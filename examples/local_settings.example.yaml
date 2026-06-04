@@ -1,0 +1,10 @@
+# Copy to ~/.symfluence_assistant/config.yaml and edit paths for your machine.
+#
+# These override the built-in defaults (~/installs/SYMFLUENCE and ~/installs/SYMFLUENCE_data).
+
+symfluence_repo: /path/to/SYMFLUENCE
+symfluence_data_dir: /path/to/SYMFLUENCE_data
+symfluence_python: /path/to/SYMFLUENCE/venv/bin/python
+
+# Optional — used for natural-language plan generation in the UI and CLI
+openai_api_key: sk-your-key-here

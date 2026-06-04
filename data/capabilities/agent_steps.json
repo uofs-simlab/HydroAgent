@@ -1,0 +1,46 @@
+{
+  "ui_file": "/Users/alj372/installs/symfluence-assistant/app/ui_streamlit.py",
+  "supported_steps": [
+    "acquire_attributes",
+    "acquire_forcings",
+    "calibrate_model",
+    "create_pour_point",
+    "define_domain",
+    "discretize_domain",
+    "dry_run",
+    "model_agnostic_preprocessing",
+    "model_specific_preprocessing",
+    "postprocess_results",
+    "process_observed_data",
+    "run_model",
+    "setup_project"
+  ],
+  "danger_steps": [
+    "GPT-4.x (Legacy / Compatibility)",
+    "GPT-5 (Recommended)",
+    "calibrate_model",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-5-mini",
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "run_model"
+  ],
+  "step_to_cli_keys": [
+    "acquire_attributes",
+    "acquire_forcings",
+    "calibrate_model",
+    "create_pour_point",
+    "define_domain",
+    "discretize_domain",
+    "model_agnostic_preprocessing",
+    "model_specific_preprocessing",
+    "postprocess_results",
+    "process_observed_data",
+    "run_model",
+    "setup_project",
+    "step",
+    "workflow"
+  ]
+}

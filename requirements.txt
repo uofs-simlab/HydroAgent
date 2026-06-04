@@ -1,0 +1,13 @@
+# HydroAgent — Python dependencies
+# Geospatial stack may be easier via conda; see README.
+
+streamlit>=1.40,<2
+streamlit-folium>=0.18
+folium>=0.15
+geopandas>=0.14
+pandas>=2.0
+PyYAML>=6.0
+openai>=1.40
+
+# Optional (Results tab: mizuRoute CSV tools)
+netCDF4>=1.6
