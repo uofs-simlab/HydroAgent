@@ -39,6 +39,7 @@ from server.capabilities.load_catalog import load_catalog
 from server.capabilities.proven_status import PROVEN_STATUS
 from server.capabilities.resolve_dependencies import resolve_step_dependencies
 from server.core.plan_rules import (
+    domain_has_local_dem,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
     plan_uses_local_data,
@@ -49,6 +50,58 @@ try:
     from server.llm.openai_provider import OpenAIProvider  # type: ignore
 except Exception:
     OPENAI_AVAILABLE = False
+
+GeminiProvider = None  # type: ignore
+GEMINI_AVAILABLE = False
+GEMINI_IMPORT_ERROR = ""
+
+
+def ensure_gemini_provider() -> bool:
+    """Import Gemini provider lazily (supports install without full app restart)."""
+    global GeminiProvider, GEMINI_AVAILABLE, GEMINI_IMPORT_ERROR
+    if GEMINI_AVAILABLE and GeminiProvider is not None:
+        return True
+    try:
+        from server.llm.gemini_provider import GeminiProvider as _GeminiProvider  # type: ignore
+
+        GeminiProvider = _GeminiProvider
+        GEMINI_AVAILABLE = True
+        GEMINI_IMPORT_ERROR = ""
+        return True
+    except Exception as exc:
+        GeminiProvider = None
+        GEMINI_AVAILABLE = False
+        GEMINI_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+ensure_gemini_provider()
+
+ClaudeProvider = None  # type: ignore
+CLAUDE_AVAILABLE = False
+CLAUDE_IMPORT_ERROR = ""
+
+
+def ensure_claude_provider() -> bool:
+    """Import Claude provider lazily (supports install without full app restart)."""
+    global ClaudeProvider, CLAUDE_AVAILABLE, CLAUDE_IMPORT_ERROR
+    if CLAUDE_AVAILABLE and ClaudeProvider is not None:
+        return True
+    try:
+        from server.llm.claude_provider import ClaudeProvider as _ClaudeProvider  # type: ignore
+
+        ClaudeProvider = _ClaudeProvider
+        CLAUDE_AVAILABLE = True
+        CLAUDE_IMPORT_ERROR = ""
+        return True
+    except Exception as exc:
+        ClaudeProvider = None
+        CLAUDE_AVAILABLE = False
+        CLAUDE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+ensure_claude_provider()
 
 FORCINGS_AVAILABLE = True
 
@@ -105,7 +158,13 @@ SYMFLUENCE_PYTHON = Path(
 
 
 def s(value) -> str:
-    return (value or "").strip()
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value).strip()
 
 
 def parse_datetime_value(value: str, fallback: dt.datetime) -> dt.datetime:
@@ -175,6 +234,220 @@ _COPY_CHECK_SVG = """
   <polyline points="20 6 9 17 4 12"></polyline>
 </svg>
 """
+
+SIDEBAR_GREY_BUTTON_KEYS = ("save_local_paths",)
+
+MAIN_PANEL_GREY_BUTTON_KEYS = (
+    "start_new_assistant_run",
+    "load_assistant_run_btn",
+    "load_data_domain_btn",
+    "input_single_validate",
+    "input_single_dry_run",
+    "input_single_run_model",
+    "input_single_calibrate_model",
+    "clear_selected_pour_point",
+    "clear_selected_bbox",
+    "manual_validate",
+    "manual_dryrun",
+    "manual_setup",
+    "manual_run_model",
+    "run_results_refresh",
+    "run_results_extract_routed",
+    "run_results_summarize_routed",
+    "shortcut_input_preprocessing",
+    "shortcut_input_model",
+    "shortcut_input_postprocess",
+)
+
+MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES = (
+    "input_single_",
+    "shortcut_input_",
+)
+
+ASSISTANT_PANEL_BUTTON_KEYS = (
+    "save_openai_key",
+    "transcribe_voice_to_prompt",
+    "generate_plan_gpt",
+    "resolve_dependencies",
+    "execute_plan_button",
+    "clear_plan_button",
+    "apply_fix_pour_point",
+    "apply_fix_bounding_box",
+    "apply_fix_hydrological_model",
+    "apply_fix_domain_def",
+    "apply_fix_forcing_dataset",
+    "shortcut_assistant_preprocessing",
+    "shortcut_assistant_model",
+    "shortcut_assistant_postprocess",
+    "calibration_assistant_run_calibrate",
+)
+
+
+def assistant_panel_button_css() -> str:
+    """CSS for slate workflow/sidebar buttons: st-key-* selectors + panel scope classes."""
+    grey_button_keys = (
+        ASSISTANT_PANEL_BUTTON_KEYS
+        + SIDEBAR_GREY_BUTTON_KEYS
+        + MAIN_PANEL_GREY_BUTTON_KEYS
+    )
+    key_btns = ",\n".join(f"div.st-key-{key} button" for key in grey_button_keys)
+    prefix_btns = ",\n".join(
+        f'div[class*="st-key-{prefix}"] button' for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES
+    )
+    key_btns_hover = ",\n".join(
+        f"div.st-key-{key} button:hover:not(:disabled)" for key in grey_button_keys
+    )
+    prefix_btns_hover = ",\n".join(
+        f'div[class*="st-key-{prefix}"] button:hover:not(:disabled)'
+        for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES
+    )
+    key_btns_disabled = ",\n".join(
+        f"div.st-key-{key} button:disabled" for key in grey_button_keys
+    )
+    prefix_btns_disabled = ",\n".join(
+        f'div[class*="st-key-{prefix}"] button:disabled'
+        for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES
+    )
+    panel_scoped = (
+        ".sym-assistant-styled button",
+        ".sym-assistant-styled [data-testid='stButton'] button",
+        ".sym-assistant-styled [data-testid='stTabs'] button",
+        ".sym-main-styled button",
+        ".sym-main-styled [data-testid='stButton'] button",
+        ".sym-main-styled [data-testid='stTabs'] button",
+    )
+    scoped = panel_scoped + (key_btns, prefix_btns)
+    scoped_hover = (
+        ".sym-assistant-styled button:hover:not(:disabled)",
+        ".sym-assistant-styled [data-testid='stButton'] button:hover:not(:disabled)",
+        ".sym-assistant-styled [data-testid='stTabs'] button:hover:not(:disabled)",
+        ".sym-main-styled button:hover:not(:disabled)",
+        ".sym-main-styled [data-testid='stButton'] button:hover:not(:disabled)",
+        ".sym-main-styled [data-testid='stTabs'] button:hover:not(:disabled)",
+        key_btns_hover,
+        prefix_btns_hover,
+    )
+    scoped_disabled = (
+        ".sym-assistant-styled button:disabled",
+        ".sym-assistant-styled [data-testid='stButton'] button:disabled",
+        ".sym-main-styled button:disabled",
+        ".sym-main-styled [data-testid='stButton'] button:disabled",
+        key_btns_disabled,
+        prefix_btns_disabled,
+    )
+    label_scoped = (
+        ".sym-assistant-styled [data-testid='stButton'] button p",
+        ".sym-assistant-styled [data-testid='stTabs'] button p",
+        ".sym-main-styled [data-testid='stButton'] button p",
+        ".sym-main-styled [data-testid='stTabs'] button p",
+    )
+    return f"""
+    {", ".join(scoped)} {{
+        background-color: #475569 !important;
+        background: #475569 !important;
+        border: 1px solid #334155 !important;
+        color: #f8fafc !important;
+        box-shadow: none !important;
+    }}
+    {", ".join(scoped_hover)} {{
+        background-color: #64748b !important;
+        background: #64748b !important;
+        border-color: #475569 !important;
+        color: #ffffff !important;
+    }}
+    {", ".join(scoped_disabled)} {{
+        background-color: #94a3b8 !important;
+        background: #94a3b8 !important;
+        border-color: #64748b !important;
+        color: #e2e8f0 !important;
+        opacity: 0.9 !important;
+    }}
+    {", ".join(label_scoped)},
+    {", ".join(f"div.st-key-{key} button p" for key in grey_button_keys)},
+    {", ".join(f'div[class*="st-key-{prefix}"] button p' for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES)} {{
+        color: inherit !important;
+    }}
+    """
+
+
+def workflow_panel_surface_css() -> str:
+    """Grey workflow column surfaces (match Streamlit sidebar tone)."""
+    return """
+    .sym-assistant-styled,
+    .sym-main-styled,
+    .sym-assistant-styled [data-testid="stVerticalBlock"],
+    .sym-main-styled [data-testid="stVerticalBlock"] {
+        background-color: #f0f2f6 !important;
+    }
+    @media (prefers-color-scheme: dark) {
+        .sym-assistant-styled,
+        .sym-main-styled,
+        .sym-assistant-styled [data-testid="stVerticalBlock"],
+        .sym-main-styled [data-testid="stVerticalBlock"] {
+            background-color: #262730 !important;
+        }
+    }
+    .right-panel {
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        background: transparent !important;
+        box-shadow: none;
+    }
+    """
+
+
+def render_workflow_panel_dom_hooks() -> None:
+    """Tag workflow scroll panels for button styling and grey backgrounds."""
+    components.html(
+        """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            function panelBg() {
+                const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                return sidebar
+                    ? getComputedStyle(sidebar).backgroundColor
+                    : "rgb(240, 242, 246)";
+            }
+            function paintColumnAncestors(node, bg) {
+                let parent = node ? node.parentElement : null;
+                for (let i = 0; i < 12 && parent; i += 1) {
+                    const testId = parent.getAttribute && parent.getAttribute("data-testid");
+                    if (testId === "column" || testId === "stColumn") {
+                        parent.style.setProperty("background-color", bg, "important");
+                        return;
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            function markPanel(markerClass, styledClass) {
+                const marker = doc.querySelector("." + markerClass);
+                if (!marker) return;
+                const bg = panelBg();
+                let el = marker.parentElement;
+                for (let i = 0; i < 40 && el; i += 1) {
+                    if (el.getAttribute && el.getAttribute("data-testid") === "stVerticalBlockBorderWrapper") {
+                        el.classList.add(styledClass);
+                        el.style.setProperty("background-color", bg, "important");
+                        paintColumnAncestors(el, bg);
+                        return;
+                    }
+                    el = el.parentElement;
+                }
+            }
+            function refreshPanels() {
+                markPanel("sym-main-panel", "sym-main-styled");
+                markPanel("sym-assistant-panel", "sym-assistant-styled");
+            }
+            refreshPanels();
+            window.setInterval(refreshPanels, 800);
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def render_copy_anchor(anchor_id: str) -> None:
@@ -485,7 +758,7 @@ def resolve_requested_plan_dependencies(plan: dict) -> dict:
         if not s(cfg.get(field)):
             missing.append(field)
 
-    if plan_uses_local_data(cfg, resolved_steps):
+    if plan_uses_local_data(cfg, resolved_steps, data_dir=SYMFLUENCE_DATA_DIR):
         missing = [f for f in missing if f != "bounding_box_coords"]
 
     new_plan["needs_user_input"] = missing
@@ -661,13 +934,108 @@ GPT_MODELS = {
 }
 ALL_GPT_MODELS = [m for group in GPT_MODELS.values() for m in group]
 
+GEMINI_MODELS = {
+    "Gemini 2.5 (Recommended)": ["gemini-2.5-flash", "gemini-2.5-pro"],
+    "Gemini 2.0": ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
+    "Gemini 1.5 (Legacy)": ["gemini-1.5-pro", "gemini-1.5-flash"],
+}
+ALL_GEMINI_MODELS = [m for group in GEMINI_MODELS.values() for m in group]
+
+CLAUDE_MODELS = {
+    "Claude 4.x (Recommended)": [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+    ],
+    "Claude 3.7": ["claude-3-7-sonnet-latest"],
+    "Claude 3.5 (Legacy)": [
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    ],
+}
+ALL_CLAUDE_MODELS = [m for group in CLAUDE_MODELS.values() for m in group]
+
+CLAUDE_MODEL_LABELS = {
+    "claude-sonnet-4-20250514": "Sonnet 4",
+    "claude-opus-4-20250514": "Opus 4",
+    "claude-3-7-sonnet-latest": "Sonnet 3.7",
+    "claude-3-5-sonnet-latest": "Sonnet 3.5",
+    "claude-3-5-haiku-latest": "Haiku 3.5",
+}
+
+
+def llm_model_label(model_id: str, provider: str) -> str:
+    if provider == "claude":
+        return CLAUDE_MODEL_LABELS.get(model_id, model_id)
+    return model_id
+
+
+VOICE_PROVIDER_LABELS = {
+    "openai": "OpenAI Whisper",
+    "gemini": "Gemini audio",
+}
+
+
+LLM_PROVIDER_LABELS = {
+    "openai": "OpenAI (GPT)",
+    "gemini": "Google (Gemini)",
+    "claude": "Anthropic (Claude)",
+}
+LLM_PROVIDER_BY_LABEL = {label: key for key, label in LLM_PROVIDER_LABELS.items()}
+LLM_PROVIDER_PACKAGES = {
+    "gemini": "google-genai",
+    "claude": "anthropic",
+}
+DEFAULT_LLM_MODEL = {
+    "openai": "gpt-5-mini",
+    "gemini": "gemini-2.5-flash",
+    "claude": "claude-sonnet-4-20250514",
+}
+
+
+def llm_models_for_provider(provider: str) -> list[str]:
+    if provider == "gemini":
+        return ALL_GEMINI_MODELS
+    if provider == "claude":
+        return ALL_CLAUDE_MODELS
+    return ALL_GPT_MODELS
+
+
+def llm_provider_available(provider: str) -> bool:
+    if provider == "gemini":
+        return ensure_gemini_provider()
+    if provider == "claude":
+        return ensure_claude_provider()
+    return OPENAI_AVAILABLE
+
+
+def llm_provider_import_error(provider: str) -> str:
+    if provider == "gemini":
+        return GEMINI_IMPORT_ERROR
+    if provider == "claude":
+        return CLAUDE_IMPORT_ERROR
+    return ""
+
+
+def llm_provider_install_hint(provider: str) -> str:
+    package = LLM_PROVIDER_PACKAGES.get(provider)
+    if not package:
+        return ""
+    return (
+        f"Python: `{sys.executable}`\n\n"
+        f"Install with:\n"
+        f"```\n{sys.executable} -m pip install {package}\n```\n"
+        f"Then restart Streamlit."
+    )
+
+
 if "api_keys" not in st.session_state:
     st.session_state.api_keys = {}
 
 persistent_cfg = load_persistent_config()
-saved_key = (persistent_cfg or {}).get("openai_api_key")
-if saved_key and not st.session_state.api_keys.get("openai"):
-    st.session_state.api_keys["openai"] = saved_key
+for _provider in ("openai", "gemini", "claude"):
+    _saved_key = (persistent_cfg or {}).get(f"{_provider}_api_key")
+    if _saved_key and not st.session_state.api_keys.get(_provider):
+        st.session_state.api_keys[_provider] = _saved_key
 
 st.session_state.setdefault("run_plan", None)
 st.session_state.setdefault("execute_plan", False)
@@ -706,6 +1074,8 @@ defaults = {
     "mpi": 1,
     "allow_run": False,
     "want_create_pour_point": True,
+    "llm_provider": "openai",
+    "llm_model": "gpt-5-mini",
     "gpt_model": "gpt-5-mini",
     "nl_request": "",
     "experiment_datetime_widget_version": 0,
@@ -1143,7 +1513,14 @@ def hoist_plan_extra_config_to_spec(spec: dict) -> dict:
 
 def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     plan_cfg = plan_cfg or {}
-    data_access = resolve_data_access_from_plan(plan_cfg) or "CLOUD"
+    run_steps = (st.session_state.get("run_plan") or {}).get("steps") or []
+    domain_name = s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name)
+    data_access = resolve_data_access_from_plan(plan_cfg) or "cloud"
+    if {"acquire_attributes", "acquire_forcings"} & set(run_steps):
+        data_access = "cloud"
+    elif domain_name and not domain_has_local_dem(SYMFLUENCE_DATA_DIR, domain_name):
+        if {"define_domain", "discretize_domain", "acquire_attributes"} & set(run_steps):
+            data_access = "cloud"
 
     spec = {
         "symfluence_code_dir": normalize_path_text(SYMFLUENCE_REPO),
@@ -1280,7 +1657,7 @@ def sync_all_ui_fields_to_plan(refresh_editor: bool = False) -> None:
     nl = s(st.session_state.get("nl_request", ""))
     required = get_required_config_fields_for_steps(steps, cfg, nl)
     missing = [k for k in required if not s(cfg.get(k))]
-    if plan_uses_local_data(cfg, steps, nl):
+    if plan_uses_local_data(cfg, steps, nl, data_dir=SYMFLUENCE_DATA_DIR):
         missing = [k for k in missing if k != "bounding_box_coords"]
     plan["needs_user_input"] = missing
 
@@ -1298,13 +1675,14 @@ def update_run_plan_needs_user_input() -> None:
     plan = normalize_local_workflow_plan(
         st.session_state.run_plan,
         s(st.session_state.get("nl_request", "")),
+        data_dir=SYMFLUENCE_DATA_DIR,
     )
     cfg = (plan.get("config") or {})
     steps = plan.get("steps", []) or []
     nl = s(st.session_state.get("nl_request", ""))
     required = get_required_config_fields_for_steps(steps, cfg, nl)
     missing = [k for k in required if not s(cfg.get(k))]
-    if plan_uses_local_data(cfg, steps, nl):
+    if plan_uses_local_data(cfg, steps, nl, data_dir=SYMFLUENCE_DATA_DIR):
         missing = [k for k in missing if k != "bounding_box_coords"]
     plan["needs_user_input"] = missing
     st.session_state.run_plan = plan
@@ -2011,56 +2389,111 @@ def augment_request_with_ui(nl: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def apply_config_spec_to_session(spec: dict) -> None:
-    """Apply GPT config spec fields to Streamlit session state (Generate config flow)."""
-    st.session_state.domain_name = s(spec.get("domain_name"))
-    st.session_state.experiment_id = s(spec.get("experiment_id")) or "exp_001"
-    st.session_state.selected_pour_point = s(spec.get("pour_point_coords"))
-    st.session_state.selected_bounding_box = s(spec.get("bounding_box_coords"))
-    if s(spec.get("hydrological_model")):
-        st.session_state.hydrological_model = normalize_hydrological_model(spec.get("hydrological_model"))
-    st.session_state.domain_def = s(spec.get("domain_def")) or s(st.session_state.domain_def)
-    if s(spec.get("forcing_dataset")):
-        st.session_state.forcing_dataset = s(spec.get("forcing_dataset"))
-    st.session_state.tstart = s(spec.get("experiment_time_start"))
-    st.session_state.tend = s(spec.get("experiment_time_end"))
-    bump_experiment_datetime_widget_version()
-    bump_config_preview_version()
-    domain_name = s(st.session_state.domain_name)
-    experiment_id = s(st.session_state.experiment_id)
-    if domain_name and experiment_id:
-        st.session_state.run_folder = preview_run_folder_name(domain_name, experiment_id)
-    st.session_state.refresh_spatial_inputs = True
-
-
-def run_generate_config_from_nl_request() -> None:
-    """Shared path for text prompt and voice: NL request -> config spec -> UI fields."""
-    key = st.session_state.api_keys.get("openai")
+def run_generate_plan_from_nl_request() -> None:
+    """NL prompt -> full SYMFLUENCE run plan (config, steps, needs_user_input)."""
+    provider = s(st.session_state.get("llm_provider")) or "openai"
+    provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
+    key = st.session_state.api_keys.get(provider)
     if not key:
-        st.error("Please save your OpenAI API key first.")
+        st.error(f"Please save your {provider_label} API key first.")
+        return
+    if not llm_provider_available(provider):
+        st.error(f"{provider_label} provider is not available in this environment.")
         return
     if not s(st.session_state.nl_request):
         st.error("Describe your workflow first (text or voice).")
         return
     try:
-        spec = OpenAIProvider(api_key=key).generate_config_spec(
-            model=st.session_state.gpt_model,
-            user_request=augment_request_with_ui(st.session_state.nl_request),
+        planner_request = augment_request_with_ui(st.session_state.nl_request)
+        model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
+        if provider == "gemini":
+            plan = GeminiProvider(api_key=key).generate_run_plan(
+                model=model,
+                user_request=planner_request,
+            )
+        elif provider == "claude":
+            plan = ClaudeProvider(api_key=key).generate_run_plan(
+                model=model,
+                user_request=planner_request,
+            )
+        else:
+            plan = OpenAIProvider(api_key=key).generate_run_plan(
+                model=model,
+                user_request=planner_request,
+            )
+        plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
+        plan = normalize_local_workflow_plan(
+            plan,
+            st.session_state.nl_request,
+            data_dir=SYMFLUENCE_DATA_DIR,
         )
-        apply_config_spec_to_session(spec)
-        st.success("Config inputs generated.")
+
+        if not isinstance(plan, dict):
+            raise RuntimeError(f"Planner returned non-dict: {type(plan)}")
+        required_top = {"config", "steps", "needs_user_input", "notes"}
+        missing_top = [k for k in required_top if k not in plan]
+        if missing_top:
+            raise RuntimeError(f"Planner plan missing keys: {missing_top}. Got keys={list(plan.keys())}")
+        if not isinstance(plan["steps"], list) or not all(isinstance(x, str) for x in plan["steps"]):
+            raise RuntimeError("Planner returned invalid 'steps' (must be list[str]).")
+        if not isinstance(plan["config"], dict):
+            raise RuntimeError("Planner returned invalid 'config' (must be object).")
+        if not isinstance(plan["needs_user_input"], list) or not all(isinstance(x, str) for x in plan["needs_user_input"]):
+            raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
+
+        st.session_state.run_plan = plan
+        apply_plan_config_to_ui(plan)
+        refresh_plan_editor_from_state()
+        st.success("Run plan generated.")
         st.rerun()
     except Exception as e:
-        st.error(f"GPT error: {e}")
+        st.error(f"Planning error: {e}")
         st.code(traceback.format_exc())
 
 
+def resolve_voice_transcription_provider() -> tuple[str | None, str | None]:
+    """Return (provider_id, api_key) for speech-to-text, with OpenAI fallback."""
+    active = s(st.session_state.get("llm_provider")) or "openai"
+    candidates: list[str] = []
+    if active in ("openai", "gemini"):
+        candidates.append(active)
+    for fallback in ("openai", "gemini"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    for provider in candidates:
+        if provider == "claude":
+            continue
+        key = st.session_state.api_keys.get(provider)
+        if key and llm_provider_available(provider):
+            return provider, key
+    return None, None
+
+
+def apply_pending_nl_request_transcript() -> None:
+    """Apply a voice transcript before the nl_request widget is drawn."""
+    pending = st.session_state.pop("_pending_nl_transcript", None)
+    if pending is not None:
+        st.session_state.nl_request = pending
+
+
 def transcribe_voice_to_nl_request(audio_bytes: bytes, filename: str) -> str | None:
-    key = st.session_state.api_keys.get("openai")
-    if not key:
-        st.error("Please save your OpenAI API key first.")
+    provider, key = resolve_voice_transcription_provider()
+    if not provider or not key:
+        st.error(
+            "Save an OpenAI or Gemini API key to use voice transcription. "
+            "OpenAI Whisper works with an OpenAI key only."
+        )
         return None
+
     try:
+        if provider == "gemini":
+            model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL["gemini"]
+            return GeminiProvider(api_key=key).transcribe_audio(
+                audio_bytes=audio_bytes,
+                filename=filename,
+                model=model,
+            )
         return OpenAIProvider(api_key=key).transcribe_audio(
             audio_bytes=audio_bytes,
             filename=filename,
@@ -2253,11 +2686,11 @@ st.markdown(
         margin-bottom: 0.7rem;
     }
     .right-panel {
-        border: 1px solid rgba(49, 51, 63, 0.12);
-        border-radius: 16px;
-        padding: 1rem;
-        background: #ffffff;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
     }
     .metric-card {
         border: 1px solid rgba(49, 51, 63, 0.12);
@@ -2317,31 +2750,13 @@ st.markdown(
         user-select: none;
         line-height: 1;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-plan_steps_gpt button,
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-generate_config_gpt button,
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-resolve_dependencies button,
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-execute_plan_button button,
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-clear_plan_button button {
-        background-color: #f1f5f9 !important;
-        border: 1px solid #cbd5e1 !important;
-        color: #475569 !important;
-    }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-plan_steps_gpt button:hover:not(:disabled),
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-generate_config_gpt button:hover:not(:disabled),
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-resolve_dependencies button:hover:not(:disabled),
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-execute_plan_button button:hover:not(:disabled),
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-clear_plan_button button:hover:not(:disabled) {
-        background-color: #e2e8f0 !important;
-        border-color: #94a3b8 !important;
-        color: #334155 !important;
-    }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) .st-key-execute_plan_button button:disabled {
-        background-color: #f8fafc !important;
-        border-color: #e2e8f0 !important;
-        color: #94a3b8 !important;
-    }
 </style>
 """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"<style>{assistant_panel_button_css()}{workflow_panel_surface_css()}</style>",
     unsafe_allow_html=True,
 )
 
@@ -2394,7 +2809,7 @@ with st.sidebar.expander("Local SYMFLUENCE paths", expanded=current_page == "Set
         key="local_symfluence_python_path",
     )
 
-    if st.button("Save local paths", key="save_local_paths"):
+    if st.button("Save local paths", key="save_local_paths", type="secondary"):
         new_settings = load_local_settings()
         new_settings["symfluence_repo"] = symfluence_repo_input
         new_settings["symfluence_data_dir"] = symfluence_data_input
@@ -2610,6 +3025,10 @@ def load_assistant_run(run_folder: str) -> str | None:
     if not plan_cfg:
         return f"No config.yaml or plan.json found in {run_dir}"
 
+    prompt_path = run_dir / "prompt.txt"
+    if prompt_path.exists():
+        st.session_state.nl_request = prompt_path.read_text(encoding="utf-8").strip()
+
     log_path = run_dir / "logs" / "execution.log"
     execution_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
 
@@ -2751,6 +3170,31 @@ def render_start_load_run_section() -> None:
                         st.rerun()
 
 
+def write_run_metadata_files(outdir: Path, plan: dict, spec_dict: dict | None = None) -> None:
+    """Persist plan.json (and optional spec.json) under runs/<domain>_<experiment>/."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "plan.json").write_text(
+        json.dumps(plan or {}, indent=2),
+        encoding="utf-8",
+    )
+    prompt = s(st.session_state.get("nl_request"))
+    if prompt:
+        (outdir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+    if spec_dict is not None:
+        (outdir / "spec.json").write_text(
+            json.dumps(spec_dict, indent=2),
+            encoding="utf-8",
+        )
+
+
+def mirror_preview_plan_to_run_folder(plan: dict, spec_dict: dict | None = None) -> None:
+    """Copy the current plan into the active run folder when domain + experiment are set."""
+    run_folder = s(st.session_state.get("run_folder"))
+    if not run_folder or run_folder in RUN_FOLDER_SKIP:
+        return
+    write_run_metadata_files(RUNS_DIR / run_folder, plan, spec_dict)
+
+
 def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
     plan_cfg_local = (st.session_state.run_plan or {}).get("config", {}) or {}
     real_spec_dict = build_spec_dict(plan_cfg_local)
@@ -2806,16 +3250,10 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 
     dump_yaml(real_cfg, real_out_yaml)
 
-    plan_path = real_outdir / "plan.json"
-    plan_path.write_text(
-        json.dumps(st.session_state.run_plan or {}, indent=2),
-        encoding="utf-8",
-    )
-
-    spec_path = real_outdir / "spec.json"
-    spec_path.write_text(
-        json.dumps(real_spec_dict, indent=2),
-        encoding="utf-8",
+    write_run_metadata_files(
+        real_outdir,
+        st.session_state.run_plan or {},
+        real_spec_dict,
     )
 
     return real_outdir, real_out_yaml, real_cfg, real_spec_dict
@@ -2832,9 +3270,37 @@ def manual_execution_log_path(outdir: Path) -> Path:
     return logs_dir / "execution.log"
 
 
+def execution_log_preamble(plan: dict | None = None) -> str:
+    """Header for execution.log: user prompt first, then resolved run plan."""
+    parts: list[str] = []
+    prompt = s(st.session_state.get("nl_request"))
+    if prompt:
+        parts.append("===== USER PROMPT =====\n")
+        parts.append(prompt)
+        parts.append("\n\n")
+    else:
+        parts.append("===== USER PROMPT =====\n(no prompt recorded)\n\n")
+
+    parts.append("===== RUN PLAN =====\n")
+    parts.append(json.dumps(plan or st.session_state.run_plan or {}, indent=2))
+    parts.append("\n")
+    return "".join(parts)
+
+
+def ensure_execution_log_preamble(log_path: Path, plan: dict | None = None) -> None:
+    """Write prompt + plan header when starting a new log (manual steps, validate-only)."""
+    if log_path.exists() and log_path.stat().st_size > 0:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    text = execution_log_preamble(plan)
+    log_path.write_text(text, encoding="utf-8")
+    st.session_state.execution_log_text = text
+
+
 def execute_validate_config_step(output_box) -> tuple[int, str]:
     outdir, out_yaml, manual_cfg, _ = build_real_run_files_from_state()
     log_path = manual_execution_log_path(outdir)
+    ensure_execution_log_preamble(log_path)
     header = "\n===== STEP: validate_config =====\n"
     append_session_execution_log(header)
     with log_path.open("a", encoding="utf-8") as f:
@@ -2866,6 +3332,7 @@ def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
 
     outdir, out_yaml, _, _ = build_real_run_files_from_state()
     log_path = manual_execution_log_path(outdir)
+    ensure_execution_log_preamble(log_path)
     cmd = build_symfluence_step_cmd(step, out_yaml)
     header = f"\n===== STEP: {step} =====\n$ {' '.join(cmd)}\n\n"
     append_session_execution_log(header)
@@ -3336,7 +3803,10 @@ def sync_preview_artifacts() -> None:
     
     with open(preview_plan_json, "w", encoding="utf-8") as f:
         json.dump(plan_to_save, f, indent=2)
-    
+
+    if st.session_state.get("run_plan"):
+        mirror_preview_plan_to_run_folder(plan_to_save, spec_dict)
+
 
 def render_workflow_output_tab() -> None:
     global output_box, progress_box, validate_btn, dryrun_btn, setup_btn, run_btn
@@ -3473,6 +3943,7 @@ st.markdown('<div class="sym-workflow-panels" aria-hidden="true"></div>', unsafe
 main_col, assistant_col = st.columns([0.72, 0.28], gap="large")
 
 with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
+    st.markdown('<span class="sym-main-panel" aria-hidden="true"></span>', unsafe_allow_html=True)
     pending_load = st.session_state.pop("_pending_load_run", None)
     if pending_load:
         load_err = load_assistant_run(pending_load)
@@ -3489,7 +3960,11 @@ with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
         render_workflow_output_tab()
 
 with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
-    st.markdown('<div class="right-panel">', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="sym-assistant-panel" aria-hidden="true"></span><div class="right-panel">',
+        unsafe_allow_html=True,
+    )
+    render_workflow_panel_dom_hooks()
     prompt_tab, chat_tab = st.tabs(["Prompt", "Chat"])
 
     with prompt_tab:
@@ -3499,44 +3974,83 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
             st.warning("Local install: acquire_forcings is disabled. Use HPC/MAF or provide external forcings.")
 
         persistent_cfg = load_persistent_config()
-        if persistent_cfg.get("openai_api_key") and not st.session_state.api_keys.get("openai"):
-            st.session_state.api_keys["openai"] = persistent_cfg.get("openai_api_key")
+        for _provider in ("openai", "gemini", "claude"):
+            _cfg_key = persistent_cfg.get(f"{_provider}_api_key")
+            if _cfg_key and not st.session_state.api_keys.get(_provider):
+                st.session_state.api_keys[_provider] = _cfg_key
 
-        if st.session_state.api_keys.get("openai"):
-            st.success("OpenAI API key loaded ✔")
+        provider_labels = list(LLM_PROVIDER_BY_LABEL.keys())
+        current_provider = s(st.session_state.get("llm_provider")) or "openai"
+        if current_provider not in LLM_PROVIDER_LABELS:
+            current_provider = "openai"
+            st.session_state.llm_provider = current_provider
+        current_provider_label = LLM_PROVIDER_LABELS[current_provider]
+        selected_provider_label = st.selectbox(
+            "Provider",
+            provider_labels,
+            index=provider_labels.index(current_provider_label),
+            key="provider_select",
+        )
+        st.session_state.llm_provider = LLM_PROVIDER_BY_LABEL[selected_provider_label]
+        active_provider = st.session_state.llm_provider
+        active_provider_label = LLM_PROVIDER_LABELS[active_provider]
+
+        if st.session_state.api_keys.get(active_provider):
+            st.success(f"{active_provider_label} API key loaded ✔")
         else:
-            st.warning("No OpenAI API key loaded")
+            st.warning(f"No {active_provider_label} API key loaded")
 
-        st.selectbox("Provider", ["OpenAI (GPT)"], index=0, key="provider_select")
-        api_key = st.text_input("Your API key", type="password", help="Stored only if you click Save key.")
+        api_key_help = {
+            "openai": "OpenAI API key.",
+            "gemini": "Google AI Studio / Gemini API key.",
+            "claude": "Anthropic API key from console.anthropic.com.",
+        }.get(active_provider, "LLM API key.")
+        api_key = st.text_input(
+            "Your API key",
+            type="password",
+            help=f"Stored only if you click Save key. {api_key_help}",
+        )
 
-        key_col1, key_col2 = st.columns(2)
-        with key_col1:
-            if st.button("Save key", key="save_openai_key"):
-                if api_key.strip():
-                    st.session_state.api_keys["openai"] = api_key.strip()
-                    cfg_local = load_local_settings()
-                    cfg_local["openai_api_key"] = api_key.strip()
-                    save_local_settings(cfg_local)
-                    st.success("API key saved on this machine.")
-                else:
-                    st.error("API key is empty.")
-        with key_col2:
-            if st.button("Clear key", key="clear_openai_key"):
-                st.session_state.api_keys.pop("openai", None)
+        if st.button("Save key", key="save_openai_key", width="stretch", type="secondary"):
+            if api_key.strip():
+                st.session_state.api_keys[active_provider] = api_key.strip()
                 cfg_local = load_local_settings()
-                cfg_local.pop("openai_api_key", None)
+                cfg_local[f"{active_provider}_api_key"] = api_key.strip()
                 save_local_settings(cfg_local)
-                st.success("API key cleared.")
+                st.success("API key saved on this machine.")
+            else:
+                st.error("API key is empty.")
 
-        if not OPENAI_AVAILABLE:
-            st.error("OpenAI provider not available. Cannot import OpenAIProvider.")
-        else:
-            st.session_state.gpt_model = st.selectbox(
-                "GPT model",
-                ALL_GPT_MODELS,
-                index=ALL_GPT_MODELS.index(st.session_state.gpt_model) if st.session_state.gpt_model in ALL_GPT_MODELS else 0,
+        if not llm_provider_available(active_provider):
+            st.error(
+                f"{active_provider_label} provider not available. "
+                "Install the required SDK package in the same Python that runs Streamlit."
             )
+            import_error = llm_provider_import_error(active_provider)
+            if import_error:
+                st.code(import_error)
+            st.markdown(llm_provider_install_hint(active_provider))
+        else:
+            available_models = llm_models_for_provider(active_provider)
+            current_model = (
+                s(st.session_state.get("llm_model"))
+                or s(st.session_state.get("gpt_model"))
+                or DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
+            )
+            if current_model not in available_models:
+                current_model = DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
+            st.session_state.llm_model = st.selectbox(
+                "Model",
+                available_models,
+                index=available_models.index(current_model),
+                format_func=lambda model_id: llm_model_label(model_id, active_provider),
+            )
+            st.session_state.gpt_model = st.session_state.llm_model
+
+            apply_pending_nl_request_transcript()
+            if st.session_state.pop("_nl_transcribe_ok", False):
+                st.success("Transcription added. Review the prompt, then click Generate plan.")
+
             def _render_prompt_body() -> None:
                 st.text_area(
                     "Describe what you want",
@@ -3554,107 +4068,61 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 render_body=_render_prompt_body,
             )
 
-            st.markdown("**Voice input** (same as typing above; uses OpenAI Whisper)")
-            if hasattr(st, "audio_input"):
-                voice_audio = st.audio_input(
-                    "Record your request",
-                    key="voice_nl_request",
-                    help="Click to record, then transcribe or generate config.",
-                )
-            else:
-                voice_audio = st.file_uploader(
-                    "Upload audio (wav, mp3, m4a, webm)",
-                    type=["wav", "mp3", "m4a", "webm", "mpeg", "mpga"],
-                    key="voice_nl_upload",
-                )
+            voice_provider, _voice_key = resolve_voice_transcription_provider()
+            if voice_provider:
+                voice_label = VOICE_PROVIDER_LABELS.get(voice_provider, "Voice")
+                st.markdown(f"**Voice input** ({voice_label} → prompt box)")
+                if voice_provider != active_provider:
+                    st.caption(
+                        f"Speech-to-text uses **{LLM_PROVIDER_LABELS[voice_provider]}** "
+                        f"(planner is **{active_provider_label}**)."
+                    )
+                if hasattr(st, "audio_input"):
+                    voice_audio = st.audio_input(
+                        "Record your request",
+                        key="voice_nl_request",
+                        help="Record audio, then click Transcribe to prompt.",
+                    )
+                else:
+                    voice_audio = st.file_uploader(
+                        "Upload audio (wav, mp3, m4a, webm)",
+                        type=["wav", "mp3", "m4a", "webm", "mpeg", "mpga"],
+                        key="voice_nl_upload",
+                    )
 
-            voice_t1, voice_t2 = st.columns(2)
-            with voice_t1:
-                transcribe_voice_btn = st.button(
+                if st.button(
                     "Transcribe to prompt",
                     key="transcribe_voice_to_prompt",
                     width="stretch",
-                )
-            with voice_t2:
-                voice_gen_btn = st.button(
-                    "Transcribe & generate config",
-                    key="transcribe_voice_generate_config",
-                    width="stretch",
-                )
-
-            if transcribe_voice_btn or voice_gen_btn:
-                if voice_audio is None:
-                    st.warning("Record or upload audio first.")
-                else:
-                    audio_bytes = voice_audio.getvalue()
-                    filename = getattr(voice_audio, "name", None) or "recording.webm"
-                    transcript = transcribe_voice_to_nl_request(audio_bytes, filename)
-                    if transcript:
-                        st.session_state.nl_request = transcript
-                        if transcribe_voice_btn:
-                            st.success("Transcription added to the prompt box. Review and click Generate config.")
+                    type="secondary",
+                ):
+                    if voice_audio is None:
+                        st.warning("Record or upload audio first.")
+                    else:
+                        audio_bytes = voice_audio.getvalue()
+                        filename = getattr(voice_audio, "name", None) or "recording.webm"
+                        transcript = transcribe_voice_to_nl_request(audio_bytes, filename)
+                        if transcript:
+                            st.session_state["_pending_nl_transcript"] = transcript
+                            st.session_state["_nl_transcribe_ok"] = True
                             st.rerun()
-                        else:
-                            run_generate_config_from_nl_request()
+            else:
+                st.caption(
+                    "Save an **OpenAI** API key to transcribe voice (Whisper). "
+                    "Claude has no speech-to-text API."
+                )
 
             st.markdown(
                 '<div class="assistant-plan-divider">------------------</div>',
                 unsafe_allow_html=True,
             )
-            plan_col, cfg_col = st.columns(2)
-            with plan_col:
-                plan_btn = st.button(
-                    "Plan steps",
-                    key="plan_steps_gpt",
-                    width="stretch",
-                    type="secondary",
-                )
-            with cfg_col:
-                gen_btn = st.button(
-                    "Generate config",
-                    key="generate_config_gpt",
-                    width="stretch",
-                    type="secondary",
-                )
-
-            if gen_btn:
-                run_generate_config_from_nl_request()
-
-            if plan_btn:
-                key = st.session_state.api_keys.get("openai")
-                if not key:
-                    st.error("Please save your OpenAI API key first.")
-                else:
-                    try:
-                        planner_request = augment_request_with_ui(st.session_state.nl_request)
-                        plan = OpenAIProvider(api_key=key).generate_run_plan(
-                            model=st.session_state.gpt_model,
-                            user_request=planner_request,
-                        )
-                        plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
-                        plan = normalize_local_workflow_plan(plan, st.session_state.nl_request)
-
-                        if not isinstance(plan, dict):
-                            raise RuntimeError(f"Planner returned non-dict: {type(plan)}")
-                        required_top = {"config", "steps", "needs_user_input", "notes"}
-                        missing_top = [k for k in required_top if k not in plan]
-                        if missing_top:
-                            raise RuntimeError(f"Planner plan missing keys: {missing_top}. Got keys={list(plan.keys())}")
-                        if not isinstance(plan["steps"], list) or not all(isinstance(x, str) for x in plan["steps"]):
-                            raise RuntimeError("Planner returned invalid 'steps' (must be list[str]).")
-                        if not isinstance(plan["config"], dict):
-                            raise RuntimeError("Planner returned invalid 'config' (must be object).")
-                        if not isinstance(plan["needs_user_input"], list) or not all(isinstance(x, str) for x in plan["needs_user_input"]):
-                            raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
-
-                        st.session_state.run_plan = plan
-                        apply_plan_config_to_ui(plan)
-                        refresh_plan_editor_from_state()
-                        st.success("Run plan generated.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Planning error: {e}")
-                        st.code(traceback.format_exc())
+            if st.button(
+                "Generate plan",
+                key="generate_plan_gpt",
+                width="stretch",
+                type="secondary",
+            ):
+                run_generate_plan_from_nl_request()
 
         if st.session_state.run_plan:
             current = json.dumps(st.session_state.run_plan, indent=2)
@@ -3911,6 +4379,8 @@ if st.session_state.execute_plan and st.session_state.run_plan:
 
     dump_yaml(cfg, out_yaml)
 
+    write_run_metadata_files(outdir, plan, spec_dict)
+
     steps = plan.get("steps", []) or []
 
     danger_found = [step for step in steps if step in DANGER_STEPS]
@@ -3932,14 +4402,15 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     log_path.write_text("", encoding="utf-8")
     st.info(f"Execution log path: {log_path}")
 
-    log.append(json.dumps(plan, indent=2) + "\n")
+    preamble = execution_log_preamble(plan)
+    log.append(preamble)
     log.append(f"\nUsing config: {out_yaml}\n")
     show_text("".join(log))
     st.session_state.execution_log_text = "".join(log)
     progress_box.markdown(render_workflow_progress(plan, "".join(log)))
 
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(plan, indent=2) + "\n")
+        f.write(preamble)
         f.write(f"\nUsing config: {out_yaml}\n")
 
     for step in steps:

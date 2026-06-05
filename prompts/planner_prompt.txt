@@ -145,6 +145,10 @@ Rules:
 
 34. If the user uses existing local domain data (e.g. DATA_ACCESS LOCAL, data_access LOCAL, data already in SYMFLUENCE_data/domain_<name>/, or explicit instructions not to download attributes/forcings/observations), leave bounding_box_coords null unless the user provides a bounding box. Semi-distributed and lumped basin workflows with only pour_point_coords (as in Tutorial 02b) do not need a bounding box.
 
+34b. "Local SYMFLUENCE data" usually means store outputs under SYMFLUENCE_data on disk, NOT skip downloads. If define_domain or discretize_domain is requested, include acquire_attributes before define_domain unless the user explicitly says attributes already exist or says not to run acquire_attributes. define_domain with delineate requires DEM at domain_<name>/data/attributes/elevation/dem/.
+
+34c. If domain attributes/DEM are not already on disk, set data_access / DATA_ACCESS to "cloud" (online MAF/gistool fetch). When acquire_attributes or acquire_forcings is included, bounding_box_coords is required unless the user explicitly states data is already present locally.
+
 35. If needs_user_input is not empty, steps must be exactly:
     - validate_config
     - dry_run

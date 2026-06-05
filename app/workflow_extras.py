@@ -55,7 +55,13 @@ PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"}
 
 
 def s(value) -> str:
-    return (value or "").strip()
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value).strip()
 
 
 def workflow_context(

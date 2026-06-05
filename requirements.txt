@@ -1,5 +1,5 @@
-# HydroAgent — Python dependencies
-# Geospatial stack may be easier via conda; see README.
+# Symfluence Assistant — Python dependencies
+# Install in a dedicated venv (recommended). Geospatial stack may be easier via conda; see README.
 
 streamlit>=1.40,<2
 streamlit-folium>=0.18
@@ -8,6 +8,8 @@ geopandas>=0.14
 pandas>=2.0
 PyYAML>=6.0
 openai>=1.40
+google-genai>=1.0
+anthropic>=0.40
 
-# Optional (Results tab: mizuRoute CSV tools)
+# Optional helpers (Results tab: mizuRoute CSV tools)
 netCDF4>=1.6
