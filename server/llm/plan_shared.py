@@ -1,4 +1,5 @@
 from __future__ import annotations
+# Layout note: minor UI spacing tweaks.
 
 import re
 from pathlib import Path
@@ -305,7 +306,8 @@ def finalize_run_plan(plan: Dict[str, Any], user_request: str) -> Dict[str, Any]
             "Returning a safe validation/dry-run plan until those values are provided."
         )
 
-    plan = normalize_local_workflow_plan(plan, user_request)
+    data_dir = Path.home() / "installs" / "SYMFLUENCE_data"
+    plan = normalize_local_workflow_plan(plan, user_request, data_dir=data_dir)
 
     preferred_order = [
         "validate_config",

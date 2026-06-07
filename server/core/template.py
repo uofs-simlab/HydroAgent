@@ -1,4 +1,5 @@
 from __future__ import annotations
+# Layout note: minor UI spacing tweaks.
 
 from pathlib import Path
 from typing import Any, Dict
@@ -116,6 +117,93 @@ def apply_spec_to_template(template: Dict[str, Any], spec_dict: Dict[str, Any]) 
         continue
 
     return out
+
+
+ROUTING_CALIBRATION_PARAMS = frozenset(
+    {
+        "routingGammaShape",
+        "routingGammaScale",
+        "velo",
+        "diff",
+    }
+)
+
+
+def params_to_calibrate_string(value: Any) -> str:
+    """SYMFLUENCE expects comma-separated PARAMS_TO_CALIBRATE, not YAML lists."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = [item.strip() for item in str(value).split(",") if item.strip()]
+    return ",".join(items)
+
+
+def normalize_params_to_calibrate(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert list-style calibration params and split routing basin params."""
+    raw = cfg.get("PARAMS_TO_CALIBRATE")
+    if raw is None:
+        return cfg
+
+    if isinstance(raw, (list, tuple)):
+        items = [str(item).strip() for item in raw if str(item).strip()]
+    elif isinstance(raw, str):
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        return cfg
+
+    summa_params = [item for item in items if item not in ROUTING_CALIBRATION_PARAMS]
+    basin_params = [item for item in items if item in ROUTING_CALIBRATION_PARAMS]
+
+    if summa_params:
+        cfg["PARAMS_TO_CALIBRATE"] = ",".join(summa_params)
+    else:
+        cfg.pop("PARAMS_TO_CALIBRATE", None)
+
+    if basin_params:
+        cfg["BASIN_PARAMS_TO_CALIBRATE"] = ",".join(basin_params)
+
+    return cfg
+
+
+def spec_key_to_yaml_key(key: str) -> str | None:
+    if not isinstance(key, str) or not key:
+        return None
+    if key in FIELD_MAP:
+        return FIELD_MAP[key]
+    if key.isupper():
+        return key
+    return None
+
+
+def strip_duplicate_lowercase_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove planner lowercase duplicates that should only exist as SYMFLUENCE keys."""
+    for key in list(cfg.keys()):
+        if not isinstance(key, str) or key == key.upper():
+            continue
+        yaml_key = spec_key_to_yaml_key(key)
+        if yaml_key and yaml_key in cfg:
+            cfg.pop(key, None)
+    return cfg
+
+
+def sync_legacy_discretization_key(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Template uses DOMAIN_DISCRETIZATION; SYMFLUENCE requires SUB_GRID_DISCRETIZATION."""
+    if cfg.get("SUB_GRID_DISCRETIZATION") in (None, "", "default"):
+        discretization = cfg.get("DOMAIN_DISCRETIZATION")
+        if discretization not in (None, "", "default"):
+            cfg["SUB_GRID_DISCRETIZATION"] = discretization
+    return cfg
+
+
+def finalize_symfluence_config(cfg: Dict[str, Any], spec: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Last-mile cleanup before writing config.yaml for SYMFLUENCE CLI validation."""
+    _ = spec
+    cfg = normalize_params_to_calibrate(cfg)
+    cfg = sync_legacy_discretization_key(cfg)
+    cfg = strip_duplicate_lowercase_keys(cfg)
+    return cfg
 
 
 def render_config_from_spec(

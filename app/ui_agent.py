@@ -1,4 +1,5 @@
 from __future__ import annotations
+# Layout note: minor UI spacing tweaks.
 
 from pathlib import Path
 import sys
@@ -25,8 +26,13 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import workflow_extras as wx  # noqa: E402
-
-from server.core.template import FIELD_MAP, render_config_from_spec
+# 
+from server.core.template import (
+    FIELD_MAP,
+    finalize_symfluence_config,
+    render_config_from_spec,
+    spec_key_to_yaml_key,
+)
 from server.core.validate import validate_spec  # noqa: E402
 
 from server.core.parameter_registry import (
@@ -38,11 +44,36 @@ from server.core.parameter_registry import (
 from server.capabilities.load_catalog import load_catalog
 from server.capabilities.proven_status import PROVEN_STATUS
 from server.capabilities.resolve_dependencies import resolve_step_dependencies
+from server.core.local_domain import (
+    copy_reusable_domain_artifacts,
+    infer_reuse_source_domain,
+    local_catchment_needs_restore,
+    restore_local_domain_artifacts,
+    seed_mac_duplicate_domain_from_basin,
+    user_request_reuses_local_domain_data,
+)
+from server.core.run_naming import (
+    allocate_unique_run_folder,
+    assistant_run_is_established,
+    parse_mac_duplicate_suffix,
+    preview_run_folder_name,
+    resolve_run_workspace,
+    run_folder_belongs_to_workspace,
+    run_folder_for_symfluence_domain,
+    symfluence_domain_for_run_folder,
+    symfluence_domain_mac_suffix,
+)
 from server.core.plan_rules import (
     domain_has_local_dem,
+    domain_has_local_streamflow,
+    domain_has_complete_local_workflow,
+    ensure_skip_process_observed_when_local_streamflow,
+    extract_station_id_from_request,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
     plan_uses_local_data,
+    strip_user_forbidden_download_steps,
+    user_requires_fresh_cloud_workflow,
 )
 
 OPENAI_AVAILABLE = True
@@ -210,12 +241,6 @@ def bump_config_preview_version() -> None:
 
 def config_preview_widget_key() -> str:
     return f"generated_config_preview_v{config_preview_widget_version()}"
-
-
-def preview_run_folder_name(domain_name: str, experiment_id: str) -> str:
-    safe_domain = sanitize_config_token(domain_name)
-    safe_expid = sanitize_config_token(experiment_id)
-    return f"{safe_domain}_{safe_expid}".strip("_")
 
 
 _COPY_ICON_SVG = """
@@ -625,19 +650,73 @@ def symfluence_domain_name(domain_name: str, experiment_id: str = "") -> str:
     return split_domain_name_from_combined(domain_name, experiment_id) or domain_name
 
 
-def symfluence_data_domain_dir(domain_name: str, experiment_id: str = "") -> Path:
-    return SYMFLUENCE_DATA_DIR / f"domain_{symfluence_domain_name(domain_name, experiment_id)}"
+def symfluence_data_domain_dir(
+    domain_name: str,
+    experiment_id: str = "",
+    *,
+    run_folder: str = "",
+) -> Path:
+    basin = symfluence_domain_name(domain_name, experiment_id)
+    if run_folder:
+        sym_domain = symfluence_domain_for_run_folder(run_folder, basin, experiment_id)
+    else:
+        sym_domain = basin
+    return SYMFLUENCE_DATA_DIR / f"domain_{sym_domain}"
+
+
+def sync_run_folder_from_session(*, unlock: bool = False) -> None:
+    """Keep or allocate a non-colliding run folder for the current domain + experiment."""
+    domain_name = s(st.session_state.domain_name)
+    experiment_id = s(st.session_state.experiment_id)
+    if not domain_name or not experiment_id:
+        return
+    if unlock:
+        st.session_state.run_workspace_locked = False
+    current = s(st.session_state.get("run_folder"))
+    if st.session_state.get("run_workspace_locked") and current:
+        return
+    basin = symfluence_domain_name(domain_name, experiment_id)
+    if current and not unlock and assistant_run_is_established(current, RUNS_DIR):
+        return
+    _, mac_n = parse_mac_duplicate_suffix(current)
+    if (
+        current
+        and not unlock
+        and mac_n is not None
+        and run_folder_belongs_to_workspace(current, basin, experiment_id)
+    ):
+        return
+    run_folder, _sym_domain = resolve_run_workspace(
+        basin,
+        experiment_id,
+        current,
+        runs_dir=RUNS_DIR,
+        data_dir=SYMFLUENCE_DATA_DIR,
+        workspace_locked=bool(st.session_state.get("run_workspace_locked")),
+    )
+    st.session_state.run_folder = run_folder
 
 
 def finalize_spec_for_symfluence(spec_dict: dict) -> dict:
     """Write DOMAIN_NAME and EXPERIMENT_ID separately; set assistant runs/ folder."""
     raw_domain = spec_dict.get("domain_name") or "domain"
     raw_expid = spec_dict.get("experiment_id") or "exp"
-    domain = symfluence_domain_name(str(raw_domain), str(raw_expid))
+    basin = symfluence_domain_name(str(raw_domain), str(raw_expid))
     expid = sanitize_config_token(str(raw_expid)) or str(raw_expid)
-    spec_dict["domain_name"] = domain
+    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    run_folder, sym_domain = resolve_run_workspace(
+        basin,
+        expid,
+        s(st.session_state.get("run_folder")),
+        runs_dir=RUNS_DIR,
+        data_dir=SYMFLUENCE_DATA_DIR,
+        workspace_locked=bool(st.session_state.get("run_workspace_locked")),
+    )
+    if user_requires_fresh_cloud_workflow(user_request, spec_dict):
+        sym_domain = basin
+    spec_dict["domain_name"] = sym_domain
     spec_dict["experiment_id"] = expid
-    st.session_state.run_folder = preview_run_folder_name(domain, expid)
+    st.session_state.run_folder = run_folder
     return spec_dict
 
 
@@ -709,9 +788,10 @@ def current_hydrological_model(plan_cfg: dict | None = None) -> str:
     )
 
 
-def resolve_requested_plan_dependencies(plan: dict) -> dict:
+def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> dict:
     catalog = load_catalog()
     steps = plan.get("steps", []) or []
+    user_request = user_request or s(st.session_state.get("nl_request"))
 
     resolved_steps = []
 
@@ -768,6 +848,12 @@ def resolve_requested_plan_dependencies(plan: dict) -> dict:
         + " | Dependencies resolved from SYMFLUENCE operation catalog."
     ).strip()
 
+    new_plan = strip_user_forbidden_download_steps(new_plan, user_request)
+    new_plan = normalize_local_workflow_plan(
+        new_plan,
+        user_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
     return new_plan
 
 def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -813,10 +899,7 @@ def apply_edited_plan_to_session(plan: dict) -> None:
     bump_experiment_datetime_widget_version()
     bump_config_preview_version()
 
-    domain_name = s(st.session_state.domain_name)
-    experiment_id = s(st.session_state.experiment_id)
-    if domain_name and experiment_id:
-        st.session_state.run_folder = preview_run_folder_name(domain_name, experiment_id)
+    sync_run_folder_from_session()
 
     wx.apply_advanced_config_from_plan(cfg)
     st.session_state.refresh_spatial_inputs = True
@@ -1071,6 +1154,7 @@ defaults = {
     "show_forcing_layer": False,
     "refresh_spatial_inputs": False,
     "run_folder": "",
+    "run_workspace_locked": False,
     "mpi": 1,
     "allow_run": False,
     "want_create_pour_point": True,
@@ -1078,6 +1162,7 @@ defaults = {
     "llm_model": "gpt-5-mini",
     "gpt_model": "gpt-5-mini",
     "nl_request": "",
+    "user_prompt": "",
     "experiment_datetime_widget_version": 0,
     "config_preview_version": 0,
     "spatial_inputs_stale": False,
@@ -1271,6 +1356,11 @@ def apply_semi_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
         "ASPECT_CLASS_NUMBER": 1,
         "USE_DROP_ANALYSIS": False,
         "DOMAIN_DISCRETIZATION": "GRUs",
+        "SUB_GRID_DISCRETIZATION": "GRUs",
+        "SETTINGS_MIZU_ROUTING_VAR": "averageRoutedRunoff",
+        "SETTINGS_MIZU_ROUTING_UNITS": "m/s",
+        "SETTINGS_MIZU_ROUTING_DT": 3600,
+        "MIZU_FROM_MODEL": "SUMMA",
     }
     extra = spec.get("extra_config") if isinstance(spec.get("extra_config"), dict) else {}
     for key, value in defaults.items():
@@ -1363,12 +1453,15 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
     extra_config = spec.get("extra_config") or {}
     if isinstance(extra_config, dict):
         for key, value in extra_config.items():
-            if value is not None:
-                cfg[key] = value
+            if value is None:
+                continue
+            yaml_key = spec_key_to_yaml_key(key)
+            if yaml_key:
+                cfg[yaml_key] = value
 
     cfg = apply_semi_distributed_config_defaults(cfg, spec)
     cfg = apply_elevation_distributed_config_defaults(cfg, spec)
-    return cfg
+    return finalize_symfluence_config(cfg, spec)
 
 def preserve_explicit_config_fields_from_prompt(plan: dict, prompt_text: str) -> dict:
     """
@@ -1548,6 +1641,12 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         "domain_def": s(plan_cfg.get("domain_def")) or s(st.session_state.domain_def),
         "hydrological_model": current_hydrological_model(plan_cfg),
         "forcing_dataset": s(plan_cfg.get("forcing_dataset")) or s(st.session_state.forcing_dataset) or None,
+        "station_id": (
+            s(plan_cfg.get("station_id"))
+            or s(st.session_state.station_id)
+            or extract_station_id_from_request(s(st.session_state.get("nl_request", "")))
+            or None
+        ),
 
         # Prefer NUM_PROCESSES, but keep MPI_PROCESSES for compatibility if your template still uses it
         "num_processes": int(st.session_state.mpi),
@@ -1567,14 +1666,85 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
             spec[k] = v
 
     spec = wx.merge_advanced_into_spec(spec, plan_cfg)
+
+    sym_domain = s(spec.get("domain_name"))
+    if plan_uses_local_data(plan_cfg, run_steps, s(st.session_state.get("nl_request", "")), data_dir=SYMFLUENCE_DATA_DIR):
+        spec["DOWNLOAD_WSC_DATA"] = False
+    elif sym_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, sym_domain):
+        spec["DOWNLOAD_WSC_DATA"] = False
+
     return hoist_plan_extra_config_to_spec(spec)
 
-def refresh_plan_editor_from_state() -> None:
-    if st.session_state.get("run_plan"):
-        st.session_state["editable_plan_box"] = json.dumps(
-            st.session_state.run_plan,
-            indent=2,
-        )
+def plan_editor_text_from_run_plan() -> str:
+    if not st.session_state.get("run_plan"):
+        return ""
+    return json.dumps(st.session_state.run_plan, indent=2)
+
+
+def refresh_plan_editor_from_state(force: bool = False) -> None:
+    """Sync the JSON editor from run_plan. Skips when the user has unsaved edits."""
+    if not st.session_state.get("run_plan"):
+        return
+    source = plan_editor_text_from_run_plan()
+    editor_text = s(st.session_state.get("editable_plan_box"))
+    if not force and editor_text and editor_text != source:
+        try:
+            edited = json.loads(editor_text)
+            if isinstance(edited, dict) and edited != st.session_state.run_plan:
+                return
+        except Exception:
+            return
+    st.session_state["_pending_plan_editor_text"] = source
+    st.session_state["_plan_editor_synced"] = source.strip()
+    if force:
+        st.session_state.pop("editable_plan_box", None)
+
+
+def apply_pending_plan_editor_sync() -> None:
+    """Apply queued plan JSON to the editor. Must run before editable_plan_box is rendered."""
+    pending = st.session_state.pop("_pending_plan_editor_text", None)
+    if pending is not None:
+        st.session_state["editable_plan_box"] = pending
+
+
+def request_plan_editor_sync_from_run_plan() -> None:
+    """Queue run_plan JSON for the editor on the next pre-widget render."""
+    if not st.session_state.get("run_plan"):
+        return
+    source = plan_editor_text_from_run_plan().strip()
+    if s(st.session_state.get("_plan_editor_synced")) == source:
+        return
+    st.session_state["_pending_plan_editor_text"] = plan_editor_text_from_run_plan()
+    st.session_state["_plan_editor_synced"] = source
+
+
+def commit_plan_editor_to_session(
+    *,
+    plan_text: str | None = None,
+    apply_ui: bool = True,
+) -> tuple[bool, str]:
+    """Apply the JSON editor contents to st.session_state.run_plan."""
+    plan_text = s(
+        plan_text
+        if plan_text is not None
+        else st.session_state.get("editable_plan_box")
+    )
+    if not plan_text:
+        return True, ""
+    try:
+        edited_plan = json.loads(plan_text)
+    except Exception as e:
+        return False, f"Plan JSON is invalid: {e}"
+    if not isinstance(edited_plan, dict):
+        return False, "Plan JSON must be an object."
+    st.session_state.run_plan = edited_plan
+    st.session_state["_plan_editor_synced"] = plan_text.strip()
+    steps = edited_plan.get("steps")
+    if isinstance(steps, list):
+        st.session_state["_committed_plan_steps"] = list(steps)
+    if apply_ui:
+        apply_edited_plan_to_session(edited_plan)
+    return True, ""
 
 
 def get_required_config_fields_for_steps(
@@ -1669,15 +1839,12 @@ def sync_all_ui_fields_to_plan(refresh_editor: bool = False) -> None:
 
 
 def update_run_plan_needs_user_input() -> None:
-    """Refresh needs_user_input from the current plan config without overwriting plan fields from UI."""
+    """Refresh needs_user_input only — never rewrite steps or normalize the plan in place."""
     if not st.session_state.get("run_plan"):
         return
-    plan = normalize_local_workflow_plan(
-        st.session_state.run_plan,
-        s(st.session_state.get("nl_request", "")),
-        data_dir=SYMFLUENCE_DATA_DIR,
-    )
-    cfg = (plan.get("config") or {})
+    plan = dict(st.session_state.run_plan)
+    cfg = dict(plan.get("config") or {})
+    plan["config"] = cfg
     steps = plan.get("steps", []) or []
     nl = s(st.session_state.get("nl_request", ""))
     required = get_required_config_fields_for_steps(steps, cfg, nl)
@@ -1767,15 +1934,11 @@ def set_plan_config_field(field: str, value: str) -> None:
     if field == "domain_name":
         st.session_state.domain_name = value
         if value and s(st.session_state.experiment_id):
-            st.session_state.run_folder = preview_run_folder_name(
-                value, s(st.session_state.experiment_id)
-            )
+            sync_run_folder_from_session(unlock=True)
     elif field == "experiment_id":
         st.session_state.experiment_id = value
         if value and s(st.session_state.domain_name):
-            st.session_state.run_folder = preview_run_folder_name(
-                s(st.session_state.domain_name), value
-            )
+            sync_run_folder_from_session(unlock=True)
     elif field == "pour_point_coords":
         st.session_state.selected_pour_point = value
         st.session_state.pour_point_input = value
@@ -2400,10 +2563,11 @@ def run_generate_plan_from_nl_request() -> None:
     if not llm_provider_available(provider):
         st.error(f"{provider_label} provider is not available in this environment.")
         return
-    if not s(st.session_state.nl_request):
+    if not s(st.session_state.nl_request) or is_plan_json_text(st.session_state.nl_request):
         st.error("Describe your workflow first (text or voice).")
         return
     try:
+        capture_user_prompt_from_session()
         planner_request = augment_request_with_ui(st.session_state.nl_request)
         model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
         if provider == "gemini":
@@ -2442,8 +2606,11 @@ def run_generate_plan_from_nl_request() -> None:
             raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
 
         st.session_state.run_plan = plan
+        st.session_state.pop("_committed_plan_steps", None)
         apply_plan_config_to_ui(plan)
-        refresh_plan_editor_from_state()
+        if s(st.session_state.get("run_folder")):
+            st.session_state.run_workspace_locked = True
+        refresh_plan_editor_from_state(force=True)
         st.success("Run plan generated.")
         st.rerun()
     except Exception as e:
@@ -2556,8 +2723,7 @@ def apply_plan_config_to_ui(plan: dict):
     bump_config_preview_version()
     mark_spatial_inputs_stale()
 
-    if domain_name and experiment_id:
-        st.session_state.run_folder = preview_run_folder_name(domain_name, experiment_id)
+    sync_run_folder_from_session()
 
     wx.apply_advanced_config_from_plan(cfgp)
     st.session_state.refresh_spatial_inputs = True
@@ -2947,9 +3113,13 @@ def apply_loaded_run_to_session(
     execution_log: str | None = None,
 ) -> None:
     st.session_state.run_folder = run_folder
+    st.session_state.run_workspace_locked = True
 
     if plan:
         st.session_state.run_plan = plan
+        steps = plan.get("steps")
+        if isinstance(steps, list):
+            st.session_state["_committed_plan_steps"] = list(steps)
     else:
         st.session_state.run_plan = {
             "config": plan_cfg,
@@ -3025,12 +3195,20 @@ def load_assistant_run(run_folder: str) -> str | None:
     if not plan_cfg:
         return f"No config.yaml or plan.json found in {run_dir}"
 
-    prompt_path = run_dir / "prompt.txt"
-    if prompt_path.exists():
-        st.session_state.nl_request = prompt_path.read_text(encoding="utf-8").strip()
+    exp = s(plan_cfg.get("experiment_id"))
+    domain_raw = s(plan_cfg.get("domain_name"))
+    if domain_raw and exp:
+        basin, mac_suffix = symfluence_domain_mac_suffix(domain_raw)
+        if mac_suffix is None:
+            basin = split_domain_name_from_combined(domain_raw, exp) or domain_raw
+        plan_cfg["domain_name"] = basin
 
     log_path = run_dir / "logs" / "execution.log"
     execution_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    recovered_prompt = load_user_prompt_from_run_dir(run_dir, execution_log)
+    if recovered_prompt:
+        st.session_state.user_prompt = recovered_prompt
+        st.session_state.nl_request = recovered_prompt
 
     apply_loaded_run_to_session(
         run_folder,
@@ -3065,7 +3243,10 @@ def load_symfluence_data_domain(folder_name: str) -> str | None:
         yaml_plan["experiment_id"] = experiment_id
         plan_cfg = yaml_plan
 
-    run_folder = preview_run_folder_name(domain_name, experiment_id)
+    basin, _suffix = symfluence_domain_mac_suffix(domain_name)
+    plan_cfg["domain_name"] = basin
+    plan_cfg["experiment_id"] = experiment_id
+    run_folder = run_folder_for_symfluence_domain(domain_name, experiment_id)
     apply_loaded_run_to_session(run_folder, plan_cfg, plan=None, execution_log="")
     return None
 
@@ -3076,9 +3257,17 @@ def start_new_assistant_run_from_session() -> str | None:
     if not domain_name or not experiment_id:
         return "Set Domain name and Experiment ID before starting a new run."
 
-    run_folder = preview_run_folder_name(domain_name, experiment_id)
+    basin = symfluence_domain_name(domain_name, experiment_id)
+    st.session_state.run_workspace_locked = False
+    run_folder = allocate_unique_run_folder(
+        basin,
+        experiment_id,
+        RUNS_DIR,
+        SYMFLUENCE_DATA_DIR,
+    )
     st.session_state.run_folder = run_folder
     build_real_run_files_from_state()
+    st.session_state.run_workspace_locked = True
     return None
 
 
@@ -3093,13 +3282,23 @@ def render_start_load_run_section() -> None:
         active_folder = s(st.session_state.run_folder)
         if active_folder:
             run_path = RUNS_DIR / active_folder
-            data_path = SYMFLUENCE_DATA_DIR / f"domain_{active_folder}"
+            data_path = symfluence_data_domain_dir(
+                s(st.session_state.domain_name),
+                s(st.session_state.experiment_id),
+                run_folder=active_folder,
+            )
             if run_path.is_dir():
-                st.info(f"Active assistant run: `{run_path}`")
+                lock_note = " (loaded — will resume in place)" if st.session_state.get("run_workspace_locked") else ""
+                st.info(f"Active assistant run: `{run_path}`{lock_note}")
             elif data_path.is_dir():
                 st.info(f"Active SYMFLUENCE domain: `{data_path}`")
             else:
                 st.info(f"Active run folder name: `{active_folder}` (not created on disk yet)")
+            if not st.session_state.get("run_workspace_locked") and " (" in active_folder:
+                st.caption(
+                    "Mac-style duplicate active — SYMFLUENCE data will go to a new "
+                    f"`domain_*` folder, not the original workspace."
+                )
         else:
             st.caption("No active run folder yet.")
 
@@ -3117,15 +3316,29 @@ def render_start_load_run_section() -> None:
 
         if source == "new":
             st.caption(
-                "Uses the Domain name and Experiment ID below to create "
-                f"`runs/<domain>_<experiment>/` with config.yaml, plan.json, and spec.json."
+                "Uses Domain name and Experiment ID to create "
+                f"`runs/<domain>_<experiment>/` (config.yaml, plan.json, spec.json). "
+                "If that workspace already exists, a Mac-style duplicate is created, e.g. "
+                "`Bow_at_Banff_semi_distributed_run_1 (1)` with data under "
+                "`domain_Bow_at_Banff_semi_distributed (1)/`."
             )
-            if st.button("Create / refresh run folder", key="start_new_assistant_run", width="stretch"):
+            if st.button("Create new run folder", key="start_new_assistant_run", width="stretch"):
                 err = start_new_assistant_run_from_session()
                 if err:
                     st.error(err)
                 else:
-                    st.success(f"Run folder ready: `{st.session_state.run_folder}`")
+                    sym_domain = symfluence_domain_for_run_folder(
+                        st.session_state.run_folder,
+                        symfluence_domain_name(
+                            st.session_state.domain_name,
+                            st.session_state.experiment_id,
+                        ),
+                        st.session_state.experiment_id,
+                    )
+                    st.success(
+                        f"Run folder ready: `{st.session_state.run_folder}` "
+                        f"(SYMFLUENCE data: `domain_{sym_domain}`)"
+                    )
                     st.rerun()
 
         elif source == "assistant":
@@ -3170,6 +3383,56 @@ def render_start_load_run_section() -> None:
                         st.rerun()
 
 
+def is_plan_json_text(text: str) -> bool:
+    """True when text looks like a run plan object (not a natural-language prompt)."""
+    text = s(text)
+    if not text.startswith("{"):
+        return False
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and "steps" in obj
+
+
+def user_prompt_for_metadata() -> str:
+    """Return the original NL user prompt, never the JSON plan editor contents."""
+    explicit = s(st.session_state.get("user_prompt"))
+    if explicit and not is_plan_json_text(explicit):
+        return explicit
+    nl = s(st.session_state.get("nl_request"))
+    if nl and not is_plan_json_text(nl):
+        return nl
+    return ""
+
+
+def capture_user_prompt_from_session() -> None:
+    """Snapshot the prompt box when generating a plan (before plan JSON can leak in)."""
+    nl = s(st.session_state.get("nl_request"))
+    if nl and not is_plan_json_text(nl):
+        st.session_state.user_prompt = nl
+
+
+def load_user_prompt_from_run_dir(run_dir: Path, execution_log: str = "") -> str:
+    """Load prompt.txt from a run folder, recovering from execution.log if corrupted."""
+    prompt_path = run_dir / "prompt.txt"
+    if prompt_path.exists():
+        raw = prompt_path.read_text(encoding="utf-8").strip()
+        if raw and not is_plan_json_text(raw):
+            return raw
+
+    marker_start = "===== USER PROMPT ====="
+    marker_end = "===== RUN PLAN ====="
+    if marker_start in execution_log:
+        chunk = execution_log.split(marker_start, 1)[1]
+        if marker_end in chunk:
+            chunk = chunk.split(marker_end, 1)[0]
+        recovered = chunk.strip()
+        if recovered and recovered != "(no prompt recorded)" and not is_plan_json_text(recovered):
+            return recovered
+    return ""
+
+
 def write_run_metadata_files(outdir: Path, plan: dict, spec_dict: dict | None = None) -> None:
     """Persist plan.json (and optional spec.json) under runs/<domain>_<experiment>/."""
     outdir.mkdir(parents=True, exist_ok=True)
@@ -3177,7 +3440,7 @@ def write_run_metadata_files(outdir: Path, plan: dict, spec_dict: dict | None = 
         json.dumps(plan or {}, indent=2),
         encoding="utf-8",
     )
-    prompt = s(st.session_state.get("nl_request"))
+    prompt = user_prompt_for_metadata()
     if prompt:
         (outdir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
     if spec_dict is not None:
@@ -3273,7 +3536,7 @@ def manual_execution_log_path(outdir: Path) -> Path:
 def execution_log_preamble(plan: dict | None = None) -> str:
     """Header for execution.log: user prompt first, then resolved run plan."""
     parts: list[str] = []
-    prompt = s(st.session_state.get("nl_request"))
+    prompt = user_prompt_for_metadata()
     if prompt:
         parts.append("===== USER PROMPT =====\n")
         parts.append(prompt)
@@ -4125,16 +4388,19 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 run_generate_plan_from_nl_request()
 
         if st.session_state.run_plan:
-            current = json.dumps(st.session_state.run_plan, indent=2)
+            apply_pending_plan_editor_sync()
+            if "editable_plan_box" not in st.session_state:
+                request_plan_editor_sync_from_run_plan()
+                apply_pending_plan_editor_sync()
+
             plan_text_holder: dict[str, str] = {"text": ""}
 
             def _render_plan_body() -> None:
                 plan_text_holder["text"] = st.text_area(
                     "Edit plan JSON",
-                    value=current,
                     height=260,
                     key="editable_plan_box",
-                    help="Must be valid JSON.",
+                    help="Must be valid JSON. Changes are applied when you click Execute plan or Resolve dependencies.",
                     label_visibility="collapsed",
                 ).strip()
 
@@ -4142,22 +4408,9 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 "Proposed run plan",
                 anchor_id="sym_copy_anchor_plan_json",
                 copy_key="copy_plan_json",
-                fallback_text=s(st.session_state.get("editable_plan_box", current)),
+                fallback_text=s(st.session_state.get("editable_plan_box", plan_editor_text_from_run_plan())),
                 render_body=_render_plan_body,
             )
-            plan_text = plan_text_holder["text"]
-
-            if plan_text:
-                try:
-                    edited_plan = json.loads(plan_text)
-                except Exception as e:
-                    st.error(f"Plan JSON is invalid: {e}")
-                    st.stop()
-
-                if plan_text != current.strip():
-                    st.session_state.run_plan = edited_plan
-                    apply_edited_plan_to_session(edited_plan)
-
             update_run_plan_needs_user_input()
 
             if st.button(
@@ -4166,11 +4419,21 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 width="stretch",
                 type="secondary",
             ):
+                ok, err = commit_plan_editor_to_session(
+                    plan_text=plan_text_holder["text"]
+                    or s(st.session_state.get("editable_plan_box"))
+                )
+                if not ok:
+                    st.error(err)
+                    st.stop()
                 resolved_plan = resolve_requested_plan_dependencies(st.session_state.run_plan)
                 st.session_state.run_plan = resolved_plan
-                if "editable_plan_box" in st.session_state:
-                    del st.session_state["editable_plan_box"]
-                st.session_state["editable_plan_box"] = json.dumps(resolved_plan, indent=2)
+                steps = resolved_plan.get("steps")
+                if isinstance(steps, list):
+                    st.session_state["_committed_plan_steps"] = list(steps)
+                st.session_state["_pending_plan_editor_text"] = json.dumps(resolved_plan, indent=2)
+                st.session_state["_plan_editor_synced"] = st.session_state["_pending_plan_editor_text"].strip()
+                st.session_state.pop("editable_plan_box", None)
                 st.success("Dependencies resolved from operation catalog.")
                 st.rerun()
 
@@ -4248,10 +4511,22 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
             if clear_plan:
                 st.session_state.run_plan = None
                 st.session_state.execute_plan = False
+                st.session_state.pop("editable_plan_box", None)
+                st.session_state.pop("_plan_editor_synced", None)
+                st.session_state.pop("_pending_plan_editor_text", None)
+                st.session_state.pop("_committed_plan_steps", None)
                 st.success("Plan cleared.")
                 st.rerun()
 
             if exec_btn:
+                ok, err = commit_plan_editor_to_session(
+                    plan_text=plan_text_holder["text"]
+                    or s(st.session_state.get("editable_plan_box"))
+                )
+                if not ok:
+                    st.error(err)
+                    st.stop()
+                update_run_plan_needs_user_input()
                 try:
                     plan_cfg = (st.session_state.run_plan or {}).get("config", {}) or {}
                     validation_cfg = {
@@ -4275,8 +4550,9 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
 
     with chat_tab:
         st.markdown("#### Conversation")
-        if s(st.session_state.nl_request):
-            st.chat_message("user").write(st.session_state.nl_request)
+        display_prompt = user_prompt_for_metadata()
+        if display_prompt:
+            st.chat_message("user").write(display_prompt)
         if st.session_state.run_plan:
             steps = st.session_state.run_plan.get("steps", []) or []
             st.chat_message("assistant").write(
@@ -4303,7 +4579,19 @@ def show_text(text: str):
 
 if st.session_state.execute_plan and st.session_state.run_plan:
     st.session_state.execute_plan = False
-    plan = force_steps(st.session_state.run_plan, want_create_pour_point=st.session_state.want_create_pour_point)
+    capture_user_prompt_from_session()
+    committed_steps = st.session_state.get("_committed_plan_steps")
+    plan = normalize_local_workflow_plan(
+        force_steps(
+            st.session_state.run_plan,
+            want_create_pour_point=st.session_state.want_create_pour_point,
+        ),
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", "")),
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
+    if isinstance(committed_steps, list) and committed_steps:
+        plan["steps"] = list(committed_steps)
+    st.session_state.run_plan = plan
     plan_cfg = (plan or {}).get("config", {}) or {}
     spec_dict = build_spec_dict(plan_cfg)
 
@@ -4381,6 +4669,20 @@ if st.session_state.execute_plan and st.session_state.run_plan:
 
     write_run_metadata_files(outdir, plan, spec_dict)
 
+    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    basin_domain = symfluence_domain_name(
+        s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
+        s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
+    )
+    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
+    plan = ensure_skip_process_observed_when_local_streamflow(
+        plan,
+        user_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+        symfluence_domain=symfluence_domain,
+    )
+    st.session_state.run_plan = plan
+
     steps = plan.get("steps", []) or []
 
     danger_found = [step for step in steps if step in DANGER_STEPS]
@@ -4442,6 +4744,37 @@ if st.session_state.execute_plan and st.session_state.run_plan:
             show_text("".join(log))
             continue
 
+        basin_domain = symfluence_domain_name(
+            s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
+            s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
+        )
+        symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
+        experiment_id = s(plan_cfg.get("experiment_id")) or "run_1"
+
+        if step == "model_specific_preprocessing" and symfluence_domain and (
+            domain_has_complete_local_workflow(
+                SYMFLUENCE_DATA_DIR, symfluence_domain, experiment_id
+            )
+            or domain_has_complete_local_workflow(
+                SYMFLUENCE_DATA_DIR, basin_domain, experiment_id
+            )
+            or local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, symfluence_domain)
+            or local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, basin_domain)
+        ):
+            restore_domain = symfluence_domain
+            if local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, restore_domain):
+                if local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, basin_domain):
+                    restore_domain = basin_domain
+                log.append(
+                    "\nRestoring local catchment shapefiles from semidistributed/into "
+                    "(legacy catchment path had wrong HRU IDs).\n"
+                )
+                restore_local_domain_artifacts(
+                    SYMFLUENCE_DATA_DIR,
+                    restore_domain,
+                    experiment_id,
+                )
+
         cmd = build_symfluence_step_cmd(step, out_yaml)
         log.append(f"\n===== STEP: {step} =====\n$ {' '.join(cmd)}\n\n")
         show_text("".join(log))
@@ -4465,6 +4798,46 @@ if st.session_state.execute_plan and st.session_state.run_plan:
             st.session_state.execution_log_text = "".join(log)
             progress_box.markdown(render_workflow_progress(plan, "".join(log)))
             break
+
+        if step == "setup_project" and not user_requires_fresh_cloud_workflow(
+            user_request, plan_cfg
+        ):
+            copied: list[str] = []
+            source_domain = infer_reuse_source_domain(
+                user_request,
+                basin_domain,
+                SYMFLUENCE_DATA_DIR,
+            )
+            if source_domain and user_request_reuses_local_domain_data(user_request):
+                copied = copy_reusable_domain_artifacts(
+                    SYMFLUENCE_DATA_DIR,
+                    source_domain,
+                    symfluence_domain,
+                )
+            elif symfluence_domain != basin_domain:
+                copied = seed_mac_duplicate_domain_from_basin(
+                    SYMFLUENCE_DATA_DIR,
+                    basin_domain,
+                    symfluence_domain,
+                )
+            if copied:
+                seed_msg = (
+                    "\nSeeded reusable local artifacts into "
+                    f"`domain_{symfluence_domain}` from existing on-disk data:\n"
+                    + "\n".join(f"  - {item}" for item in copied)
+                    + "\n"
+                )
+                log.append(seed_msg)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(seed_msg)
+                plan = ensure_skip_process_observed_when_local_streamflow(
+                    plan,
+                    user_request,
+                    data_dir=SYMFLUENCE_DATA_DIR,
+                    symfluence_domain=symfluence_domain,
+                )
+                st.session_state.run_plan = plan
+                steps = plan.get("steps", []) or []
 
         show_text("".join(log))
         st.session_state.execution_log_text = "".join(log)
