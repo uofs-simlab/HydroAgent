@@ -1,6 +1,7 @@
 from __future__ import annotations
 # Layout note: minor UI spacing tweaks.
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List
@@ -11,6 +12,7 @@ from server.core.plan_rules import (
 )
 
 PLANNER_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "planner_prompt.txt"
+PLAN_REFINEMENT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "plan_refinement_prompt.txt"
 
 
 def _normalize_domain_name_for_config(name: str | None):
@@ -239,7 +241,12 @@ def build_run_plan_schema() -> Dict[str, Any]:
     }
 
 
-def finalize_run_plan(plan: Dict[str, Any], user_request: str) -> Dict[str, Any]:
+def finalize_run_plan(
+    plan: Dict[str, Any],
+    user_request: str,
+    *,
+    skip_workflow_step_restore: bool = False,
+) -> Dict[str, Any]:
     cfg = plan.get("config", {}) or {}
 
     if cfg.get("extra_config") is not None and not isinstance(cfg.get("extra_config"), dict):
@@ -307,7 +314,12 @@ def finalize_run_plan(plan: Dict[str, Any], user_request: str) -> Dict[str, Any]
         )
 
     data_dir = Path.home() / "installs" / "SYMFLUENCE_data"
-    plan = normalize_local_workflow_plan(plan, user_request, data_dir=data_dir)
+    plan = normalize_local_workflow_plan(
+        plan,
+        user_request,
+        data_dir=data_dir,
+        skip_workflow_step_restore=skip_workflow_step_restore,
+    )
 
     preferred_order = [
         "validate_config",
@@ -356,3 +368,77 @@ def finalize_run_plan(plan: Dict[str, Any], user_request: str) -> Dict[str, Any]
 
     plan["config"] = _compact_plan_config(cfg)
     return plan
+
+
+def build_plan_refinement_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "reply": {
+                "type": "string",
+                "description": "Short natural-language reply to the user.",
+            },
+            "update_plan": {
+                "type": "boolean",
+                "description": "True when the workflow plan should change.",
+            },
+            "plan": build_run_plan_schema(),
+        },
+        "required": ["reply", "update_plan", "plan"],
+    }
+
+
+def build_plan_refinement_user_prompt(
+    *,
+    current_plan: Dict[str, Any],
+    user_message: str,
+    conversation_excerpt: str = "",
+    context_excerpt: str = "",
+) -> str:
+    lines = [
+        "Current workflow plan (JSON):",
+        json.dumps(current_plan, indent=2),
+        "",
+        f"Latest user message:\n{user_message.strip()}",
+    ]
+    if conversation_excerpt.strip():
+        lines.extend(["", "Conversation so far:", conversation_excerpt.strip()])
+    if context_excerpt.strip():
+        lines.extend(["", "Runtime context:", context_excerpt.strip()])
+    return "\n".join(lines).strip() + "\n"
+
+
+def finalize_plan_refinement(
+    result: Dict[str, Any],
+    *,
+    current_plan: Dict[str, Any],
+    conversation_text: str,
+    data_dir: Path | None = None,
+) -> tuple[str, Dict[str, Any], bool]:
+    reply = s(result.get("reply")) or "Done."
+    update_plan = bool(result.get("update_plan"))
+    if not update_plan:
+        return reply, dict(current_plan), False
+
+    new_plan = result.get("plan")
+    if not isinstance(new_plan, dict):
+        raise RuntimeError("Planner refinement returned invalid 'plan' (must be object).")
+
+    required_top = {"config", "steps", "needs_user_input", "notes"}
+    missing_top = [k for k in required_top if k not in new_plan]
+    if missing_top:
+        raise RuntimeError(f"Refined plan missing keys: {missing_top}")
+
+    new_plan = finalize_run_plan(
+        new_plan,
+        conversation_text,
+        skip_workflow_step_restore=True,
+    )
+    return reply, new_plan, True
+
+
+def s(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()

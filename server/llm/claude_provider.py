@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Tuple
 
 from anthropic import Anthropic
 
 from server.llm.plan_shared import (
     PLANNER_PROMPT_PATH,
+    PLAN_REFINEMENT_PROMPT_PATH,
+    build_plan_refinement_schema,
+    build_plan_refinement_user_prompt,
     build_run_plan_schema,
+    finalize_plan_refinement,
     finalize_run_plan,
     _extract_bounding_box,
     _extract_hydrological_model,
@@ -113,6 +118,38 @@ class ClaudeProvider:
             max_output_tokens=4096,
         )
         return finalize_run_plan(plan, user_request)
+
+    def refine_run_plan(
+        self,
+        *,
+        model: str,
+        user_message: str,
+        current_plan: Dict[str, Any],
+        conversation_text: str = "",
+        context_text: str = "",
+        data_dir: Path | None = None,
+    ) -> Tuple[str, Dict[str, Any], bool]:
+        refinement_prompt = PLAN_REFINEMENT_PROMPT_PATH.read_text(encoding="utf-8")
+        schema = build_plan_refinement_schema()
+        user_prompt = build_plan_refinement_user_prompt(
+            current_plan=current_plan,
+            user_message=user_message,
+            conversation_excerpt=conversation_text,
+            context_excerpt=context_text,
+        )
+        result = self._call_json_schema(
+            model=model,
+            schema=schema,
+            system_prompt=refinement_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=4096,
+        )
+        return finalize_plan_refinement(
+            result,
+            current_plan=current_plan,
+            conversation_text=conversation_text or user_message,
+            data_dir=data_dir,
+        )
 
     def generate_config_spec(self, *, model: str, user_request: str) -> Dict[str, Any]:
         schema = {

@@ -264,17 +264,15 @@ def compute_quick_metrics(merged: pd.DataFrame) -> dict[str, float | int | str]:
 
 
 def get_calibration_config_values(plan_cfg: dict | None = None) -> dict[str, str]:
+    from server.core.ui_config_fields import lookup_plan_config
+
     plan_cfg = plan_cfg or {}
-    extra = plan_cfg.get("extra_config") if isinstance(plan_cfg.get("extra_config"), dict) else {}
     values: dict[str, str] = {}
     for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
-        raw = st.session_state.get(session_key)
-        if raw is None or raw == "":
-            val = s(plan_cfg.get(session_key)) or s(extra.get(session_key)) or s(extra.get(yaml_key))
-        elif session_key in ("iterations", "population_size"):
-            val = s(str(raw))
-        else:
-            val = s(raw) or s(plan_cfg.get(session_key)) or s(extra.get(session_key)) or s(extra.get(yaml_key))
+        val = s(lookup_plan_config(plan_cfg, session_key, yaml_key))
+        if not val:
+            raw = st.session_state.get(session_key)
+            val = s(str(raw)) if session_key in ("iterations", "population_size") and raw is not None else s(raw)
         if val:
             values[session_key] = val
     return values
@@ -336,11 +334,14 @@ def merge_calibration_into_spec(spec: dict, plan_cfg: dict | None = None) -> dic
 
 
 def get_advanced_config_values(plan_cfg: dict | None = None) -> dict[str, str]:
+    from server.core.ui_config_fields import lookup_plan_config
+
     plan_cfg = plan_cfg or {}
-    extra = plan_cfg.get("extra_config") if isinstance(plan_cfg.get("extra_config"), dict) else {}
     values: dict[str, str] = {}
     for session_key, yaml_key, _ in ADVANCED_SESSION_FIELDS:
-        values[session_key] = s(st.session_state.get(session_key)) or s(plan_cfg.get(session_key)) or s(extra.get(session_key)) or s(extra.get(yaml_key))
+        val = s(lookup_plan_config(plan_cfg, session_key, yaml_key)) or s(st.session_state.get(session_key))
+        if val:
+            values[session_key] = val
     return values
 
 
@@ -384,6 +385,8 @@ def sync_advanced_config_to_plan() -> None:
 
 
 def render_advanced_config_section() -> None:
+    from widget_keys import input_panel_widget_key
+
     with st.expander("Advanced config", expanded=False):
         st.caption("Optional SYMFLUENCE settings synced to the plan and generated config.yaml.")
         c1, c2 = st.columns(2)
@@ -396,17 +399,17 @@ def render_advanced_config_section() -> None:
                 )
                 if st.session_state.get("streamflow_data_provider", "WSC") in ["WSC", "USGS", "VI", "NIWA"]
                 else 0,
-                key="adv_streamflow_data_provider",
+                key=input_panel_widget_key("adv_streamflow_data_provider"),
             )
             st.session_state.station_id = st.text_input(
                 "Station ID",
                 value=s(st.session_state.get("station_id")),
-                key="adv_station_id",
+                key=input_panel_widget_key("adv_station_id"),
             )
             st.session_state.routing_model = st.text_input(
                 "Routing model",
                 value=s(st.session_state.get("routing_model")) or "mizuRoute",
-                key="adv_routing_model",
+                key=input_panel_widget_key("adv_routing_model"),
             )
         with c2:
             st.session_state.pet_method = st.selectbox(
@@ -417,23 +420,23 @@ def render_advanced_config_section() -> None:
                 )
                 if st.session_state.get("pet_method", "oudin") in ["oudin", "hamon", "hargreaves"]
                 else 0,
-                key="adv_pet_method",
+                key=input_panel_widget_key("adv_pet_method"),
             )
             st.session_state.spinup_period = st.text_input(
                 "Spinup period",
                 value=s(st.session_state.get("spinup_period")),
                 placeholder="2004-01-01, 2004-01-04",
-                key="adv_spinup_period",
+                key=input_panel_widget_key("adv_spinup_period"),
             )
             st.session_state.calibration_period = st.text_input(
                 "Calibration period",
                 value=s(st.session_state.get("calibration_period")),
-                key="adv_calibration_period",
+                key=input_panel_widget_key("adv_calibration_period"),
             )
             st.session_state.evaluation_period = st.text_input(
                 "Evaluation period",
                 value=s(st.session_state.get("evaluation_period")),
-                key="adv_evaluation_period",
+                key=input_panel_widget_key("adv_evaluation_period"),
             )
         sync_advanced_config_to_plan()
 
@@ -587,6 +590,8 @@ def render_calibration_section(
     execute_calibrate_fn,
     location: str = "assistant",
 ) -> None:
+    from widget_keys import input_panel_widget_key
+
     prefix = f"calibration_{location}"
     with st.expander("Calibration", expanded=False):
         st.caption(
@@ -603,7 +608,7 @@ def render_calibration_section(
                 )
                 if st.session_state.get("iterative_optimization_algorithm", "DE") in CALIBRATION_ALGORITHMS
                 else 0,
-                key=f"{prefix}_algorithm",
+                key=input_panel_widget_key(f"{prefix}_algorithm"),
             )
             st.session_state.optimization_metric = st.selectbox(
                 "Metric",
@@ -611,7 +616,7 @@ def render_calibration_section(
                 index=CALIBRATION_METRICS.index(st.session_state.get("optimization_metric", "KGE"))
                 if st.session_state.get("optimization_metric", "KGE") in CALIBRATION_METRICS
                 else 0,
-                key=f"{prefix}_metric",
+                key=input_panel_widget_key(f"{prefix}_metric"),
             )
             st.session_state.optimization_target = st.selectbox(
                 "Target",
@@ -621,7 +626,7 @@ def render_calibration_section(
                 )
                 if st.session_state.get("optimization_target", "streamflow") in CALIBRATION_TARGETS
                 else 0,
-                key=f"{prefix}_target",
+                key=input_panel_widget_key(f"{prefix}_target"),
             )
         with c2:
             st.session_state.calibration_timestep = st.selectbox(
@@ -632,7 +637,7 @@ def render_calibration_section(
                 )
                 if st.session_state.get("calibration_timestep", "daily") in CALIBRATION_TIMESTEPS
                 else 2,
-                key=f"{prefix}_timestep",
+                key=input_panel_widget_key(f"{prefix}_timestep"),
             )
             st.session_state.iterations = int(
                 st.number_input(
@@ -640,7 +645,7 @@ def render_calibration_section(
                     min_value=1,
                     max_value=5000,
                     value=int(st.session_state.get("iterations", 50) or 50),
-                    key=f"{prefix}_iterations",
+                    key=input_panel_widget_key(f"{prefix}_iterations"),
                 )
             )
             st.session_state.population_size = int(
@@ -649,14 +654,14 @@ def render_calibration_section(
                     min_value=2,
                     max_value=500,
                     value=int(st.session_state.get("population_size", 10) or 10),
-                    key=f"{prefix}_population",
+                    key=input_panel_widget_key(f"{prefix}_population"),
                 )
             )
         st.session_state.calibration_period = st.text_input(
             "Calibration period",
             value=s(st.session_state.get("calibration_period")),
             placeholder="2004-01-05, 2004-01-19",
-            key=f"{prefix}_calibration_period",
+            key=input_panel_widget_key(f"{prefix}_calibration_period"),
         )
         sync_calibration_config_to_plan()
         sync_advanced_config_to_plan()

@@ -651,11 +651,56 @@ def restore_workflow_steps_from_user_request(plan: dict, user_request: str = "")
     return out
 
 
+def _normalize_chat_datetime(value: str, *, default_hm: str) -> str:
+    value = _s(value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return f"{value} {default_hm}"
+    return value
+
+
+def apply_chat_config_edits(plan: dict, user_message: str) -> dict:
+    """Apply config changes from natural-language chat messages."""
+    from server.core.ui_config_fields import apply_comprehensive_chat_config_edits
+
+    return apply_comprehensive_chat_config_edits(plan, user_message)
+
+
+def apply_chat_step_edits(plan: dict, user_message: str) -> dict:
+    """Apply explicit add/remove step instructions from a chat message."""
+    if not isinstance(plan, dict) or not user_message:
+        return plan
+    text = user_message.lower()
+    steps = list(plan.get("steps") or [])
+    changed = False
+    remove_verbs = r"(remove|removed|drop|dropped|skip|skipped|omit|omitted|exclude|excluded|without|delete|deleted)"
+    for step in WORKFLOW_STEP_NAMES:
+        if step == "dry_run":
+            continue
+        step_pat = re.escape(step)
+        if re.search(rf"{remove_verbs}.*\b{step_pat}\b", text) or re.search(
+            rf"\b{step_pat}\b.*{remove_verbs}", text
+        ):
+            if step in steps:
+                steps = [s for s in steps if s != step]
+                changed = True
+            continue
+        if re.search(rf"\b(add|added|include|included|insert|inserted)\b.*\b{step_pat}\b", text):
+            if step not in steps:
+                steps.append(step)
+                changed = True
+    if not changed:
+        return plan
+    out = dict(plan)
+    out["steps"] = steps
+    return out
+
+
 def normalize_local_workflow_plan(
     plan: dict,
     user_request: str = "",
     *,
     data_dir: str | Path | None = None,
+    skip_workflow_step_restore: bool = False,
 ) -> dict:
     """
     Fix plans for local-data / notebook-style workflows: no bbox gate, restore steps from prompt.
@@ -670,7 +715,8 @@ def normalize_local_workflow_plan(
 
     out = strip_user_forbidden_download_steps(out, user_request)
     out = ensure_plan_station_id(out, user_request)
-    out = restore_workflow_steps_from_user_request(out, user_request)
+    if not skip_workflow_step_restore:
+        out = restore_workflow_steps_from_user_request(out, user_request)
     out = ensure_skip_domain_rerun_when_local_artifacts_exist(out, user_request, data_dir=data_dir)
     out = ensure_online_data_when_missing(out, user_request, data_dir=data_dir)
     cfg = dict(out.get("config") or {})
@@ -683,7 +729,7 @@ def normalize_local_workflow_plan(
     needs = [x for x in (out.get("needs_user_input") or []) if x != "bounding_box_coords"]
     out["needs_user_input"] = needs
 
-    if set(steps) <= {"validate_config", "dry_run"}:
+    if not skip_workflow_step_restore and set(steps) <= {"validate_config", "dry_run"}:
         extracted = extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES)
         if extracted:
             if "validate_config" not in extracted:
