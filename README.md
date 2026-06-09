@@ -7,6 +7,7 @@ A natural-language assistant and Streamlit UI for planning and executing [SYMFLU
 ## Features
 
 - **Multi-provider LLM plan generation** — Supports OpenAI (GPT), Google (Gemini), and Anthropic (Claude) for natural-language workflow planning
+- **Conversational plan refinement** — Chat with the assistant after generating a plan to adjust steps, change parameters, or switch models; changes apply live
 - **Dependency resolution** — Automatically orders and validates workflow steps before execution
 - **Interactive map** — Pour-point and bounding-box selection with delineation output overlays via Folium
 - **Config generation** — Writes SYMFLUENCE-compatible `config.yaml` from plan parameters
@@ -22,9 +23,18 @@ A natural-language assistant and Streamlit UI for planning and executing [SYMFLU
 HydroAgent/
 ├── app/
 │   ├── ui_agent.py          # Main Streamlit application
-│   └── workflow_extras.py   # Results, maps, calibration shortcuts
+│   ├── workflow_extras.py   # Results, maps, calibration shortcuts
+│   ├── input_panel_sync.py  # Syncs plan config into session state and Input widgets
+│   └── widget_keys.py       # Versioned Streamlit widget key helpers
 ├── server/
-│   ├── core/                # Config templates, validation, parameter registry, plan rules
+│   ├── core/
+│   │   ├── local_domain.py      # Domain artifact copy/restore utilities
+│   │   ├── run_naming.py        # Mac-style duplicate run-folder naming
+│   │   ├── ui_config_fields.py  # Config field registry and chat-edit logic
+│   │   ├── plan_rules.py        # Workflow planning rules
+│   │   ├── template.py          # Config template renderer
+│   │   ├── validate.py          # Config validation
+│   │   └── parameter_registry.py
 │   ├── capabilities/        # Operation catalog, dependency resolution, proven-status flags
 │   └── llm/
 │       ├── plan_shared.py       # Shared schema and plan utilities across providers
@@ -32,15 +42,19 @@ HydroAgent/
 │       ├── gemini_provider.py   # Google Gemini provider
 │       └── claude_provider.py   # Anthropic Claude provider
 ├── prompts/
-│   └── planner_prompt.txt   # System prompt for workflow plan generation
+│   ├── planner_prompt.txt         # System prompt for initial plan generation
+│   └── plan_refinement_prompt.txt # System prompt for chat-based plan refinement
 ├── configs/                 # SYMFLUENCE YAML templates
 ├── data/capabilities/       # Operation catalog and dependency metadata (JSON)
-├── tools/                   # Optional mizuRoute post-processing scripts
+├── tools/
+│   ├── extract_discharge.py             # mizuRoute routed-flow extraction
+│   ├── summarize_routed_flow.py         # Flow summarisation
+│   └── restore_local_domain_artifacts.py  # Restore catchment/DEM from semidistributed into/ copies
 ├── examples/                # local_settings.example.yaml
 ├── cli.py                   # Headless plan generator (OpenAI)
 ├── run.sh                   # Launch script
 ├── requirements.txt
-└── runs/                    # Per-run output folders (config.yaml, plan.json, logs)
+└── runs/                    # Per-run output folders (config.yaml, plan.json, chat.json, logs)
 ```
 
 ---
@@ -118,8 +132,9 @@ Open `http://localhost:8501` in your browser.
 
 1. **Workflows → Input** — Set domain, experiment ID, pour point, model, and date range (or click **Load data domain**).
 2. **Workflows → Prompt** — Select a provider, enter your API key, describe the run in plain English, then click **Generate plan**.
-3. Review the plan JSON, click **Resolve dependencies**, then **Execute plan** (confirm `RUN` for `run_model` / `calibrate_model` steps).
-4. **Output / Results** — Inspect logs and artifacts; use the Results tab for routed-flow plots.
+3. Review the plan JSON; use the **Chat** tab to refine it conversationally if needed.
+4. Click **Resolve dependencies**, then **Execute plan** (confirm `RUN` for `run_model` / `calibrate_model` steps).
+5. **Output / Results** — Inspect logs and artifacts; use the Results tab for routed-flow plots.
 
 Run outputs are saved under `runs/<domain>_<experiment>/`.
 
@@ -193,8 +208,8 @@ The centre column contains the core workflow controls split across two tabs.
 
 | Option | What it does |
 |--------|-------------|
-| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, and `spec.json`. |
-| Load assistant run | Dropdown of existing folders under `runs/`; loading restores all session fields from the saved plan and config. |
+| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, `spec.json`, and `chat.json`. If the folder name is already taken, a Finder-style suffix (`(1)`, `(2)`, …) is added automatically to avoid overwriting existing work. |
+| Load assistant run | Dropdown of existing folders under `runs/`; loading restores all session fields from the saved plan, config, and chat history. |
 | Load SYMFLUENCE data domain | Dropdown of `domain_*` folders under `SYMFLUENCE_data/`; reads `config.yaml` from the domain and populates the session fields from it. |
 
 **Workflow settings**
@@ -204,7 +219,7 @@ The centre column contains the core workflow controls split across two tabs.
 | Domain name | Short identifier for the geographical domain (e.g. `BowRiver`). Must match the folder name in `SYMFLUENCE_data/domain_<name>`. |
 | Experiment ID | Short label for this particular run (e.g. `baseline2010`). Combined with domain name to form the run folder. |
 | Run folder name | Auto-filled as `<domain>_<experiment>`. Can be edited manually. |
-| Hydrological model | Dropdown: SUMMA, FUSE, GR, HBV, MESH, HYPE, ngen, TOPMODEL, and others supported by SYMFLUENCE. Leave blank to let the LLM choose from the prompt. |
+| Hydrological model | Dropdown: SUMMA, FUSE, GR, HBV, MESH, HYPE, ngen, TOPMODEL. Leave blank to let the LLM choose from the prompt. |
 | Domain definition | How the spatial domain is bounded: `delineate` (watershed from pour point), `lumped` (single HRU), `point` (single point), or `subset` (from bounding box). |
 | Forcing dataset | Meteorological input source: ERA5, RDRS, MERRA2, NLDAS, or Custom. |
 | NUM_PROCESSES | Number of parallel processes for model execution (1–128). |
@@ -214,13 +229,13 @@ The centre column contains the core workflow controls split across two tabs.
 
 | Control | What it does |
 |---------|-------------|
-| Map click mode — Pour point | Click anywhere on the map to drop a pour point marker. Coordinates are captured as `lat, lon` and written to the plan config. |
+| Map click mode — Pour point | Click anywhere on the map to drop a pour point marker. Coordinates are captured as `lat/lon` and written to the plan config. |
 | Map click mode — Bounding box | Click two corners of a rectangle on the map. The first click sets corner 1; the second click finalises the box. Clicking again after the box is set starts a new box. |
 | Review layers (expander) | Toggle checkboxes to overlay delineation outputs (DEM, land class, soil class, river basins, HRU/GRU, forcing grid, river network) on the map. Layers appear only when the corresponding shapefiles exist under `SYMFLUENCE_data/domain_<name>/`. |
 | Interactive map | Folium map; pan and zoom normally. Click to set spatial inputs according to the mode above. |
 | Clear pour point | Removes the current pour point from the session and from the active plan. |
 | Clear bounding box | Removes the current bounding box from the session and from the active plan. |
-| Pour point (lat/lon) | Text field showing the active coordinates; can also be typed or pasted directly in the format `lat,lon`. |
+| Pour point (lat/lon) | Text field showing the active coordinates; can also be typed or pasted directly in `lat/lon` format. |
 | Bounding box (north/west/south/east) | Text field for manual entry or display of the active bounding box. |
 
 **Run single step** (expander)
@@ -250,7 +265,7 @@ Runs individual SYMFLUENCE steps immediately using the current Input fields, wit
 
 ### Right panel (LLM Assistant)
 
-The right column (28% of the page width) contains the LLM assistant split across two tabs.
+The right column contains the LLM assistant split across two tabs.
 
 #### Prompt tab
 
@@ -281,7 +296,7 @@ Type a plain-English description of the modelling run — basin name, pour point
 
 **Voice input**
 
-Record directly in the browser. Transcription uses **OpenAI Whisper** (if an OpenAI key is saved) or **Gemini audio** (if a Gemini key is saved). Claude does not have a speech-to-text API and cannot be used for transcription.
+Record directly in the browser or upload a WAV/MP3/M4A/WebM file. Transcription uses **OpenAI Whisper** (if an OpenAI key is saved) or **Gemini audio** (if a Gemini key is saved). Claude does not have a speech-to-text API and cannot be used for transcription.
 
 | Button | What it does |
 |--------|-------------|
@@ -311,7 +326,45 @@ Inspects the current plan against the SYMFLUENCE operation catalog and inserts a
 
 #### Chat tab
 
-Shows a conversation view of the current session — your last prompt and the assistant's response (the list of planned steps and any warnings about missing inputs). This is read-only; use the Prompt tab to make changes.
+The Chat tab is a full conversational interface for refining the active plan. After generating an initial plan from the Prompt tab, switch here to make adjustments through natural language rather than editing JSON directly.
+
+**What you can do in chat:**
+
+- Add, remove, or reorder workflow steps ("add calibration", "remove acquire_forcings")
+- Change any config parameter ("set the end date to 2015-12-31", "use RDRS forcing", "switch to FUSE")
+- Change spatial inputs ("set pour point to 51.17/-115.57")
+- Ask questions about the plan or current run status without changing anything
+
+The assistant responds with a short explanation and applies any plan changes immediately — the editable plan JSON in the Prompt tab and the Input tab fields both update in real time.
+
+Chat history is saved to `runs/<folder>/chat.json` and is reloaded automatically when you load a run from the Start / load run section.
+
+---
+
+## Advanced config fields
+
+In addition to the core workflow settings visible in the Input tab, the following parameters can be set via the Chat tab or by editing the plan JSON directly. They are synced to `config.yaml` and the UI automatically.
+
+| Field | Description |
+|-------|-------------|
+| `streamflow_data_provider` | Streamflow observation source: WSC, USGS, VI, or NIWA. |
+| `station_id` | Gauging station identifier for streamflow download. |
+| `routing_model` | Routing model to use (e.g. mizuRoute). |
+| `pet_method` | PET calculation method: `oudin`, `hamon`, or `hargreaves`. |
+| `spinup_period` | Spin-up period as `YYYY-MM-DD, YYYY-MM-DD`. |
+| `calibration_period` | Calibration period as `YYYY-MM-DD, YYYY-MM-DD`. |
+| `evaluation_period` | Evaluation period as `YYYY-MM-DD, YYYY-MM-DD`. |
+| `iterative_optimization_algorithm` | Calibration algorithm: DE, DDS, PSO, NSGA-II, SCE-UA, or ADAM. |
+| `optimization_metric` | Objective function: KGE, NSE, RMSE, or Bias. |
+| `optimization_target` | Calibration target variable: streamflow, swe, snow_depth, et, or groundwater. |
+| `calibration_timestep` | Timestep for calibration evaluation: `native`, `hourly`, or `daily`. |
+| `iterations` | Number of calibration iterations. |
+| `population_size` | Population size for population-based algorithms. |
+| `download_snotel` | Boolean; download SNOTEL station data when true. |
+| `snotel_station` | SNOTEL station identifier. |
+| `data_access` | Data access mode (`local` to skip cloud downloads). |
+| `params_to_calibrate` | Comma-separated list of model parameters to include in calibration. |
+| `discretization` | Spatial discretization method. |
 
 ---
 
@@ -323,7 +376,18 @@ For workflows that skip download steps, place data under:
 SYMFLUENCE_data/domain_<DOMAIN_NAME>/
 ```
 
-Set `domain_name` and `experiment_id` as separate plan fields (do not merge them into `DOMAIN_NAME`).
+Set `domain_name` and `experiment_id` as separate plan fields (do not merge them into `DOMAIN_NAME`). Set `data_access: local` in the plan config or tell the assistant "use local data" in the prompt or chat.
+
+### Restoring semidistributed domain artifacts
+
+If catchment shapefiles or DEM are missing from a semidistributed domain, the `restore_local_domain_artifacts.py` tool can rebuild them from the `into/` copies created during domain delineation:
+
+```bash
+python tools/restore_local_domain_artifacts.py \
+    --data-dir /path/to/SYMFLUENCE_data \
+    --domain-name Bow_at_Banff_semi_distributed \
+    --experiment-id run_1
+```
 
 ---
 
@@ -332,10 +396,11 @@ Set `domain_name` and `experiment_id` as separate plan fields (do not merge them
 | Symptom | Fix |
 |---------|-----|
 | `symfluence workflow step` not found | Check `symfluence_python` in `~/.symfluence_assistant/config.yaml` |
-| DEM / shapefile missing | Verify `DOMAIN_NAME` matches a `SYMFLUENCE_data/domain_*` folder |
+| DEM / shapefile missing | Verify `DOMAIN_NAME` matches a `SYMFLUENCE_data/domain_*` folder; run `restore_local_domain_artifacts.py` if delineation outputs are present but legacy paths are missing |
 | Plan / LLM errors | Check the API key for the selected provider in the sidebar or config file |
 | Provider not available | Ensure `anthropic` or `google-genai` is installed in the same Python environment running Streamlit |
 | GeoPandas import errors | Install GDAL via conda-forge (see Prerequisites) |
+| Run folder collision | The app handles this automatically with `(1)`, `(2)` suffixes; if you see unexpected folder names, check `runs/` for pre-existing folders |
 
 ---
 
