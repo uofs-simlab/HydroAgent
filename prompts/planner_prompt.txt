@@ -154,7 +154,7 @@ Rules:
     - validate_config
     - dry_run
 
-36. If the user mentions a model name such as SUMMA, FUSE, GR, HBV, MESH, HYPE, ngen, or TOPMODEL, put it in config.hydrological_model.
+36. If the user mentions a SYMFLUENCE hydrological model (e.g. SUMMA, FUSE, GR, NGEN, MESH, HYPE), put the registry name in config.hydrological_model.
 
 37. If the user does not mention a model, use "SUMMA" as hydrological_model.
 

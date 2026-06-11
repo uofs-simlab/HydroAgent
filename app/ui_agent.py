@@ -36,8 +36,12 @@ from widget_keys import (  # noqa: E402
     mpi_widget_key,
 )
 from server.core.ui_config_fields import (  # noqa: E402
+    DOMAIN_DEF_OPTIONS,
+    FORCING_DATASET_OPTIONS,
     HYDROLOGICAL_MODEL_OPTIONS,
+    coerce_selectbox_value,
     lookup_plan_config,
+    normalize_forcing_dataset,
     normalize_hydrological_model,
     summarize_plan_changes_for_chat,
 )
@@ -57,7 +61,7 @@ from server.core.parameter_registry import (
 
 from server.capabilities.load_catalog import load_catalog
 from server.capabilities.proven_status import PROVEN_STATUS
-from server.capabilities.resolve_dependencies import resolve_step_dependencies
+from server.capabilities.resolve_dependencies import WORKFLOW_PRIORITY, resolve_step_dependencies
 from server.core.local_domain import (
     copy_reusable_domain_artifacts,
     infer_reuse_source_domain,
@@ -85,6 +89,7 @@ from server.core.plan_rules import (
     domain_has_complete_local_workflow,
     ensure_skip_process_observed_when_local_streamflow,
     extract_station_id_from_request,
+    infer_goal_steps_from_request,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
     plan_uses_local_data,
@@ -318,6 +323,7 @@ MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES = (
 ASSISTANT_PANEL_BUTTON_KEYS = (
     "save_openai_key",
     "transcribe_voice_to_prompt",
+    "transcribe_voice_to_chat",
     "generate_plan_gpt",
     "resolve_dependencies",
     "execute_plan_button",
@@ -806,26 +812,35 @@ def current_hydrological_model(plan_cfg: dict | None = None) -> str:
 
 def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> dict:
     catalog = load_catalog()
-    steps = plan.get("steps", []) or []
+    steps = list(plan.get("steps", []) or [])
     user_request = user_request or conversation_text_for_plan_rules()
 
-    resolved_steps = []
+    goal_steps = [step for step in steps if step not in ("validate_config", "dry_run")]
+    if not goal_steps:
+        goal_steps = infer_goal_steps_from_request(user_request)
+        if not goal_steps and re.search(r"\bsumma\b", user_request, flags=re.IGNORECASE):
+            goal_steps = ["run_model"]
 
-    for step in steps:
-        if step == "validate_config":
-            continue
-
+    resolved_steps: list[str] = []
+    for goal in goal_steps:
         try:
-            chain = resolve_step_dependencies(step, catalog)
+            chain = resolve_step_dependencies(goal, catalog, include_validate=False)
         except Exception:
-            chain = [step]
-
+            chain = [goal]
         for item in chain:
             if item not in resolved_steps:
                 resolved_steps.append(item)
 
     if "validate_config" not in resolved_steps:
         resolved_steps.insert(0, "validate_config")
+
+    if "dry_run" not in steps:
+        resolved_steps = [step for step in resolved_steps if step != "dry_run"]
+
+    resolved_steps = sorted(
+        resolved_steps,
+        key=lambda step: WORKFLOW_PRIORITY.get(step, 999),
+    )
 
     new_plan = json.loads(json.dumps(plan))
     new_plan["steps"] = resolved_steps
@@ -859,10 +874,17 @@ def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> d
 
     new_plan["needs_user_input"] = missing
 
+    notes = str(new_plan.get("notes", "")).strip()
+    if not missing and "Missing required inputs:" in notes:
+        notes = re.sub(
+            r"Missing required inputs:.*?(?=\s*\||$)",
+            "",
+            notes,
+            flags=re.IGNORECASE,
+        ).strip(" |")
     new_plan["notes"] = (
-        str(new_plan.get("notes", "")).strip()
-        + " | Dependencies resolved from SYMFLUENCE operation catalog."
-    ).strip()
+        notes + " | Dependencies resolved from SYMFLUENCE operation catalog."
+    ).strip(" |")
 
     new_plan = strip_user_forbidden_download_steps(new_plan, user_request)
     new_plan = normalize_local_workflow_plan(
@@ -1144,6 +1166,7 @@ defaults = {
     "nl_request": "",
     "user_prompt": "",
     "chat_messages": [],
+    "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
     "assistant_panel_tabs": "Prompt",
     "input_panel_widget_version": 0,
@@ -1554,12 +1577,12 @@ def sync_manual_inputs_to_selected() -> None:
 
 def on_pour_point_input_change() -> None:
     sync_manual_pour_point_to_map()
-    sync_all_ui_fields_to_plan(refresh_editor=True)
+    sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
     bump_config_preview_version()
 
 
 def on_bounding_box_input_change() -> None:
-    sync_all_ui_fields_to_plan(refresh_editor=True)
+    sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
     bump_config_preview_version()
 
 
@@ -1666,7 +1689,7 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     return hoist_plan_extra_config_to_spec(spec)
 
 def plan_editor_text_from_run_plan() -> str:
-    if not st.session_state.get("run_plan"):
+    if st.session_state.get("run_plan") is None:
         return ""
     return json.dumps(st.session_state.run_plan, indent=2)
 
@@ -1676,9 +1699,64 @@ def plan_editor_widget_key() -> str:
     return f"editable_plan_box_v{version}"
 
 
-def refresh_plan_editor_from_state(force: bool = False) -> None:
+def workflow_chat_compose_key() -> str:
+    version = int(st.session_state.get("workflow_chat_compose_version", 0))
+    return f"workflow_chat_compose_v{version}"
+
+
+def bump_workflow_chat_compose_version() -> None:
+    st.session_state.workflow_chat_compose_version = int(
+        st.session_state.get("workflow_chat_compose_version", 0)
+    ) + 1
+
+
+def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
+    """Push map picks and spatial text inputs into run_plan.config."""
+    if st.session_state.get("run_plan") is None:
+        return
+    pour = s(st.session_state.selected_pour_point) or s(st.session_state.pour_point_input)
+    bbox = s(st.session_state.selected_bounding_box) or s(st.session_state.bounding_box_input)
+    plan = st.session_state.run_plan
+    plan.setdefault("config", {})
+    cfg = plan["config"]
+    if pour:
+        cfg["pour_point_coords"] = pour
+    else:
+        cfg.pop("pour_point_coords", None)
+    if bbox:
+        cfg["bounding_box_coords"] = bbox
+    else:
+        cfg.pop("bounding_box_coords", None)
+    update_run_plan_needs_user_input()
+    if refresh_editor:
+        refresh_plan_editor_from_state(force=True)
+    else:
+        st.session_state["_plan_editor_stash"] = plan_editor_text_from_run_plan()
+
+
+def capture_plan_editor_draft() -> None:
+    """Persist in-flight plan JSON before the assistant panel rerenders another tab."""
+    if st.session_state.get("run_plan") is None:
+        return
+    widget_key = plan_editor_widget_key()
+    editor_text = s(st.session_state.get(widget_key))
+    synced_text = s(st.session_state.get("_plan_editor_synced"))
+    if editor_text and editor_text.strip() != synced_text:
+        try:
+            parsed = json.loads(editor_text)
+            if isinstance(parsed, dict) and {"config", "steps"}.issubset(parsed.keys()):
+                st.session_state.run_plan = parsed
+                update_run_plan_needs_user_input()
+        except Exception:
+            pass
+    sync_spatial_fields_to_run_plan(refresh_editor=False)
+    st.session_state["_plan_editor_stash"] = plan_editor_text_from_run_plan()
+    st.session_state["_plan_editor_synced"] = s(st.session_state["_plan_editor_stash"])
+
+
+def refresh_plan_editor_from_state(force: bool = False, *, remount: bool = False) -> None:
     """Sync the JSON editor from run_plan. Skips when the user has unsaved edits."""
-    if not st.session_state.get("run_plan"):
+    if st.session_state.get("run_plan") is None:
         return
     source = plan_editor_text_from_run_plan()
     widget_key = plan_editor_widget_key()
@@ -1690,12 +1768,52 @@ def refresh_plan_editor_from_state(force: bool = False) -> None:
                 return
         except Exception:
             return
-    if force:
+    if remount:
         st.session_state.plan_editor_version = int(st.session_state.get("plan_editor_version", 0)) + 1
         widget_key = plan_editor_widget_key()
+    st.session_state["_plan_editor_stash"] = source
     st.session_state["_pending_plan_editor_text"] = source
     st.session_state["_plan_editor_synced"] = source.strip()
     st.session_state[widget_key] = source
+
+
+def render_persistent_plan_editor(*, visible: bool) -> str:
+    """Mount the plan JSON editor on every rerun so Prompt/Chat switches keep widget state."""
+    prepare_plan_editor_before_render()
+    plan_key = plan_editor_widget_key()
+    if visible:
+        holder = {"text": ""}
+
+        def _render_plan_body() -> None:
+            raw = st.text_area(
+                "Edit plan JSON",
+                height=260,
+                key=plan_key,
+                help="Must be valid JSON. Changes are applied when you click Execute plan or Resolve dependencies.",
+                label_visibility="collapsed",
+            )
+            holder["text"] = s(raw)
+
+        render_editable_block_with_copy(
+            "Proposed run plan",
+            anchor_id="sym_copy_anchor_plan_json",
+            copy_key="copy_plan_json",
+            fallback_text=current_plan_editor_text(),
+            render_body=_render_plan_body,
+        )
+        return holder["text"] or current_plan_editor_text()
+
+    st.text_area(
+        "Edit plan JSON",
+        height=68,
+        key=plan_key,
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        f'<style>div.st-key-{plan_key} {{ display: none !important; }}</style>',
+        unsafe_allow_html=True,
+    )
+    return current_plan_editor_text()
 
 
 def apply_pending_plan_editor_sync() -> None:
@@ -1707,7 +1825,7 @@ def apply_pending_plan_editor_sync() -> None:
 
 def prepare_plan_editor_before_render() -> None:
     """Ensure the plan JSON editor has content before Streamlit draws the text_area."""
-    if not st.session_state.get("run_plan"):
+    if st.session_state.get("run_plan") is None:
         return
     source = plan_editor_text_from_run_plan()
     widget_key = plan_editor_widget_key()
@@ -1812,7 +1930,16 @@ def get_required_config_fields_for_steps(
     return sorted(required)
 
 
-def sync_all_ui_fields_to_plan(refresh_editor: bool = False) -> None:
+def sync_input_panel_to_run_plan() -> None:
+    """Push Input tab workflow settings into run_plan and refresh the plan JSON editor."""
+    if not st.session_state.get("run_plan"):
+        return
+    sync_mpi_to_run_plan()
+    sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
+    bump_config_preview_version()
+
+
+def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bool = False) -> None:
     values = {
         "domain_name": s(st.session_state.domain_name),
         "experiment_id": s(st.session_state.experiment_id),
@@ -1853,7 +1980,7 @@ def sync_all_ui_fields_to_plan(refresh_editor: bool = False) -> None:
     wx.sync_advanced_config_to_plan()
 
     if refresh_editor:
-        refresh_plan_editor_from_state()
+        refresh_plan_editor_from_state(force=force_editor)
 
 
 def update_run_plan_needs_user_input() -> None:
@@ -1959,7 +2086,6 @@ def set_plan_config_field(field: str, value: str) -> None:
             sync_run_folder_from_session(unlock=True)
     elif field == "pour_point_coords":
         st.session_state.selected_pour_point = value
-        st.session_state.pour_point_input = value
         parsed = parse_pour_point(value)
         if parsed:
             lat, lon = parsed
@@ -1973,7 +2099,6 @@ def set_plan_config_field(field: str, value: str) -> None:
         mark_spatial_inputs_stale()
     elif field == "bounding_box_coords":
         st.session_state.selected_bounding_box = value
-        st.session_state.bounding_box_input = value
         mark_spatial_inputs_stale()
     elif field == "experiment_time_start":
         st.session_state.tstart = value
@@ -2128,7 +2253,7 @@ def render_fix_missing_inputs_section(needs: list[str]) -> None:
                     set_plan_config_field("domain_def", val)
                     st.rerun()
             elif field == "forcing_dataset":
-                options = ["ERA5", "RDRS", "MERRA2", "NLDAS", "Custom"]
+                options = FORCING_DATASET_OPTIONS
                 idx = options.index(current) if current in options else 0
                 val = st.selectbox(
                     "Forcing dataset",
@@ -2168,23 +2293,13 @@ def set_pour_point_from_map(lat: float, lon: float) -> None:
     st.session_state.map_point_selected = True
 
     st.session_state.selected_pour_point = value
-    st.session_state.pour_point_input = value
 
     st.session_state.selected_bounding_box = ""
-    st.session_state.bounding_box_input = ""
     st.session_state.bbox_point_1 = None
     st.session_state.bbox_point_2 = None
     st.session_state.bbox_selected = False
 
-    if st.session_state.get("run_plan"):
-        st.session_state.run_plan.setdefault("config", {})
-        st.session_state.run_plan["config"]["pour_point_coords"] = value
-        st.session_state.run_plan["config"].pop("bounding_box_coords", None)
-
-        needs = st.session_state.run_plan.get("needs_user_input", [])
-        if isinstance(needs, list):
-            st.session_state.run_plan["needs_user_input"] = [x for x in needs if x != "pour_point_coords"]
-        refresh_plan_editor_from_state()
+    sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
     bump_config_preview_version()
@@ -2198,20 +2313,8 @@ def set_bounding_box_from_points(lat1: float, lon1: float, lat2: float, lon2: fl
     st.session_state.bbox_selected = True
 
     st.session_state.selected_bounding_box = value
-    st.session_state.bounding_box_input = value
 
-    if st.session_state.get("run_plan"):
-        st.session_state.run_plan.setdefault("config", {})
-
-        if s(st.session_state.selected_pour_point):
-            st.session_state.run_plan["config"]["pour_point_coords"] = s(st.session_state.selected_pour_point)
-
-        st.session_state.run_plan["config"]["bounding_box_coords"] = value
-
-        needs = st.session_state.run_plan.get("needs_user_input", [])
-        if isinstance(needs, list):
-            st.session_state.run_plan["needs_user_input"] = [x for x in needs if x != "bounding_box_coords"]
-        refresh_plan_editor_from_state()
+    sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
     bump_config_preview_version()
@@ -2646,7 +2749,7 @@ def run_generate_plan_from_nl_request() -> None:
         apply_plan_config_to_ui(plan)
         if s(st.session_state.get("run_folder")):
             st.session_state.run_workspace_locked = True
-        refresh_plan_editor_from_state(force=True)
+        refresh_plan_editor_from_state(force=True, remount=True)
         seed_chat_from_generate_plan(user_prompt_for_metadata(), plan)
         save_chat_messages_to_run_folder()
         st.success("Run plan generated.")
@@ -2680,6 +2783,19 @@ def apply_pending_nl_request_transcript() -> None:
     pending = st.session_state.pop("_pending_nl_transcript", None)
     if pending is not None:
         st.session_state.nl_request = pending
+
+
+def apply_pending_workflow_chat_draft() -> None:
+    """Apply a voice transcript before the chat compose widget is drawn."""
+    pending = st.session_state.pop("_pending_workflow_chat_draft", None)
+    if pending is not None:
+        bump_workflow_chat_compose_version()
+        st.session_state[workflow_chat_compose_key()] = pending
+
+
+def clear_workflow_chat_compose() -> None:
+    """Clear the compose box (button callback)."""
+    bump_workflow_chat_compose_version()
 
 
 def transcribe_voice_to_nl_request(audio_bytes: bytes, filename: str) -> str | None:
@@ -2822,7 +2938,7 @@ def force_steps(plan: dict, want_create_pour_point: bool) -> dict:
     return plan
 
 
-st.set_page_config(page_title="SymFlowENT: SYMFLUENCE Workflow Assistant Agent", layout="wide")
+st.set_page_config(page_title="HydroAgent: SYMFLUENCE Workflow Assistant Agent", layout="wide")
 
 st.markdown(
     """
@@ -2980,7 +3096,7 @@ st.markdown(
     """
 <div class="sym-header">
   <div class="sym-title-wrap">
-    <div class="sym-title">SymFlowENT</div>
+    <div class="sym-title">HydroAgent</div>
     <div class="sym-subtitle">SYMFLUENCE Workflow Assistant Agent</div>
   </div>
   <div class="sym-status">✓ System status</div>
@@ -2992,7 +3108,7 @@ st.markdown(
 # -----------------------------------------------------------------------------
 # Left navigation and global settings
 # -----------------------------------------------------------------------------
-st.sidebar.markdown("## SymFlowENT")
+st.sidebar.markdown("## HydroAgent")
 current_page = st.sidebar.radio(
     "Navigation",
     ["Dashboard", "Workflows", "Experiments", "Data", "Templates", "Results", "Logs", "Settings"],
@@ -3678,7 +3794,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             st.session_state.run_plan = new_plan
             st.session_state.pop("_committed_plan_steps", None)
             apply_edited_plan_to_session(new_plan)
-            refresh_plan_editor_from_state(force=True)
+            refresh_plan_editor_from_state(force=True, remount=True)
             update_run_plan_needs_user_input()
             sync_mpi_to_run_plan()
             if diff:
@@ -3841,6 +3957,16 @@ def render_workflow_chat_tab() -> None:
             else:
                 st.write(content)
 
+    apply_pending_workflow_chat_draft()
+    if st.session_state.pop("_chat_transcribe_ok", False):
+        st.success("Transcription added to the message box below. Edit if needed, then click **Send**.")
+    if st.session_state.pop("_chat_send_empty", False):
+        st.warning("Message is empty.")
+
+    chat_disabled = not st.session_state.api_keys.get(provider)
+    compose_key = workflow_chat_compose_key()
+    compose_value = s(st.session_state.get(compose_key))
+
     voice_provider, _voice_key = resolve_voice_transcription_provider()
     if voice_provider and st.session_state.get("run_plan"):
         voice_label = VOICE_PROVIDER_LABELS.get(voice_provider, "Voice")
@@ -3853,7 +3979,12 @@ def render_workflow_chat_tab() -> None:
                 type=["wav", "mp3", "m4a", "webm", "mpeg", "mpga"],
                 key="voice_chat_upload",
             )
-        if st.button("Transcribe to chat", key="transcribe_voice_to_chat", width="stretch"):
+        if st.button(
+            "Transcribe to chat",
+            key="transcribe_voice_to_chat",
+            width="stretch",
+            type="secondary",
+        ):
             if chat_voice is None:
                 st.warning("Record or upload audio first.")
             else:
@@ -3862,11 +3993,45 @@ def render_workflow_chat_tab() -> None:
                     getattr(chat_voice, "name", None) or "recording.webm",
                 )
                 if transcript:
-                    queue_chat_refinement(transcript)
+                    st.session_state["_pending_workflow_chat_draft"] = transcript
+                    st.session_state["_chat_transcribe_ok"] = True
                     st.rerun()
 
-    chat_disabled = not st.session_state.api_keys.get(provider)
-    if chat_input := st.chat_input(
+    if compose_value:
+        with st.form("workflow_chat_compose_form", clear_on_submit=False, border=False):
+            compose_text = st.text_area(
+                "Message",
+                height=88,
+                key=compose_key,
+                disabled=chat_disabled,
+                placeholder="Ask about the plan or request changes…",
+            )
+            send_col, clear_col = st.columns(2)
+            with send_col:
+                send_clicked = st.form_submit_button(
+                    "Send",
+                    disabled=chat_disabled,
+                    use_container_width=True,
+                )
+            with clear_col:
+                clear_clicked = st.form_submit_button(
+                    "Clear message",
+                    disabled=chat_disabled,
+                    use_container_width=True,
+                )
+
+        if clear_clicked:
+            clear_workflow_chat_compose()
+            st.rerun()
+        elif send_clicked:
+            draft_text = s(compose_text)
+            if draft_text:
+                queue_chat_refinement(draft_text)
+                bump_workflow_chat_compose_version()
+                st.rerun()
+            else:
+                st.warning("Message is empty.")
+    elif chat_input := st.chat_input(
         "Ask about the plan or request changes…",
         key="workflow_chat_input",
         disabled=chat_disabled,
@@ -4231,33 +4396,38 @@ def render_workflow_input_tab() -> None:
     
     ws4, ws5, ws6 = st.columns(3)
     with ws4:
+        hydro_value = coerce_selectbox_value(
+            st.session_state.hydrological_model,
+            HYDROLOGICAL_MODEL_OPTIONS,
+            normalizer=normalize_hydrological_model,
+        )
         st.session_state.hydrological_model = st.selectbox(
             "Hydrological model",
             options=HYDROLOGICAL_MODEL_OPTIONS,
-            index=HYDROLOGICAL_MODEL_OPTIONS.index(st.session_state.hydrological_model)
-            if st.session_state.hydrological_model in HYDROLOGICAL_MODEL_OPTIONS
-            else 0,
+            index=HYDROLOGICAL_MODEL_OPTIONS.index(hydro_value),
             help="Leave blank if the model should come only from the prompt/plan.",
             key=input_panel_widget_key("input_hydrological_model"),
         )
     with ws5:
+        domain_value = coerce_selectbox_value(st.session_state.domain_def, DOMAIN_DEF_OPTIONS)
         st.session_state.domain_def = st.selectbox(
             "Domain definition",
-            options=["delineate", "lumped", "point", "subset"],
-            index=["delineate", "lumped", "point", "subset"].index(st.session_state.domain_def)
-            if st.session_state.domain_def in ["delineate", "lumped", "point", "subset"]
-            else 0,
+            options=DOMAIN_DEF_OPTIONS,
+            index=DOMAIN_DEF_OPTIONS.index(domain_value),
             help="How the spatial domain should be defined.",
             key=input_panel_widget_key("input_domain_def"),
         )
     with ws6:
+        forcing_value = coerce_selectbox_value(
+            st.session_state.forcing_dataset,
+            FORCING_DATASET_OPTIONS,
+            normalizer=normalize_forcing_dataset,
+        )
         st.session_state.forcing_dataset = st.selectbox(
             "Forcing dataset",
-            options=["ERA5", "RDRS", "MERRA2", "NLDAS", "Custom"],
-            index=["ERA5", "RDRS", "MERRA2", "NLDAS", "Custom"].index(st.session_state.forcing_dataset)
-            if st.session_state.forcing_dataset in ["ERA5", "RDRS", "MERRA2", "NLDAS", "Custom"]
-            else 0,
-            help="Default meteorological forcing source for the workflow.",
+            options=FORCING_DATASET_OPTIONS,
+            index=FORCING_DATASET_OPTIONS.index(forcing_value),
+            help="Must match a SYMFLUENCE FORCING_DATASET value.",
             key=input_panel_widget_key("input_forcing_dataset"),
         )
     
@@ -4350,11 +4520,7 @@ def render_workflow_input_tab() -> None:
                     st.session_state.bbox_point_1 = (lat, lon)
                     st.session_state.bbox_point_2 = None
                     st.session_state.bbox_selected = False
-                    current_pour = s(st.session_state.selected_pour_point)
-                    if st.session_state.get("run_plan"):
-                        st.session_state.run_plan.setdefault("config", {})
-                        if current_pour:
-                            st.session_state.run_plan["config"]["pour_point_coords"] = current_pour
+                    sync_spatial_fields_to_run_plan(refresh_editor=True)
                     st.rerun()
                 elif not st.session_state.bbox_selected:
                     lat1, lon1 = st.session_state.bbox_point_1
@@ -4364,8 +4530,8 @@ def render_workflow_input_tab() -> None:
                     st.session_state.bbox_point_1 = (lat, lon)
                     st.session_state.bbox_point_2 = None
                     st.session_state.bbox_selected = False
-                    st.session_state.bounding_box_input = ""
                     st.session_state.selected_bounding_box = ""
+                    mark_spatial_inputs_stale()
                     st.rerun()
 
     clear_a, clear_b = st.columns(2)
@@ -4374,26 +4540,20 @@ def render_workflow_input_tab() -> None:
             st.session_state.map_lat = None
             st.session_state.map_lon = None
             st.session_state.map_point_selected = False
-            st.session_state.pour_point_input = ""
             st.session_state.selected_pour_point = ""
             st.session_state.last_map_click = None
             mark_spatial_inputs_stale()
-            if st.session_state.get("run_plan"):
-                st.session_state.run_plan.setdefault("config", {})
-                st.session_state.run_plan["config"].pop("pour_point_coords", None)
+            sync_spatial_fields_to_run_plan(refresh_editor=True)
             st.rerun()
     with clear_b:
         if st.button("Clear bounding box", key="clear_selected_bbox"):
             st.session_state.bbox_point_1 = None
             st.session_state.bbox_point_2 = None
             st.session_state.bbox_selected = False
-            st.session_state.bounding_box_input = ""
             st.session_state.selected_bounding_box = ""
             st.session_state.last_map_click = None
             mark_spatial_inputs_stale()
-            if st.session_state.get("run_plan"):
-                st.session_state.run_plan.setdefault("config", {})
-                st.session_state.run_plan["config"].pop("bounding_box_coords", None)
+            sync_spatial_fields_to_run_plan(refresh_editor=True)
             st.rerun()
 
     status_col1, status_col2 = st.columns(2)
@@ -4426,7 +4586,7 @@ def render_workflow_input_tab() -> None:
         on_change=on_bounding_box_input_change,
     )
 
-    update_run_plan_needs_user_input()
+    sync_input_panel_to_run_plan()
     render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
@@ -4723,6 +4883,7 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     )
     render_workflow_panel_dom_hooks()
     apply_pending_assistant_panel_tab_focus()
+    capture_plan_editor_draft()
     st.radio(
         "Assistant panel",
         options=[ASSISTANT_TAB_PROMPT, ASSISTANT_TAB_CHAT],
@@ -4730,7 +4891,12 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
         horizontal=True,
         label_visibility="collapsed",
     )
-    if st.session_state.get(ASSISTANT_PANEL_TABS_KEY, ASSISTANT_TAB_PROMPT) == ASSISTANT_TAB_CHAT:
+    on_prompt_tab = st.session_state.get(ASSISTANT_PANEL_TABS_KEY, ASSISTANT_TAB_PROMPT) != ASSISTANT_TAB_CHAT
+    plan_text_holder = ""
+
+    if not on_prompt_tab:
+        if st.session_state.get("run_plan") is not None:
+            plan_text_holder = render_persistent_plan_editor(visible=False)
         render_workflow_chat_tab()
     else:
         st.markdown("#### LLM Assistant")
@@ -4815,9 +4981,6 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
             apply_pending_nl_request_transcript()
             if st.session_state.pop("_nl_transcribe_ok", False):
                 st.success("Transcription added. Review the prompt, then click Generate plan.")
-            if st.session_state.pop("_voice_to_chat_ok", False):
-                st.success("Voice message sent to **Chat** for plan refinement.")
-
             def _render_prompt_body() -> None:
                 st.text_area(
                     "Describe what you want",
@@ -4871,8 +5034,9 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                         transcript = transcribe_voice_to_nl_request(audio_bytes, filename)
                         if transcript:
                             if st.session_state.get("run_plan"):
-                                queue_chat_refinement(transcript)
-                                st.session_state["_voice_to_chat_ok"] = True
+                                st.session_state["_pending_workflow_chat_draft"] = transcript
+                                st.session_state["_chat_transcribe_ok"] = True
+                                request_assistant_chat_tab()
                             else:
                                 st.session_state["_pending_nl_transcript"] = transcript
                                 st.session_state["_nl_transcribe_ok"] = True
@@ -4895,28 +5059,8 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
             ):
                 run_generate_plan_from_nl_request()
 
-        if st.session_state.run_plan:
-            prepare_plan_editor_before_render()
-
-            plan_text_holder: dict[str, str] = {"text": ""}
-            _plan_editor_key = plan_editor_widget_key()
-
-            def _render_plan_body() -> None:
-                plan_text_holder["text"] = st.text_area(
-                    "Edit plan JSON",
-                    height=260,
-                    key=_plan_editor_key,
-                    help="Must be valid JSON. Changes are applied when you click Execute plan or Resolve dependencies.",
-                    label_visibility="collapsed",
-                ).strip()
-
-            render_editable_block_with_copy(
-                "Proposed run plan",
-                anchor_id="sym_copy_anchor_plan_json",
-                copy_key="copy_plan_json",
-                fallback_text=current_plan_editor_text(),
-                render_body=_render_plan_body,
-            )
+        if st.session_state.get("run_plan") is not None:
+            plan_text_holder = render_persistent_plan_editor(visible=True)
             update_run_plan_needs_user_input()
 
             if st.button(
@@ -4926,7 +5070,7 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 type="secondary",
             ):
                 ok, err = commit_plan_editor_to_session(
-                    plan_text=plan_text_holder["text"] or current_plan_editor_text()
+                    plan_text=plan_text_holder or current_plan_editor_text()
                 )
                 if not ok:
                     st.error(err)
@@ -4936,7 +5080,7 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
                 steps = resolved_plan.get("steps")
                 if isinstance(steps, list):
                     st.session_state["_committed_plan_steps"] = list(steps)
-                refresh_plan_editor_from_state(force=True)
+                refresh_plan_editor_from_state(force=True, remount=True)
                 st.success("Dependencies resolved from operation catalog.")
                 st.rerun()
 
@@ -5018,7 +5162,7 @@ with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
 
             if exec_btn:
                 ok, err = commit_plan_editor_to_session(
-                    plan_text=plan_text_holder["text"] or current_plan_editor_text()
+                    plan_text=plan_text_holder or current_plan_editor_text()
                 )
                 if not ok:
                     st.error(err)

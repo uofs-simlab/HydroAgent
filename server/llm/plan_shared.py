@@ -73,22 +73,15 @@ def _extract_hydrological_model(text: str) -> str | None:
     if not text:
         return None
 
-    model_map = {
-        "SUMMA": "SUMMA",
-        "FUSE": "FUSE",
-        "GR": "GR",
-        "HBV": "HBV",
-        "MESH": "MESH",
-        "HYPE": "HYPE",
-        "NGEN": "ngen",
-        "NGEN.": "ngen",
-        "TOPMODEL": "TOPMODEL",
-    }
+    from server.core.ui_config_fields import HYDROLOGICAL_MODEL_OPTIONS, normalize_hydrological_model
 
     upper = text.upper()
-    for key, value in model_map.items():
-        if re.search(rf"\b{re.escape(key)}\b", upper):
-            return value
+    for model in HYDROLOGICAL_MODEL_OPTIONS:
+        if not model:
+            continue
+        if re.search(rf"\b{re.escape(model)}\b", upper):
+            normalized = normalize_hydrological_model(model)
+            return normalized or None
 
     return None
 
@@ -144,7 +137,6 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "bounding_box_coords": {"type": ["string", "null"]},
                     "hydrological_model": {
                         "type": ["string", "null"],
-                        "enum": ["SUMMA", "FUSE", "GR", "HBV", "MESH", "HYPE", "ngen", "TOPMODEL", None],
                     },
                     "domain_def": {
                         "type": ["string", "null"],
@@ -266,8 +258,9 @@ def finalize_run_plan(
     if not cfg.get("hydrological_model"):
         cfg["hydrological_model"] = _extract_hydrological_model(user_request) or "SUMMA"
     else:
-        hm = str(cfg["hydrological_model"]).strip()
-        cfg["hydrological_model"] = "ngen" if hm.lower() == "ngen" else hm.upper()
+        from server.core.ui_config_fields import normalize_hydrological_model
+
+        cfg["hydrological_model"] = normalize_hydrological_model(str(cfg["hydrological_model"]))
 
     start = cfg.get("experiment_time_start")
     if isinstance(start, str) and len(start.strip()) == 10:

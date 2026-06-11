@@ -9,7 +9,9 @@ import streamlit as st
 import workflow_extras as wx
 from server.core.ui_config_fields import (
     lookup_plan_config,
+    normalize_forcing_dataset,
     normalize_hydrological_model,
+    normalize_pet_method,
     session_key_for_plan_field,
 )
 from widget_keys import bump_all_input_widget_versions
@@ -35,11 +37,12 @@ def _parse_pour_point(value: str) -> tuple[float, float] | None:
 
 
 def _sync_spatial_field(cfg: dict, plan_key: str, session_key: str, input_key: str) -> None:
+    """Sync spatial plan fields into session state without touching widget keys directly."""
+    _ = input_key  # Widget keys are refreshed via refresh_spatial_inputs on the next run.
     raw = lookup_plan_config(cfg, plan_key)
     if raw is not None and _s(raw):
         val = _s(raw).replace(",", "/")
         st.session_state[session_key] = val
-        st.session_state[input_key] = val
         if plan_key == "pour_point_coords":
             parsed = _parse_pour_point(val)
             if parsed:
@@ -49,7 +52,6 @@ def _sync_spatial_field(cfg: dict, plan_key: str, session_key: str, input_key: s
                 st.session_state.map_point_selected = True
     elif plan_key in cfg and cfg.get(plan_key) is None:
         st.session_state[session_key] = ""
-        st.session_state[input_key] = ""
         if plan_key == "pour_point_coords":
             st.session_state.map_lat = None
             st.session_state.map_lon = None
@@ -98,6 +100,8 @@ def sync_plan_config_to_session(plan: dict | None) -> None:
         _sync_scalar_field(cfg, plan_key)
 
     _sync_scalar_field(cfg, "hydrological_model", normalizer=normalize_hydrological_model)
+    _sync_scalar_field(cfg, "forcing_dataset", normalizer=normalize_forcing_dataset)
+    _sync_scalar_field(cfg, "pet_method", normalizer=normalize_pet_method)
 
     for plan_key in ("NUM_PROCESSES", "num_processes", "MPI_PROCESSES", "mpi_processes"):
         if lookup_plan_config(cfg, plan_key) is not None:

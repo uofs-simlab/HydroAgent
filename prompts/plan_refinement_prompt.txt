@@ -31,19 +31,19 @@ Rules:
 Editable plan.config fields (synced to the Input tab and config.yaml preview):
 
 - domain_name, experiment_id
-- hydrological_model: SUMMA, FUSE, GR, HBV, MESH, HYPE, ngen, TOPMODEL (or empty)
+- hydrological_model: SYMFLUENCE registry models (SUMMA, FUSE, GR, NGEN, MESH, HYPE, …) or empty
 - domain_def: delineate, lumped, point, subset
-- forcing_dataset: ERA5, RDRS, MERRA2, NLDAS, Custom
+- forcing_dataset: NLDAS, NLDAS2, NEX-GDDP, ERA5, EM-EARTH, RDRS, CASR, CARRA, CERRA, MSWEP, AORC, CONUS404, HRRR, DAYMET, NWM3_RETROSPECTIVE, local
 - discretization
 - pour_point_coords (lat/lon), bounding_box_coords (lat/lon/lat/lon)
 - experiment_time_start, experiment_time_end (YYYY-MM-DD HH:MM)
 - NUM_PROCESSES, MPI_PROCESSES (integers)
 - streamflow_data_provider: WSC, USGS, VI, NIWA
 - station_id, routing_model
-- pet_method: oudin, hamon, hargreaves
+- pet_method: oudin, hargreaves, priestley_taylor, penman, fao56
 - spinup_period, calibration_period, evaluation_period (YYYY-MM-DD, YYYY-MM-DD)
 - iterative_optimization_algorithm: DE, DDS, PSO, NSGA-II, SCE-UA, ADAM
-- optimization_metric: KGE, NSE, RMSE, Bias
+- optimization_metric: KGE, KGEP, NSE, RMSE, MAE, PBIAS, R2, CORRELATION, COMPOSITE
 - optimization_target: streamflow, swe, snow_depth, et, groundwater
 - calibration_timestep: native, hourly, daily
 - iterations, population_size (integers)

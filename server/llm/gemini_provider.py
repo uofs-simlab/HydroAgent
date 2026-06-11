@@ -156,7 +156,6 @@ class GeminiProvider:
                 "bounding_box_coords": {"type": ["string", "null"]},
                 "hydrological_model": {
                     "type": ["string", "null"],
-                    "enum": ["SUMMA", "FUSE", "GR", "HBV", "MESH", "HYPE", "ngen", "TOPMODEL", None],
                 },
                 "domain_def": {
                     "type": ["string", "null"],
@@ -180,7 +179,7 @@ class GeminiProvider:
         system_prompt = (
             "You are a hydrology workflow assistant for SYMFLUENCE.\n"
             "Return ONLY JSON that strictly matches the schema.\n"
-            "Extract hydrological_model if user mentions SUMMA, FUSE, GR, HBV, MESH, HYPE, ngen, or TOPMODEL.\n"
+            "Extract hydrological_model using SYMFLUENCE registry names (e.g. SUMMA, FUSE, GR, NGEN, MESH, HYPE).\n"
             "Extract bounding_box_coords if user provides bounding box, bbox, or north/west/south/east values.\n"
             "If times are missing, choose 01:00 for start and 23:00 for end."
         )

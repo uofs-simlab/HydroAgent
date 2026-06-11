@@ -730,7 +730,7 @@ def normalize_local_workflow_plan(
     out["needs_user_input"] = needs
 
     if not skip_workflow_step_restore and set(steps) <= {"validate_config", "dry_run"}:
-        extracted = extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES)
+        extracted = infer_goal_steps_from_request(user_request)
         if extracted:
             if "validate_config" not in extracted:
                 extracted.insert(0, "validate_config")
@@ -759,3 +759,47 @@ def extract_steps_from_request(user_request: str, allowed_steps: list[str]) -> l
         if re.search(rf"\b{re.escape(step)}\b", user_request, flags=re.IGNORECASE):
             found.append(step)
     return found
+
+
+def infer_goal_steps_from_request(user_request: str) -> list[str]:
+    """Infer high-level workflow goals from natural-language hydrology prompts."""
+    text = _s(user_request).lower()
+    if not text:
+        return []
+
+    goals: list[str] = []
+
+    def add(step: str) -> None:
+        if step not in goals:
+            goals.append(step)
+
+    if re.search(r"\bprocess_observed\b", text) or re.search(r"\bobserved\s+streamflow\b", text):
+        add("process_observed_data")
+
+    if (
+        re.search(r"\bfrom\s+scratch\b", text)
+        or re.search(r"\brun\s+(?:the\s+)?model\b", text)
+        or re.search(r"\brun\s+summa\b", text)
+    ):
+        add("run_model")
+
+    if re.search(r"\bprepare\s+.*\binput\b", text) or re.search(r"\bsumma\s+input\b", text):
+        add("model_specific_preprocessing")
+
+    if re.search(r"\bforcing\b", text):
+        add("acquire_forcings")
+
+    if re.search(r"\bacquire\s+attribute", text) or re.search(r"\battributes\s+and\b", text):
+        add("acquire_attributes")
+
+    if (
+        re.search(r"\bgenerate\s+the\s+domain\b", text)
+        or re.search(r"\bdefine\s+domain\b", text)
+        or re.search(r"\bdelineat", text)
+    ):
+        add("define_domain")
+
+    for step in extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES):
+        add(step)
+
+    return goals

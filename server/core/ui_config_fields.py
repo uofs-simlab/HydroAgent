@@ -6,16 +6,19 @@ import re
 from typing import Any
 
 from server.core.parameter_registry import FIRST_CLASS_FIELD_MAP, coerce_scalar_value
-
-HYDROLOGICAL_MODEL_OPTIONS = ["", "SUMMA", "FUSE", "GR", "HBV", "MESH", "HYPE", "ngen", "TOPMODEL"]
-DOMAIN_DEF_OPTIONS = ["delineate", "lumped", "point", "subset"]
-FORCING_DATASET_OPTIONS = ["ERA5", "RDRS", "MERRA2", "NLDAS", "Custom"]
-STREAMFLOW_PROVIDER_OPTIONS = ["WSC", "USGS", "VI", "NIWA"]
-PET_METHOD_OPTIONS = ["oudin", "hamon", "hargreaves"]
-CALIBRATION_ALGORITHMS = ["DE", "DDS", "PSO", "NSGA-II", "SCE-UA", "ADAM"]
-CALIBRATION_METRICS = ["KGE", "NSE", "RMSE", "Bias"]
-CALIBRATION_TARGETS = ["streamflow", "swe", "snow_depth", "et", "groundwater"]
-CALIBRATION_TIMESTEPS = ["native", "hourly", "daily"]
+from server.core.symfluence_options import (
+    CALIBRATION_ALGORITHMS,
+    CALIBRATION_METRICS,
+    CALIBRATION_TARGETS,
+    CALIBRATION_TIMESTEPS,
+    DOMAIN_DEF_OPTIONS,
+    FORCING_DATASET_OPTIONS,
+    HYDROLOGICAL_MODEL_OPTIONS,
+    PET_METHOD_OPTIONS,
+    STREAMFLOW_PROVIDER_OPTIONS,
+    _LEGACY_FORCING_ALIASES,
+    _UNSUPPORTED_HYDRO_MODELS,
+)
 
 # Canonical planner key -> session_state key (when different)
 SESSION_KEY_ALIASES: dict[str, str] = {
@@ -79,9 +82,46 @@ def normalize_hydrological_model(value: str) -> str:
     value = (value or "").strip()
     if not value:
         return ""
-    if value.lower() == "ngen":
-        return "ngen"
-    return value.upper()
+    upper = value.upper()
+    if upper in _UNSUPPORTED_HYDRO_MODELS:
+        return ""
+    valid = {m for m in HYDROLOGICAL_MODEL_OPTIONS if m}
+    return upper if upper in valid else ""
+
+
+def normalize_pet_method(value: str) -> str:
+    value = (value or "").strip().lower()
+    if not value:
+        return PET_METHOD_OPTIONS[0]
+    legacy = {"hamon": "hargreaves"}
+    if value in legacy:
+        return legacy[value]
+    for option in PET_METHOD_OPTIONS:
+        if option == value:
+            return option
+    return PET_METHOD_OPTIONS[0]
+
+
+def normalize_forcing_dataset(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return FORCING_DATASET_OPTIONS[3]  # ERA5
+    alias = _LEGACY_FORCING_ALIASES.get(value.lower())
+    if alias:
+        return alias
+    for option in FORCING_DATASET_OPTIONS:
+        if option.lower() == value.lower():
+            return option
+    return FORCING_DATASET_OPTIONS[3]
+
+
+def coerce_selectbox_value(value: str, options: list[str], *, normalizer=None) -> str:
+    """Map session/plan values onto a valid selectbox option."""
+    if normalizer:
+        value = normalizer(value)
+    if value in options:
+        return value
+    return options[0] if options else value
 
 
 def session_key_for_plan_field(plan_key: str) -> str:
@@ -152,20 +192,13 @@ def _normalize_chat_datetime(value: str, *, default_hm: str) -> str:
 
 
 def _extract_hydrological_model(text: str) -> str | None:
-    model_map = {
-        "SUMMA": "SUMMA",
-        "FUSE": "FUSE",
-        "GR": "GR",
-        "HBV": "HBV",
-        "MESH": "MESH",
-        "HYPE": "HYPE",
-        "NGEN": "ngen",
-        "TOPMODEL": "TOPMODEL",
-    }
-    upper = text.upper()
-    for key, value in model_map.items():
-        if re.search(rf"\b{re.escape(key)}\b", upper):
-            return value
+    upper = (text or "").upper()
+    for model in HYDROLOGICAL_MODEL_OPTIONS:
+        if not model:
+            continue
+        if re.search(rf"\b{re.escape(model)}\b", upper):
+            normalized = normalize_hydrological_model(model)
+            return normalized or None
     return None
 
 
@@ -223,6 +256,8 @@ def _coerce_field_value(field: dict[str, Any], raw: str) -> Any:
         return _normalize_chat_datetime(raw, default_hm=field.get("default_hm", "00:00"))
     if field_type == "model":
         return normalize_hydrological_model(raw)
+    if field.get("key") == "forcing_dataset":
+        return normalize_forcing_dataset(raw)
     if field_type == "period":
         return re.sub(r"\s*,\s*", ", ", raw)
     options = field.get("options") or []
@@ -277,31 +312,36 @@ def apply_comprehensive_chat_config_edits(plan: dict, user_message: str) -> dict
             break
 
     # Natural-language hydrological model
+    model_names = "|".join(re.escape(m) for m in HYDROLOGICAL_MODEL_OPTIONS if m)
     model_nl = re.search(
-        r"\b(?:use|switch\s+to|change(?:\s+(?:the\s+)?hydrological\s+model)?\s+to|"
-        r"set\s+(?:the\s+)?(?:hydrological\s+)?model\s+to)\s+"
-        r"(SUMMA|FUSE|GR|HBV|MESH|HYPE|ngen|NGEN|TOPMODEL)\b",
+        rf"\b(?:use|switch\s+to|change(?:\s+(?:the\s+)?hydrological\s+model)?\s+to|"
+        rf"set\s+(?:the\s+)?(?:hydrological\s+)?model\s+to)\s+"
+        rf"({model_names})\b",
         text,
         flags=re.IGNORECASE,
     )
     if model_nl:
         set_plan_config_value(cfg, "hydrological_model", normalize_hydrological_model(model_nl.group(1)))
         changed = True
-    elif re.search(r"\b(?:use|run)\s+(SUMMA|FUSE|GR|HBV|MESH|HYPE|ngen|NGEN|TOPMODEL)\b", text, re.I):
+    elif re.search(
+        r"\b(?:use|run)\s+(" + "|".join(m for m in HYDROLOGICAL_MODEL_OPTIONS if m) + r")\b",
+        text,
+        re.I,
+    ):
         extracted = _extract_hydrological_model(text)
         if extracted:
             set_plan_config_value(cfg, "hydrological_model", extracted)
             changed = True
 
     # Natural-language forcing dataset
+    forcing_pattern = "|".join(re.escape(option) for option in FORCING_DATASET_OPTIONS)
     forcing_nl = re.search(
-        r"\b(?:use|switch\s+to|set)\s+(ERA5|RDRS|MERRA2|NLDAS|Custom)\s+(?:forcing|forcings)?\b",
+        rf"\b(?:use|switch\s+to|set)\s+({forcing_pattern}|local)\s+(?:forcing|forcings)?\b",
         text,
         flags=re.IGNORECASE,
     )
     if forcing_nl:
-        val = forcing_nl.group(1).upper() if forcing_nl.group(1).lower() != "custom" else "Custom"
-        set_plan_config_value(cfg, "forcing_dataset", val)
+        set_plan_config_value(cfg, "forcing_dataset", normalize_forcing_dataset(forcing_nl.group(1)))
         changed = True
 
     # Natural-language domain definition

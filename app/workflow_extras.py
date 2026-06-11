@@ -46,10 +46,12 @@ CALIBRATION_SESSION_FIELDS = [
     ("population_size", "POPULATION_SIZE"),
 ]
 
-CALIBRATION_ALGORITHMS = ["DE", "DDS", "PSO", "NSGA-II", "SCE-UA", "ADAM"]
-CALIBRATION_METRICS = ["KGE", "NSE", "RMSE", "Bias"]
-CALIBRATION_TARGETS = ["streamflow", "swe", "snow_depth", "et", "groundwater"]
-CALIBRATION_TIMESTEPS = ["native", "hourly", "daily"]
+from server.core.symfluence_options import (
+    CALIBRATION_ALGORITHMS,
+    CALIBRATION_METRICS,
+    CALIBRATION_TARGETS,
+    CALIBRATION_TIMESTEPS,
+)
 
 PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"}
 
@@ -385,6 +387,11 @@ def sync_advanced_config_to_plan() -> None:
 
 
 def render_advanced_config_section() -> None:
+    from server.core.ui_config_fields import (
+        PET_METHOD_OPTIONS,
+        coerce_selectbox_value,
+        normalize_pet_method,
+    )
     from widget_keys import input_panel_widget_key
 
     with st.expander("Advanced config", expanded=False):
@@ -412,14 +419,15 @@ def render_advanced_config_section() -> None:
                 key=input_panel_widget_key("adv_routing_model"),
             )
         with c2:
+            pet_value = coerce_selectbox_value(
+                st.session_state.get("pet_method", "oudin"),
+                PET_METHOD_OPTIONS,
+                normalizer=normalize_pet_method,
+            )
             st.session_state.pet_method = st.selectbox(
                 "PET method",
-                options=["oudin", "hamon", "hargreaves"],
-                index=["oudin", "hamon", "hargreaves"].index(
-                    st.session_state.get("pet_method", "oudin")
-                )
-                if st.session_state.get("pet_method", "oudin") in ["oudin", "hamon", "hargreaves"]
-                else 0,
+                options=PET_METHOD_OPTIONS,
+                index=PET_METHOD_OPTIONS.index(pet_value),
                 key=input_panel_widget_key("adv_pet_method"),
             )
             st.session_state.spinup_period = st.text_input(
@@ -862,7 +870,7 @@ def render_logs_page(*, runs_dir: Path, run_folder_skip: set[str]) -> None:
     st.markdown(f"**Run directory:** `{run_dir}`")
     if log_path.exists():
         st.caption(f"Log file: `{log_path}` ({log_path.stat().st_size} bytes)")
-        n_tail = st.slider("Lines to show", 20, 400, 120, key="logs_tail_lines")
+        n_tail = st.slider("Lines to show", 20, 1000, 120, key="logs_tail_lines")
         st.code(tail_file(log_path, n_tail) or "(empty log)")
     else:
         st.warning("No execution.log for this run yet.")
