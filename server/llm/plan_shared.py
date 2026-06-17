@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from server.core.plan_rules import (
+    domain_name_needs_user_input,
+    ensure_domain_name_user_input,
+    extract_explicit_domain_name_from_request,
+    mark_domain_name_confirmed,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
 )
@@ -16,36 +20,17 @@ PLAN_REFINEMENT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / 
 
 
 def _normalize_domain_name_for_config(name: str | None):
+    from server.core.ui_config_fields import normalize_domain_name_value
+
     if not name:
         return None
-    name = re.sub(r"\s+", "_", name.strip())
-    name = re.sub(r"[^A-Za-z0-9_\-]", "", name)
-    return name
+    cleaned = normalize_domain_name_value(str(name))
+    return cleaned or None
 
 
 def _extract_domain_name(text: str):
-    if not text:
-        return None
-
-    text = text.strip()
-
-    m = re.search(
-        r"for\s+([A-Za-z0-9_\-\s]+?)(?:\s+at|\s+from|\s+with|\s+using|$)",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(
-        r"run\s+(?:summa|fuse|gr|hbv|mesh|hype|ngen|topmodel)?\s+for\s+([A-Za-z0-9_\-\s]+)",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).strip()
-
-    return None
+    """Deprecated loose extractor — use extract_explicit_domain_name_from_request."""
+    return extract_explicit_domain_name_from_request(text) or None
 
 
 def _compact_plan_config(cfg: dict) -> dict:
@@ -87,17 +72,9 @@ def _extract_hydrological_model(text: str) -> str | None:
 
 
 def _extract_bounding_box(text: str) -> str | None:
-    if not text:
-        return None
+    from server.core.ui_config_fields import _extract_bbox_coords_from_text
 
-    m = re.search(
-        r"(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)",
-        text,
-    )
-    if m:
-        return "/".join(x.strip() for x in m.groups())
-
-    return None
+    return _extract_bbox_coords_from_text(text)
 
 
 def build_run_plan_schema() -> Dict[str, Any]:
@@ -276,13 +253,14 @@ def finalize_run_plan(
     if not cfg.get("domain_def"):
         cfg["domain_def"] = "delineate"
 
-    if not cfg.get("domain_name"):
-        extracted = _extract_domain_name(user_request)
-        if extracted:
-            cfg["domain_name"] = extracted.strip()
-
-    if cfg.get("domain_name"):
+    explicit_domain = extract_explicit_domain_name_from_request(user_request)
+    if explicit_domain:
+        cfg["domain_name"] = explicit_domain
+        cfg = mark_domain_name_confirmed(cfg)
+    elif cfg.get("domain_name"):
         cfg["domain_name"] = _normalize_domain_name_for_config(cfg["domain_name"])
+
+    plan["config"] = cfg
 
     required_user_fields = [
         "domain_name",
@@ -296,7 +274,16 @@ def finalize_run_plan(
     if plan_requires_bounding_box(cfg, steps_now, user_request):
         required_user_fields.append("bounding_box_coords")
 
-    missing = [f for f in required_user_fields if not cfg.get(f)]
+    data_dir = Path.home() / "installs" / "SYMFLUENCE_data"
+    missing = [
+        f
+        for f in required_user_fields
+        if (
+            f == "domain_name"
+            and domain_name_needs_user_input(cfg, user_request, data_dir=data_dir)
+        )
+        or (f != "domain_name" and not cfg.get(f))
+    ]
 
     if missing:
         plan["needs_user_input"] = missing
@@ -306,13 +293,14 @@ def finalize_run_plan(
             "Returning a safe validation/dry-run plan until those values are provided."
         )
 
-    data_dir = Path.home() / "installs" / "SYMFLUENCE_data"
+    plan = ensure_domain_name_user_input(plan, user_request, data_dir=data_dir)
     plan = normalize_local_workflow_plan(
         plan,
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=skip_workflow_step_restore,
     )
+    cfg = dict(plan.get("config") or {})
 
     preferred_order = [
         "validate_config",

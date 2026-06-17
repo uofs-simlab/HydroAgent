@@ -48,6 +48,181 @@ def domain_root(data_dir: str | Path, domain_name: str) -> Path:
     return Path(data_dir) / f"domain_{_s(domain_name)}"
 
 
+_GENERIC_DOMAIN_TOKENS = frozenset(
+    {
+        "bow",
+        "river",
+        "basin",
+        "domain",
+        "summa",
+        "water",
+        "catchment",
+        "watershed",
+        "study",
+        "area",
+        "test",
+        "demo",
+        "experiment",
+        "exp",
+    }
+)
+
+
+def normalize_domain_name_token(name: str) -> str:
+    from server.core.ui_config_fields import normalize_domain_name_value
+
+    return normalize_domain_name_value(_s(name))
+
+
+def is_weak_domain_name(name: str) -> bool:
+    """True for guessed or filesystem-unsafe basin labels (e.g. Bow, 2025)."""
+    token = normalize_domain_name_token(name)
+    if not token:
+        return True
+    if re.fullmatch(r"\d{4}", token):
+        return True
+    if token.lower() in _GENERIC_DOMAIN_TOKENS:
+        return True
+    if "_" not in token and "-" not in token and len(token) < 10:
+        return True
+    return False
+
+
+def domain_name_confirmed_in_plan(cfg: dict) -> bool:
+    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    return bool(extra.get("domain_name_confirmed") or extra.get("DOMAIN_NAME_CONFIRMED"))
+
+
+def mark_domain_name_confirmed(cfg: dict) -> dict:
+    out = dict(cfg)
+    extra = dict(out.get("extra_config") or {}) if isinstance(out.get("extra_config"), dict) else {}
+    extra["domain_name_confirmed"] = True
+    out["extra_config"] = extra
+    return out
+
+
+def extract_explicit_domain_name_from_request(user_request: str) -> str:
+    """Return domain_name only when the user explicitly names it in the prompt."""
+    text = _s(user_request)
+    if not text:
+        return ""
+
+    patterns = (
+        r"\bdomain_name\s+([A-Za-z0-9_\-]+)",
+        r"\bdomain\s+name\s+([A-Za-z0-9_\-]+)",
+        r"\bDOMAIN_NAME\s*[=:]\s*[\"']?([A-Za-z0-9_\-]+)",
+        r"\buse\s+domain_name\s+([A-Za-z0-9_\-]+)",
+        r"\breuse\s+(?:the\s+)?(?:existing\s+)?domain[_\s]+([A-Za-z0-9_\-]+)",
+        r"\bSYMFLUENCE_data/domain_([A-Za-z0-9_\-]+)",
+        r"\bdomain_([A-Za-z0-9_\-]+)/",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return normalize_domain_name_token(match.group(1))
+    return ""
+
+
+def domain_name_needs_user_input(
+    cfg: dict | None,
+    user_request: str = "",
+    *,
+    data_dir: str | Path | None = None,
+) -> bool:
+    """True when domain_name is missing, weak, or not explicitly confirmed."""
+    from server.core.ui_config_fields import plan_config_field_present
+
+    cfg = cfg or {}
+    if not plan_config_field_present(cfg, "domain_name"):
+        return True
+
+    name = normalize_domain_name_token(_s(cfg.get("domain_name")))
+    if not name or is_weak_domain_name(name):
+        return True
+
+    explicit = extract_explicit_domain_name_from_request(user_request)
+    if explicit and explicit.lower() == name.lower():
+        return False
+
+    if domain_name_confirmed_in_plan(cfg):
+        return False
+
+    if data_dir and domain_root(data_dir, name).is_dir():
+        return False
+
+    return True
+
+
+def list_existing_domain_names(data_dir: str | Path | None, *, limit: int = 8) -> list[str]:
+    """Return sorted domain folder names under SYMFLUENCE_data/domain_*."""
+    if not data_dir:
+        return []
+    root = Path(data_dir)
+    if not root.is_dir():
+        return []
+    names = sorted(
+        p.name[len("domain_") :]
+        for p in root.glob("domain_*")
+        if p.is_dir() and p.name.startswith("domain_")
+    )
+    return names[:limit] if limit > 0 else names
+
+
+def ensure_domain_name_user_input(
+    plan: dict,
+    user_request: str = "",
+    *,
+    data_dir: str | Path | None = None,
+) -> dict:
+    """Gate execution until domain_name is explicit, confirmed, or matches on-disk data."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    cfg = dict(out.get("config") or {})
+    explicit = extract_explicit_domain_name_from_request(user_request)
+
+    if explicit:
+        cfg["domain_name"] = explicit
+        cfg = mark_domain_name_confirmed(cfg)
+    elif _s(cfg.get("domain_name")) and domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
+        weak = is_weak_domain_name(_s(cfg.get("domain_name")))
+        cfg.pop("domain_name", None)
+        if weak:
+            _append_plan_note(
+                out,
+                "Removed weak inferred domain_name; provide a filesystem-safe basin name "
+                "(e.g. Bow_at_Banff_semi_distributed).",
+            )
+
+    out["config"] = cfg
+    if not domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
+        return out
+
+    needs = list(out.get("needs_user_input") or [])
+    if "domain_name" not in needs:
+        needs.append("domain_name")
+    out["needs_user_input"] = needs
+    out["steps"] = ["validate_config", "dry_run"]
+    _append_plan_note(
+        out,
+        "Domain name is required. Set domain_name in the prompt, pick an existing "
+        "SYMFLUENCE_data/domain_<name>/ folder, or confirm it in the Input tab.",
+    )
+    existing = list_existing_domain_names(data_dir)
+    if existing:
+        more = ""
+        root = Path(data_dir) if data_dir else None
+        if root and root.is_dir():
+            total = sum(1 for p in root.glob("domain_*") if p.is_dir())
+            if total > len(existing):
+                more = f" ({total} on disk)"
+        _append_plan_note(
+            out,
+            "Existing domains: " + ", ".join(existing) + more,
+        )
+    return out
+
+
 def domain_catchment_shapefile_candidates(
     data_dir: str | Path,
     domain_name: str,
@@ -321,11 +496,12 @@ def user_requires_fresh_cloud_workflow(user_request: str, cfg: dict | None = Non
             "acquire_attributes",
             "define_domain",
             "workflow_steps",
+            "exact step order",
         )
     ):
         return True
-    if "workflow_steps" in text and "define_domain" in text and "acquire_attributes" in text:
-        if any(phrase in text for phrase in ("from scratch", "do not reuse", "data_access: cloud")):
+    if any(marker in text for marker in ("workflow_steps", "exact step order")) and "define_domain" in text and "acquire_attributes" in text:
+        if any(phrase in text for phrase in ("from scratch", "do not reuse", "data_access: cloud", "cloud data access")):
             return True
     return False
 
@@ -362,6 +538,12 @@ def ensure_skip_domain_rerun_when_local_artifacts_exist(
     steps = list(out.get("steps") or [])
 
     if user_requires_fresh_cloud_workflow(user_request, cfg):
+        return out
+
+    if is_weak_domain_name(domain_name):
+        return out
+
+    if domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
         return out
 
     if not domain_has_complete_local_workflow(data_dir, domain_name, experiment_id):
@@ -591,7 +773,9 @@ def ensure_online_data_when_missing(
             out = ensure_cloud_data_access_for_acquire_steps(out)
 
         if plan_requires_bounding_box(cfg, out.get("steps") or [], user_request):
-            if not _s(cfg.get("bounding_box_coords")):
+            from server.core.ui_config_fields import plan_config_field_present
+
+            if not plan_config_field_present(cfg, "bounding_box_coords"):
                 needs = list(out.get("needs_user_input") or [])
                 if "bounding_box_coords" not in needs:
                     needs.append("bounding_box_coords")
@@ -609,26 +793,39 @@ def extract_ordered_workflow_steps(user_request: str) -> list[str]:
     if not user_request:
         return []
     allowed = set(WORKFLOW_STEP_NAMES)
-    block = re.search(
+    step_lookup = {name.lower(): name for name in WORKFLOW_STEP_NAMES}
+    block_patterns = [
         r"workflow_steps\s*:\s*\n(.*?)(?=\n\S|\Z)",
-        user_request,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not block:
+        r"(?:use\s+)?this\s+exact\s+step\s+order\s*:?\s*\n(.*?)(?=\nGenerate\b|\Z)",
+    ]
+    block_text = ""
+    for pattern in block_patterns:
+        block = re.search(pattern, user_request, flags=re.IGNORECASE | re.DOTALL)
+        if block:
+            block_text = block.group(1)
+            break
+    if not block_text:
         return []
+
     ordered: list[str] = []
-    for line in block.group(1).splitlines():
+    seen: set[str] = set()
+    for line in block_text.splitlines():
         line = line.strip()
         if not line:
             continue
-        match = re.search(r"^-\s*[\"']?([A-Za-z_]+)[\"']?", line)
-        if not match:
-            match = re.search(r"[\"']([A-Za-z_]+)[\"']", line)
-        if not match:
-            continue
-        step = match.group(1)
-        if step in allowed:
+        step = ""
+        bare = step_lookup.get(line.lower())
+        if bare:
+            step = bare
+        else:
+            match = re.search(r"^-\s*[\"']?([A-Za-z_]+)[\"']?", line)
+            if not match:
+                match = re.search(r"[\"']([A-Za-z_]+)[\"']", line)
+            if match:
+                step = match.group(1)
+        if step in allowed and step not in seen:
             ordered.append(step)
+            seen.add(step)
     return ordered
 
 
@@ -691,7 +888,24 @@ def apply_chat_step_edits(plan: dict, user_message: str) -> dict:
     if not changed:
         return plan
     out = dict(plan)
-    out["steps"] = steps
+    out["steps"] = [step for step in WORKFLOW_STEP_NAMES if step in steps]
+    return out
+
+
+def _drop_satisfied_needs_user_input(plan: dict) -> dict:
+    """Remove needs_user_input entries that already have values in plan.config."""
+    if not isinstance(plan, dict):
+        return plan
+    from server.core.ui_config_fields import plan_config_field_present
+
+    out = dict(plan)
+    cfg = dict(out.get("config") or {})
+    needs = [
+        key
+        for key in (out.get("needs_user_input") or [])
+        if not plan_config_field_present(cfg, key)
+    ]
+    out["needs_user_input"] = needs
     return out
 
 
@@ -715,6 +929,7 @@ def normalize_local_workflow_plan(
 
     out = strip_user_forbidden_download_steps(out, user_request)
     out = ensure_plan_station_id(out, user_request)
+    out = ensure_domain_name_user_input(out, user_request, data_dir=data_dir)
     if not skip_workflow_step_restore:
         out = restore_workflow_steps_from_user_request(out, user_request)
     out = ensure_skip_domain_rerun_when_local_artifacts_exist(out, user_request, data_dir=data_dir)
@@ -724,12 +939,16 @@ def normalize_local_workflow_plan(
     steps = list(out.get("steps") or [])
 
     if not plan_uses_local_data(cfg, steps, user_request, data_dir=data_dir):
-        return out
+        return _drop_satisfied_needs_user_input(out)
 
     needs = [x for x in (out.get("needs_user_input") or []) if x != "bounding_box_coords"]
     out["needs_user_input"] = needs
 
-    if not skip_workflow_step_restore and set(steps) <= {"validate_config", "dry_run"}:
+    if (
+        not skip_workflow_step_restore
+        and set(steps) <= {"validate_config", "dry_run"}
+        and not domain_name_needs_user_input(cfg, user_request, data_dir=data_dir)
+    ):
         extracted = infer_goal_steps_from_request(user_request)
         if extracted:
             if "validate_config" not in extracted:
@@ -745,7 +964,7 @@ def normalize_local_workflow_plan(
                 "Steps restored from prompt where the planner returned only validate_config/dry_run."
             )
 
-    return out
+    return _drop_satisfied_needs_user_input(out)
 
 
 def extract_steps_from_request(user_request: str, allowed_steps: list[str]) -> list[str]:

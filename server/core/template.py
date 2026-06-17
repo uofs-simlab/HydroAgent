@@ -190,8 +190,23 @@ def strip_duplicate_lowercase_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def sync_legacy_discretization_key(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Template uses DOMAIN_DISCRETIZATION; SYMFLUENCE requires SUB_GRID_DISCRETIZATION."""
-    if cfg.get("SUB_GRID_DISCRETIZATION") in (None, "", "default"):
-        discretization = cfg.get("DOMAIN_DISCRETIZATION")
+    from server.core.ui_config_fields import (
+        normalize_discretization_value,
+        symfluence_discretization_from_plan,
+    )
+
+    discretization = cfg.get("DOMAIN_DISCRETIZATION")
+    if discretization not in (None, "", "default"):
+        plan_probe = {
+            "discretization": discretization,
+            "domain_name": cfg.get("DOMAIN_NAME"),
+            "domain_def": cfg.get("DOMAIN_DEFINITION_METHOD"),
+        }
+        sym_value = symfluence_discretization_from_plan(plan_probe)
+        cfg["DOMAIN_DISCRETIZATION"] = sym_value
+        cfg["SUB_GRID_DISCRETIZATION"] = sym_value
+        discretization = sym_value
+    elif cfg.get("SUB_GRID_DISCRETIZATION") in (None, "", "default"):
         if discretization not in (None, "", "default"):
             cfg["SUB_GRID_DISCRETIZATION"] = discretization
     return cfg

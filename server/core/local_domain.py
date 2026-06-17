@@ -181,6 +181,174 @@ def legacy_catchment_path(data_dir: str | Path, domain_name: str) -> Path:
     )
 
 
+def canonical_catchment_path(
+    data_dir: str | Path,
+    domain_name: str,
+    experiment_id: str = "run_1",
+) -> Path:
+    return (
+        Path(data_dir)
+        / f"domain_{domain_name}"
+        / "shapefiles"
+        / "catchment"
+        / "semidistributed"
+        / experiment_id
+        / f"{domain_name}_HRUs_GRUs.shp"
+    )
+
+
+def lumped_catchment_path(
+    data_dir: str | Path,
+    domain_name: str,
+    experiment_id: str = "run_1",
+) -> Path:
+    return (
+        Path(data_dir)
+        / f"domain_{domain_name}"
+        / "shapefiles"
+        / "catchment"
+        / "lumped"
+        / experiment_id
+        / f"{domain_name}_HRUs_GRUs.shp"
+    )
+
+
+def is_lumped_routing(routing_delineation: str) -> bool:
+    return (routing_delineation or "").strip().lower() == "lumped"
+
+
+def discretized_catchment_path(
+    data_dir: str | Path,
+    domain_name: str,
+    experiment_id: str = "run_1",
+    *,
+    routing_delineation: str = "",
+) -> Path:
+    """Best catchment shapefile from the latest discretize_domain output."""
+    if is_lumped_routing(routing_delineation):
+        lumped = lumped_catchment_path(data_dir, domain_name, experiment_id)
+        if lumped.is_file():
+            return lumped
+    semi = canonical_catchment_path(data_dir, domain_name, experiment_id)
+    if semi.is_file():
+        return semi
+    if is_lumped_routing(routing_delineation):
+        return lumped_catchment_path(data_dir, domain_name, experiment_id)
+    return semi
+
+
+def _parse_lat_lon_pair(value: str) -> tuple[float, float] | None:
+    text = (value or "").strip()
+    if not text or "/" not in text:
+        return None
+    try:
+        lat_str, lon_str = text.split("/", 1)
+        return float(lat_str.strip()), float(lon_str.strip())
+    except ValueError:
+        return None
+
+
+def _parse_bbox_nwse(value: str) -> tuple[float, float, float, float] | None:
+    text = (value or "").strip().replace(",", "/")
+    if not text:
+        return None
+    parts = [part.strip() for part in text.split("/") if part.strip()]
+    if len(parts) != 4:
+        return None
+    try:
+        north, west, south, east = (float(parts[i]) for i in range(4))
+        if north < south:
+            north, south = south, north
+        if east < west:
+            west, east = east, west
+        return north, west, south, east
+    except ValueError:
+        return None
+
+
+def pour_point_inside_bounding_box(pour_coords: str, bbox_coords: str) -> tuple[bool, str]:
+    """Return (ok, message). Pour point must lie inside north/west/south/east bbox."""
+    pour = _parse_lat_lon_pair(pour_coords)
+    bbox = _parse_bbox_nwse(bbox_coords)
+    if pour is None:
+        return True, ""
+    if bbox is None:
+        return True, ""
+    lat, lon = pour
+    north, west, south, east = bbox
+    if south <= lat <= north and west <= lon <= east:
+        return True, ""
+    return (
+        False,
+        f"Pour point {lat}/{lon} is outside bounding box "
+        f"{north}/{west}/{south}/{east} (north/west/south/east). "
+        "Expand the eastern longitude bound past the pour point before running delineation.",
+    )
+
+
+def _read_hru_ids(shapefile: Path) -> set[int]:
+    if not shapefile.is_file():
+        return set()
+    try:
+        import geopandas as gpd
+
+        gdf = gpd.read_file(shapefile)
+        for col in ("HRU_ID", "hru_id", "HRU_id"):
+            if col in gdf.columns:
+                return {int(v) for v in gdf[col].dropna().unique()}
+    except Exception:
+        return set()
+    return set()
+
+
+def catchment_hru_ids_mismatch(
+    data_dir: str | Path,
+    domain_name: str,
+    experiment_id: str = "run_1",
+    *,
+    min_overlap_ratio: float = 0.9,
+    routing_delineation: str = "",
+) -> bool:
+    """True when legacy and discretized catchments disagree on HRU IDs."""
+    legacy = legacy_catchment_path(data_dir, domain_name)
+    canonical = discretized_catchment_path(
+        data_dir, domain_name, experiment_id, routing_delineation=routing_delineation
+    )
+    legacy_ids = _read_hru_ids(legacy)
+    canonical_ids = _read_hru_ids(canonical)
+    if not legacy_ids or not canonical_ids:
+        return False
+    overlap = len(legacy_ids & canonical_ids)
+    denom = max(len(legacy_ids), len(canonical_ids))
+    return overlap / denom < min_overlap_ratio
+
+
+def sync_canonical_catchment_to_legacy(
+    data_dir: str | Path,
+    domain_name: str,
+    experiment_id: str = "run_1",
+    *,
+    routing_delineation: str = "",
+) -> bool:
+    """Copy discretized catchment (lumped or semidistributed) to legacy SUMMA path."""
+    src_base = discretized_catchment_path(
+        data_dir, domain_name, experiment_id, routing_delineation=routing_delineation
+    )
+    if not src_base.is_file():
+        return False
+    dst_base = legacy_catchment_path(data_dir, domain_name)
+    dst_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in ("shp", "shx", "dbf", "prj", "cpg"):
+        src = src_base.with_suffix(f".{ext}")
+        if src.is_file():
+            shutil.copy2(src, dst_base.with_suffix(f".{ext}"))
+    return True
+
+
+def summa_preprocessing_hru_mismatch(step_output: str) -> bool:
+    return "Forcing HRU IDs not found in catchment shapefile" in (step_output or "")
+
+
 def catchment_hru_count(shapefile: Path) -> int:
     dbf = shapefile.with_suffix(".dbf")
     if not dbf.is_file():
@@ -197,9 +365,17 @@ def local_catchment_needs_restore(
     data_dir: str | Path,
     domain_name: str,
     *,
+    experiment_id: str = "run_1",
     min_hrus: int = 2,
+    routing_delineation: str = "",
 ) -> bool:
     legacy = legacy_catchment_path(data_dir, domain_name)
+    lumped = is_lumped_routing(routing_delineation)
+    effective_min = 1 if lumped else min_hrus
     if not legacy.is_file():
         return True
-    return catchment_hru_count(legacy) < min_hrus
+    if catchment_hru_count(legacy) < effective_min:
+        return True
+    return catchment_hru_ids_mismatch(
+        data_dir, domain_name, experiment_id, routing_delineation=routing_delineation
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 # Layout note: minor UI spacing tweaks.
 
 from pathlib import Path
+import re
 import sys
 import os
 import subprocess
@@ -30,20 +31,31 @@ from input_panel_sync import sync_plan_config_to_session  # noqa: E402
 from widget_keys import (  # noqa: E402
     bump_all_input_widget_versions,
     bump_config_preview_version,
+    bump_spatial_input_widget_version,
     config_preview_widget_key,
     experiment_datetime_widget_key,
     input_panel_widget_key,
     mpi_widget_key,
+    spatial_input_widget_key,
 )
 from server.core.ui_config_fields import (  # noqa: E402
     DOMAIN_DEF_OPTIONS,
     FORCING_DATASET_OPTIONS,
     HYDROLOGICAL_MODEL_OPTIONS,
+    _extract_bbox_coords_from_text,
+    apply_comprehensive_chat_config_edits,
+    apply_prompt_literal_config_edits,
+    canonical_plan_config,
     coerce_selectbox_value,
     lookup_plan_config,
     normalize_forcing_dataset,
     normalize_hydrological_model,
+    normalize_plan_for_storage,
+    plan_config_field_present,
     summarize_plan_changes_for_chat,
+    is_lumped_workflow,
+    symfluence_discretization_from_plan,
+    user_forbids_mizuroute,
 )
 from server.core.template import (
     FIELD_MAP,
@@ -52,6 +64,14 @@ from server.core.template import (
     spec_key_to_yaml_key,
 )
 from server.core.validate import validate_spec  # noqa: E402
+from server.core.workflow_executor import (  # noqa: E402
+    completed_steps_from_log,
+    execution_log_path,
+    launch_background_workflow,
+    prepare_execution_log,
+    sync_workflow_execution_state,
+    workflow_is_running,
+)
 
 from server.core.parameter_registry import (
     load_template_parameters,
@@ -65,9 +85,13 @@ from server.capabilities.resolve_dependencies import WORKFLOW_PRIORITY, resolve_
 from server.core.local_domain import (
     copy_reusable_domain_artifacts,
     infer_reuse_source_domain,
+    legacy_catchment_path,
     local_catchment_needs_restore,
+    pour_point_inside_bounding_box,
     restore_local_domain_artifacts,
     seed_mac_duplicate_domain_from_basin,
+    summa_preprocessing_hru_mismatch,
+    sync_canonical_catchment_to_legacy,
     user_request_reuses_local_domain_data,
 )
 from server.core.run_naming import (
@@ -84,12 +108,16 @@ from server.core.run_naming import (
 from server.core.plan_rules import (
     apply_chat_config_edits,
     apply_chat_step_edits,
+    domain_catchment_shapefile_candidates,
     domain_has_local_dem,
     domain_has_local_streamflow,
     domain_has_complete_local_workflow,
+    domain_name_needs_user_input,
     ensure_skip_process_observed_when_local_streamflow,
     extract_station_id_from_request,
     infer_goal_steps_from_request,
+    is_weak_domain_name,
+    mark_domain_name_confirmed,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
     plan_uses_local_data,
@@ -188,6 +216,9 @@ ASSISTANT_BASE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ASSISTANT_BASE / "configs" / "symfluence_template.yaml"
 RUNS_DIR = ASSISTANT_BASE / "runs"
 PREVIEW_DIR = RUNS_DIR / "_preview"
+cfg: dict = {}
+preview_yaml: Path = PREVIEW_DIR / "config_preview.yaml"
+spec_dict: dict = {}
 RUN_FOLDER_SKIP = {"_preview"}
 
 DEFAULT_SYMFLUENCE_REPO = USER_HOME / "installs" / "SYMFLUENCE"
@@ -253,8 +284,8 @@ def sync_mpi_to_run_plan() -> None:
     plan = st.session_state.run_plan
     plan.setdefault("config", {})
     mpi_val = int(st.session_state.mpi)
-    plan["config"]["NUM_PROCESSES"] = mpi_val
     plan["config"]["num_processes"] = mpi_val
+    plan["config"].pop("NUM_PROCESSES", None)
 
 
 def resolve_num_processes_from_plan_cfg(plan_cfg: dict | None) -> int | None:
@@ -340,6 +371,15 @@ ASSISTANT_PANEL_BUTTON_KEYS = (
     "shortcut_assistant_postprocess",
     "calibration_assistant_run_calibrate",
 )
+
+ASSISTANT_PANEL_TOGGLE_KEY = "assistant_panel_toggle"
+
+# Middle workflow column: scroll region height (px) and map iframe height inside it.
+WORKFLOW_PANEL_HEIGHT = 720
+WORKFLOW_MAP_HEIGHT = 520
+WORKFLOW_MAP_ZOOM = 8
+WORKFLOW_SECTION_KEY = "workflow_section"
+EXECUTION_LOG_TAIL_CHARS = 120_000
 
 
 def assistant_panel_button_css() -> str:
@@ -429,6 +469,83 @@ def assistant_panel_button_css() -> str:
     """
 
 
+def panel_edge_toggle_css(key: str, *, edge: str) -> str:
+    """SYMFLUENCE-style vertical chevron on a panel border (edge='left' or 'right')."""
+    if edge == "left":
+        radius = "0 8px 8px 0"
+        border_trim = "border-left: none !important;"
+    else:
+        radius = "8px 0 0 8px"
+        border_trim = "border-right: none !important;"
+    return f"""
+    div.st-key-{key} {{
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        height: 100% !important;
+        min-height: calc(100dvh - 10.5rem) !important;
+        max-width: 1.75rem !important;
+        width: 1.75rem !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: visible !important;
+        pointer-events: none !important;
+    }}
+    div.st-key-{key} button {{
+        pointer-events: auto !important;
+        min-height: 5rem !important;
+        width: 1.65rem !important;
+        min-width: 1.65rem !important;
+        padding: 0.35rem 0 !important;
+        border-radius: {radius} !important;
+        border: 1px solid #d7e2eb !important;
+        {border_trim}
+        background: #eef4fb !important;
+        color: #1b2f45 !important;
+        font-size: 1rem !important;
+        font-weight: 700 !important;
+        line-height: 1 !important;
+        box-shadow: none !important;
+    }}
+    div.st-key-{key} button:hover:not(:disabled) {{
+        background: #e2edf8 !important;
+        border-color: #c5d6e6 !important;
+        color: #0f172a !important;
+    }}
+    """
+
+
+def assistant_panel_toggle_css() -> str:
+    return panel_edge_toggle_css(ASSISTANT_PANEL_TOGGLE_KEY, edge="right")
+
+
+def spatial_input_css() -> str:
+    """Fixed-width pour point / bounding box fields on one row."""
+    return """
+    div[class*="st-key-pour_point_input"] {
+        max-width: 24rem !important;
+        width: 24rem !important;
+    }
+    div[class*="st-key-bounding_box_input"] {
+        max-width: 24rem !important;
+        width: 24rem !important;
+    }
+    div.st-key-clear_selected_pour_point,
+    div.st-key-clear_selected_bbox {
+        max-width: 24rem !important;
+        width: 24rem !important;
+    }
+    div[class*="st-key-pour_point_input"] [data-testid="stTextInputRootElement"],
+    div[class*="st-key-bounding_box_input"] [data-testid="stTextInputRootElement"] {
+        max-width: 100% !important;
+    }
+    div.st-key-clear_selected_pour_point [data-testid="stButton"],
+    div.st-key-clear_selected_bbox [data-testid="stButton"] {
+        width: 100% !important;
+    }
+    """
+
+
 def workflow_panel_surface_css() -> str:
     """Grey workflow column surfaces (match Streamlit sidebar tone)."""
     return """
@@ -452,6 +569,27 @@ def workflow_panel_surface_css() -> str:
         padding: 0;
         background: transparent !important;
         box-shadow: none;
+    }
+    .sym-main-styled [data-testid="stVerticalBlockBorderWrapper"] {
+        overflow: hidden !important;
+    }
+    .sym-main-styled [data-testid="stCustomComponentV1"] {
+        width: 100% !important;
+        max-width: 100% !important;
+        position: relative !important;
+        z-index: 0 !important;
+        overflow: hidden !important;
+        contain: layout paint !important;
+    }
+    .sym-main-styled [data-testid="stCustomComponentV1"] iframe {
+        width: 100% !important;
+        max-width: 100% !important;
+        position: relative !important;
+        z-index: 0 !important;
+    }
+    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {
+        position: relative !important;
+        z-index: 5 !important;
     }
     """
 
@@ -500,7 +638,6 @@ def render_workflow_panel_dom_hooks() -> None:
                 markPanel("sym-assistant-panel", "sym-assistant-styled");
             }
             refreshPanels();
-            window.setInterval(refreshPanels, 800);
         })();
         </script>
         """,
@@ -774,27 +911,215 @@ def mark_spatial_inputs_stale() -> None:
     st.session_state.spatial_inputs_stale = True
 
 
+def workflow_input_map_widget_key() -> str:
+    version = int(st.session_state.get("workflow_map_widget_version", 0))
+    pour_hidden = int(bool(st.session_state.get("pour_point_map_hidden")))
+    bbox_hidden = int(bool(st.session_state.get("bbox_map_hidden")))
+    pour = None if pour_hidden else _resolve_pour_point_lat_lon()
+    bbox = None if bbox_hidden else _resolve_bounding_box_bounds()
+    pour_tag = (
+        "none"
+        if pour is None
+        else f"{pour[0]:.5f}_{pour[1]:.5f}"
+    )
+    bbox_tag = "none" if bbox is None else "set"
+    return f"input_map_v{version}_ph{pour_hidden}_bh{bbox_hidden}_{pour_tag}_{bbox_tag}"
+
+
+def pour_point_widget_key() -> str:
+    return spatial_input_widget_key("pour_point_input")
+
+
+def bounding_box_widget_key() -> str:
+    return spatial_input_widget_key("bounding_box_input")
+
+
+def pour_point_input_value() -> str:
+    return s(st.session_state.get(pour_point_widget_key()))
+
+
+def bounding_box_input_value() -> str:
+    return s(st.session_state.get(bounding_box_widget_key()))
+
+
+def visible_selected_pour() -> str:
+    if not _pour_point_visible_on_map():
+        return ""
+    return s(st.session_state.selected_pour_point) or pour_point_input_value()
+
+
+def visible_selected_bbox() -> str:
+    if not _bbox_visible_on_map():
+        return ""
+    return s(st.session_state.selected_bounding_box) or bounding_box_input_value()
+
+
+def bump_workflow_map_widget_version() -> None:
+    st.session_state.workflow_map_widget_version = int(
+        st.session_state.get("workflow_map_widget_version", 0)
+    ) + 1
+
+
+def _register_suppressed_map_clicks(*coords: tuple[float, float] | None) -> None:
+    """Ignore stale st_folium last_clicked replays for these coordinates."""
+    clicks: list[tuple[float, float]] = list(st.session_state.get("_suppressed_map_clicks") or [])
+    seen = set(clicks)
+    for coord in coords:
+        if coord is None:
+            continue
+        rounded = (round(coord[0], 7), round(coord[1], 7))
+        if rounded not in seen:
+            clicks.append(rounded)
+            seen.add(rounded)
+    if clicks:
+        st.session_state["_suppressed_map_clicks"] = clicks
+    else:
+        st.session_state.pop("_suppressed_map_clicks", None)
+
+
+def _map_click_is_suppressed(lat: float, lon: float) -> bool:
+    clicks = st.session_state.get("_suppressed_map_clicks") or []
+    return (round(lat, 7), round(lon, 7)) in set(clicks)
+
+
+def _clear_suppressed_map_clicks() -> None:
+    st.session_state.pop("_suppressed_map_clicks", None)
+
+
+def _pour_point_visible_on_map() -> bool:
+    return not bool(st.session_state.get("pour_point_map_hidden"))
+
+
+def _bbox_visible_on_map() -> bool:
+    return not bool(st.session_state.get("bbox_map_hidden"))
+
+
+def process_pending_spatial_clears() -> None:
+    """Run queued pour/bbox clears before the map widget is built."""
+    if st.session_state.pop("_pending_clear_pour", False):
+        _handle_clear_pour_point()
+    if st.session_state.pop("_pending_clear_bbox", False):
+        _handle_clear_bounding_box()
+
+
+def _handle_clear_pour_point() -> None:
+    pour = _resolve_pour_point_lat_lon()
+    if pour is not None:
+        _register_suppressed_map_clicks(pour)
+        st.session_state.last_map_click = (round(pour[0], 7), round(pour[1], 7))
+    else:
+        st.session_state.last_map_click = None
+    clear_pour_point_selection(refresh_editor=True, remount_plan_editor=True)
+    st.session_state["_skip_input_panel_sync_once"] = True
+    st.session_state["_ignore_map_clicks_once"] = True
+    st.session_state["_spatial_just_cleared"] = True
+
+
+def _handle_clear_bounding_box() -> None:
+    bounds = _resolve_bounding_box_bounds()
+    if bounds is not None:
+        north, west, south, east = bounds
+        _register_suppressed_map_clicks(
+            (north, west),
+            (south, east),
+            (north, east),
+            (south, west),
+        )
+        st.session_state.last_map_click = (round(north, 7), round(west, 7))
+    else:
+        st.session_state.last_map_click = None
+    clear_bounding_box_selection(refresh_editor=True, remount_plan_editor=True)
+    st.session_state["_skip_input_panel_sync_once"] = True
+    st.session_state["_ignore_map_clicks_once"] = True
+    st.session_state["_spatial_just_cleared"] = True
+
+
+def _clear_spatial_from_run_plan(*, pour: bool = False, bbox: bool = False) -> None:
+    plan = st.session_state.get("run_plan")
+    if not isinstance(plan, dict):
+        return
+    cfg = plan.setdefault("config", {})
+    if pour:
+        cfg["pour_point_coords"] = ""
+        cfg.pop("POUR_POINT_COORDS", None)
+    if bbox:
+        cfg["bounding_box_coords"] = ""
+        cfg.pop("BOUNDING_BOX_COORDS", None)
+    update_run_plan_needs_user_input()
+    store_run_plan(plan)
+
+
+def clear_pour_point_selection(*, refresh_editor: bool = True, remount_plan_editor: bool = False) -> None:
+    st.session_state.pour_point_map_hidden = True
+    st.session_state.map_lat = None
+    st.session_state.map_lon = None
+    st.session_state.map_point_selected = False
+    st.session_state.selected_pour_point = ""
+    bump_spatial_input_widget_version()
+    _clear_spatial_from_run_plan(pour=True)
+    mark_spatial_inputs_stale()
+    bump_workflow_map_widget_version()
+    if refresh_editor:
+        refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
+    bump_config_preview_version()
+
+
+def clear_bounding_box_selection(*, refresh_editor: bool = True, remount_plan_editor: bool = False) -> None:
+    st.session_state.bbox_map_hidden = True
+    st.session_state.bbox_point_1 = None
+    st.session_state.bbox_point_2 = None
+    st.session_state.bbox_selected = False
+    st.session_state.selected_bounding_box = ""
+    bump_spatial_input_widget_version()
+    _clear_spatial_from_run_plan(bbox=True)
+    mark_spatial_inputs_stale()
+    bump_workflow_map_widget_version()
+    if refresh_editor:
+        refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
+    bump_config_preview_version()
+
+
 def refresh_spatial_input_widgets() -> None:
     """Clear cached text-input widget state so map/plan values appear in the boxes."""
     if not st.session_state.pop("spatial_inputs_stale", False):
         return
-    for widget_key in ("pour_point_input", "bounding_box_input"):
-        if widget_key in st.session_state:
-            del st.session_state[widget_key]
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if key_text.startswith("pour_point_input") or key_text.startswith("bounding_box_input"):
+            st.session_state.pop(key, None)
     if s(st.session_state.selected_pour_point):
-        st.session_state.pour_point_input = s(st.session_state.selected_pour_point)
+        st.session_state[pour_point_widget_key()] = s(st.session_state.selected_pour_point)
     if s(st.session_state.selected_bounding_box):
-        st.session_state.bounding_box_input = s(st.session_state.selected_bounding_box)
+        st.session_state[bounding_box_widget_key()] = s(st.session_state.selected_bounding_box)
+
+
+def sync_spatial_selections(pour: str = "", bbox: str = "") -> None:
+    """Update selected_* spatial values; refresh text widgets on the next rerun only."""
+    pour = s(pour)
+    bbox = s(bbox)
+    if pour:
+        st.session_state.selected_pour_point = pour
+    if bbox:
+        st.session_state.selected_bounding_box = bbox
+    current_pour = pour_point_input_value()
+    current_bbox = bounding_box_input_value()
+    if (pour and pour != current_pour) or (bbox and bbox != current_bbox):
+        mark_spatial_inputs_stale()
+        st.session_state.refresh_spatial_inputs = True
 
 
 def effective_plan_config_for_preview() -> dict:
     """Plan config merged with live map/UI spatial selections for preview generation."""
     plan_cfg = dict((st.session_state.run_plan or {}).get("config") or {})
-    pour = s(st.session_state.selected_pour_point) or s(st.session_state.pour_point_input)
-    bbox = (
-        s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
-    )
+    pour = ""
+    bbox = ""
+    if _pour_point_visible_on_map():
+        pour = s(st.session_state.selected_pour_point) or pour_point_input_value()
+    if _bbox_visible_on_map():
+        bbox = (
+            s(st.session_state.selected_bounding_box)
+            or bounding_box_input_value()
+        )
     if pour:
         plan_cfg["pour_point_coords"] = pour
     if bbox:
@@ -905,6 +1230,25 @@ def apply_edited_plan_to_session(plan: dict) -> None:
     sync_run_folder_from_session()
     sync_mpi_to_run_plan()
 
+
+def defer_edited_plan_to_session() -> None:
+    """Queue plan→session sync for before Input widgets mount (after late commits)."""
+    st.session_state["_pending_apply_plan_to_session"] = True
+
+
+def process_pre_widget_plan_sync() -> None:
+    """Apply deferred plan sync and refresh spatial text-input keys before widgets mount."""
+    process_pending_spatial_clears()
+    apply_pending_plan_editor_sync()
+    if st.session_state.pop("_pending_apply_plan_to_session", False):
+        plan = st.session_state.get("run_plan")
+        if plan:
+            apply_edited_plan_to_session(plan)
+    if st.session_state.get("refresh_spatial_inputs"):
+        st.session_state.refresh_spatial_inputs = False
+        mark_spatial_inputs_stale()
+    refresh_spatial_input_widgets()
+
 def load_persistent_config() -> dict:
     if CONFIG_FILE.exists():
         with CONFIG_FILE.open("r") as f:
@@ -922,9 +1266,52 @@ def parse_pour_point(value: str) -> tuple[float, float] | None:
     except Exception:
         return None
 
+
+def parse_bounding_box(value: str) -> tuple[float, float, float, float] | None:
+    """Parse north/west/south/east bounding box string."""
+    value = s(value).replace(",", "/")
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split("/") if part.strip()]
+    if len(parts) != 4:
+        return None
+    try:
+        north, west, south, east = (float(parts[i]) for i in range(4))
+        if north < south:
+            north, south = south, north
+        if east < west:
+            west, east = east, west
+        return north, west, south, east
+    except Exception:
+        return None
+
+
+def sync_manual_bounding_box_to_map() -> None:
+    """Sync bounding-box text input to map rectangle state (manual entry only)."""
+    value = bounding_box_input_value()
+    parsed = parse_bounding_box(value)
+    if parsed is None:
+        if not value:
+            if st.session_state.get("bbox_selected") and s(st.session_state.get("selected_bounding_box")):
+                return
+            st.session_state.bbox_point_1 = None
+            st.session_state.bbox_point_2 = None
+            st.session_state.bbox_selected = False
+            st.session_state.selected_bounding_box = ""
+        return
+
+    north, west, south, east = parsed
+    st.session_state.bbox_map_hidden = False
+    st.session_state.selected_bounding_box = (
+        f"{north:.7f}/{west:.7f}/{south:.7f}/{east:.7f}"
+    )
+    st.session_state.bbox_point_1 = (north, west)
+    st.session_state.bbox_point_2 = (south, east)
+    st.session_state.bbox_selected = True
+
 def sync_manual_pour_point_to_map() -> None:
     """Sync pour-point text input to map marker state (manual entry only)."""
-    value = s(st.session_state.pour_point_input)
+    value = pour_point_input_value()
     parsed = parse_pour_point(value)
 
     if parsed is None:
@@ -939,6 +1326,7 @@ def sync_manual_pour_point_to_map() -> None:
         return
 
     lat, lon = parsed
+    st.session_state.pour_point_map_hidden = False
     st.session_state.selected_pour_point = format_pour_point(lat, lon)
     st.session_state.map_lat = lat
     st.session_state.map_lon = lon
@@ -1123,6 +1511,7 @@ for _provider in ("openai", "gemini", "claude"):
 
 st.session_state.setdefault("run_plan", None)
 st.session_state.setdefault("execute_plan", False)
+st.session_state.setdefault("workflow_executing", False)
 st.session_state.setdefault("execution_log_text", "")
 st.session_state.setdefault("chat_messages", [])
 
@@ -1146,10 +1535,11 @@ defaults = {
     "bbox_point_1": None,
     "bbox_point_2": None,
     "bbox_selected": False,
+    "pour_point_map_hidden": False,
+    "bbox_map_hidden": False,
     "show_dem_layer": False,
     "show_landclass_layer": False,
     "show_soilclass_layer": False,
-    "show_catchment_layer": True,
     "show_riverbasins_layer": False,
     "show_rivernetwork_layer": False,
     "show_hrugru_layer": False,
@@ -1169,10 +1559,15 @@ defaults = {
     "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
     "assistant_panel_tabs": "Prompt",
+    "assistant_panel_open": True,
+    "hydroagent_nav_page": "Workflows",
+    "workflow_section": "Input",
     "input_panel_widget_version": 0,
     "mpi_widget_version": 0,
     "experiment_datetime_widget_version": 0,
     "config_preview_version": 0,
+    "workflow_map_widget_version": 0,
+    "spatial_input_widget_version": 0,
     "spatial_inputs_stale": False,
     "streamflow_data_provider": "WSC",
     "station_id": "",
@@ -1249,6 +1644,77 @@ def render_workflow_progress(plan: dict | None, log_text: str) -> str:
         pieces.append(f"{icon} {label}")
 
     return " → ".join(pieces)
+
+
+def active_workflow_run_dir() -> Path | None:
+    folder = s(st.session_state.get("run_folder"))
+    if not folder:
+        return None
+    run_dir = RUNS_DIR / folder
+    if not run_dir.is_dir():
+        return None
+    return run_dir
+
+
+def workflow_running_for_current_run() -> bool:
+    run_dir = active_workflow_run_dir()
+    return bool(run_dir and workflow_is_running(run_dir))
+
+
+def refresh_workflow_execution_log() -> tuple[bool, str, Path | None]:
+    """Sync execution.log into session state; return (running, log_text, log_path)."""
+    run_dir = active_workflow_run_dir()
+    if run_dir is None:
+        return False, s(st.session_state.get("execution_log_text", "")), None
+
+    running = sync_workflow_execution_state(run_dir, st.session_state)
+    log_path = execution_log_path(run_dir)
+    log_text = (
+        log_path.read_text(encoding="utf-8")
+        if log_path.exists()
+        else s(st.session_state.get("execution_log_text", ""))
+    )
+    st.session_state.execution_log_text = log_text
+    return running, log_text, log_path
+
+
+def render_workflow_output_execution_section() -> None:
+    """Workflow progress and command output on the Output tab (middle panel)."""
+    global output_box, progress_box
+
+    running, log_text, log_path = refresh_workflow_execution_log()
+
+    if st.session_state.pop("_workflow_just_started", False):
+        st.success("Workflow started in the background.")
+
+    plan = st.session_state.get("run_plan")
+
+    st.subheader("Workflow progress")
+    progress_box = st.empty()
+    if plan:
+        progress_box.markdown(render_workflow_progress(plan, log_text))
+
+    if running:
+        st.caption("Running in background — this view refreshes every few seconds while the workflow is active.")
+
+    st.subheader("Command output")
+    output_box = st.empty()
+    display_log = log_text
+    if len(display_log) > EXECUTION_LOG_TAIL_CHARS:
+        st.caption(
+            f"Showing the last {EXECUTION_LOG_TAIL_CHARS // 1000}k characters of the execution log "
+            f"({len(display_log) // 1000}k total). Full log is on disk."
+        )
+        display_log = display_log[-EXECUTION_LOG_TAIL_CHARS:]
+    if display_log:
+        output_box.code(display_log)
+    elif running:
+        output_box.code("(waiting for output…)")
+    elif plan:
+        output_box.code("")
+
+    if log_path is not None:
+        st.caption(f"Log file: `{log_path}`")
 
 
 def clean_cfg_for_safe_run(cfg: dict) -> dict:
@@ -1337,6 +1803,9 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
         return False
     spec = spec or {}
     cfg = cfg or {}
+    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    if is_lumped_workflow(spec, user_request):
+        return False
     domain = s(spec.get("domain_name") or cfg.get("DOMAIN_NAME")).lower()
     if "semi_distributed" in domain or "semi-distributed" in domain:
         return True
@@ -1408,6 +1877,33 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
     return cfg
 
 
+def apply_lumped_workflow_defaults(cfg: dict, spec: dict, user_request: str = "") -> dict:
+    """Align lumped-basin configs with SYMFLUENCE examples (GRUs + lumped routing)."""
+    user_request = user_request or user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    if not is_lumped_workflow(spec, user_request):
+        return cfg
+    defaults = {
+        "ROUTING_DELINEATION": "lumped",
+        "DOMAIN_DISCRETIZATION": "GRUs",
+        "SUB_GRID_DISCRETIZATION": "GRUs",
+        "PARAMETER_REGIONALIZATION": "lumped",
+        "LUMPED_WATERSHED_METHOD": "TauDEM",
+        "DELINEATE_BY_POURPOINT": True,
+    }
+    extra = spec.get("extra_config") if isinstance(spec.get("extra_config"), dict) else {}
+    for key, value in defaults.items():
+        if extra.get(key) is not None:
+            continue
+        if spec.get(key) is not None:
+            continue
+        cfg[key] = value
+    if user_forbids_mizuroute(user_request):
+        cfg.pop("ROUTING_MODEL", None)
+        cfg.pop("MIZUROUTE_INSTALL_PATH", None)
+        cfg.pop("MIZUROUTE_EXE", None)
+    return cfg
+
+
 def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
     """
     Re-apply planner/spec values after template cleanup.
@@ -1447,14 +1943,27 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
         "data_access": "DATA_ACCESS",
     }
 
+    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
     for spec_key, yaml_key in mapping.items():
-        if spec.get(spec_key) is not None:
-            cfg[yaml_key] = spec[spec_key]
+        if spec.get(spec_key) is None:
+            continue
+        if spec_key == "discretization":
+            sym_val = symfluence_discretization_from_plan(spec, user_request)
+            cfg[yaml_key] = sym_val
+            cfg["SUB_GRID_DISCRETIZATION"] = sym_val
+            continue
+        if spec_key == "routing_model" and user_forbids_mizuroute(user_request):
+            cfg.pop(yaml_key, None)
+            continue
+        cfg[yaml_key] = spec[spec_key]
 
     # Preserve uppercase native SYMFLUENCE keys from the plan/spec
     for key, value in spec.items():
-        if value is not None and isinstance(key, str) and key.isupper():
-            cfg[key] = value
+        if value is None or not isinstance(key, str) or not key.isupper():
+            continue
+        if key in {"DOMAIN_DISCRETIZATION", "SUB_GRID_DISCRETIZATION"}:
+            continue
+        cfg[key] = value
 
     # Reapply advanced explicit SYMFLUENCE parameters after cleanup.
     # These come from plan.config.extra_config and must override template defaults.
@@ -1469,6 +1978,7 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
 
     cfg = apply_semi_distributed_config_defaults(cfg, spec)
     cfg = apply_elevation_distributed_config_defaults(cfg, spec)
+    cfg = apply_lumped_workflow_defaults(cfg, spec, user_request)
     return finalize_symfluence_config(cfg, spec)
 
 def preserve_explicit_config_fields_from_prompt(plan: dict, prompt_text: str) -> dict:
@@ -1476,73 +1986,8 @@ def preserve_explicit_config_fields_from_prompt(plan: dict, prompt_text: str) ->
     Safety net: preserve explicit key-value settings from the user's prompt.
     This prevents the LLM planner from replacing explicit prompt values with old/default values.
     """
-    import re
-
-    plan.setdefault("config", {})
-    cfg = plan["config"]
-    text = prompt_text or ""
-
-    patterns_str = {
-        "domain_name": r"\bdomain_name\s+([A-Za-z0-9_\- ]+?)(?:\.|\n|$)",
-        "experiment_id": r"\bexperiment_id\s+([A-Za-z0-9_\-]+)",
-        "forcing_dataset": r"\bforcing_dataset\s+([A-Za-z0-9_\-]+)",
-        "domain_def": r"\bdomain_def\s+([A-Za-z0-9_\-]+)",
-        "discretization": r"\bdiscretization\s+([A-Za-z0-9_\-]+)",
-        "data_access": r"\bdata_access\s+([A-Za-z0-9_]+)",
-        "DATA_ACCESS": r"\bDATA_ACCESS\s+([A-Za-z0-9_]+)",
-        "SNOTEL_STATION": r"\bSNOTEL_STATION\s+(?:to\s+)?([0-9]+)",
-        "optimization_target": r"\boptimization_target\s+([A-Za-z0-9_\-]+)",
-        "optimization_metric": r"\boptimization_metric\s+([A-Za-z0-9_\-]+)",
-        "calibration_timestep": r"\bcalibration_timestep\s+([A-Za-z0-9_\-]+)",
-        "iterative_optimization_algorithm": r"\biterative_optimization_algorithm\s+([A-Za-z0-9_\-]+)",
-        "DELINEATION_METHOD": r"\bDELINEATION_METHOD\s+([A-Za-z0-9_]+)",
-        "delineation_method": r"\bdelineation_method\s+([A-Za-z0-9_]+)",
-    }
-
-    patterns_coords_time = {
-        "pour_point_coords": r"\bpour_point_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
-        "bounding_box_coords": r"\bbounding_box_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
-        "experiment_time_start": r"\bexperiment_time_start\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
-        "experiment_time_end": r"\bexperiment_time_end\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
-    }
-
-    patterns_period = {
-        "spinup_period": r"\bspinup_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})",
-        "calibration_period": r"\bcalibration_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})",
-        "evaluation_period": r"\bevaluation_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})",
-    }
-
-    patterns_int = {
-        "iterations": r"\biterations\s+([0-9]+)",
-        "POPULATION_SIZE": r"\bPOPULATION_SIZE\s+([0-9]+)",
-        "NUM_PROCESSES": r"\bNUM_PROCESSES\s+([0-9]+)",
-        "MPI_PROCESSES": r"\bMPI_PROCESSES\s+([0-9]+)",
-        "STREAM_THRESHOLD": r"\bSTREAM_THRESHOLD\s+([0-9]+(?:\.[0-9]+)?)",
-        "stream_threshold": r"\bstream_threshold\s+([0-9]+(?:\.[0-9]+)?)",
-        "ELEVATION_BAND_SIZE": r"\bELEVATION_BAND_SIZE\s+([0-9]+(?:\.[0-9]+)?)",
-        "elevation_band_size": r"\belevation_band_size\s+([0-9]+(?:\.[0-9]+)?)",
-    }
-
-    patterns_bool = {
-        "DOWNLOAD_SNOTEL": r"\bDOWNLOAD_SNOTEL\s+(?:to\s+)?(true|false)",
-    }
-
-    for key, pat in {**patterns_str, **patterns_coords_time, **patterns_period}.items():
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            cfg[key] = m.group(1).strip()
-
-    for key, pat in patterns_int.items():
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            cfg[key] = int(m.group(1))
-
-    for key, pat in patterns_bool.items():
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            cfg[key] = m.group(1).lower() == "true"
-
-    return plan
+    plan = apply_prompt_literal_config_edits(plan, prompt_text)
+    return apply_comprehensive_chat_config_edits(plan, prompt_text)
 
 def is_new_map_click(lat: float, lon: float) -> bool:
     current = (round(lat, 7), round(lon, 7))
@@ -1551,6 +1996,52 @@ def is_new_map_click(lat: float, lon: float) -> bool:
         return False
     st.session_state.last_map_click = current
     return True
+
+
+def handle_workflow_map_selection(map_data: dict | None) -> None:
+    """Apply pour point / bounding box map clicks; ignore stale st_folium replays."""
+    if st.session_state.pop("_ignore_map_clicks_once", False):
+        return
+    if not map_data or not map_data.get("last_clicked"):
+        return
+
+    clicked = map_data["last_clicked"]
+    lat = clicked["lat"]
+    lon = clicked["lng"]
+    if _map_click_is_suppressed(lat, lon):
+        return
+    if not is_new_map_click(lat, lon):
+        return
+
+    if st.session_state.map_mode == "pour_point":
+        current = format_pour_point(lat, lon)
+        if s(st.session_state.selected_pour_point) != current:
+            set_pour_point_from_map(lat, lon)
+            st.rerun()
+        return
+
+    if st.session_state.map_mode != "bounding_box":
+        return
+
+    p1 = st.session_state.bbox_point_1
+    if p1 is None:
+        st.session_state.bbox_map_hidden = False
+        st.session_state.bbox_point_1 = (lat, lon)
+        st.session_state.bbox_point_2 = None
+        st.session_state.bbox_selected = False
+        sync_spatial_fields_to_run_plan(refresh_editor=True)
+        st.rerun()
+    elif not st.session_state.bbox_selected:
+        lat1, lon1 = st.session_state.bbox_point_1
+        set_bounding_box_from_points(lat1, lon1, lat, lon)
+        st.rerun()
+    else:
+        st.session_state.bbox_point_1 = (lat, lon)
+        st.session_state.bbox_point_2 = None
+        st.session_state.bbox_selected = False
+        st.session_state.selected_bounding_box = ""
+        mark_spatial_inputs_stale()
+        st.rerun()
 
 
 def format_pour_point(lat: float, lon: float) -> str:
@@ -1567,10 +2058,10 @@ def format_bounding_box(lat1: float, lon1: float, lat2: float, lon2: float) -> s
 
 def sync_manual_inputs_to_selected() -> None:
     """Copy non-empty manual text fields into selected_* without erasing map picks."""
-    pour_from_input = s(st.session_state.pour_point_input)
+    pour_from_input = pour_point_input_value()
     if pour_from_input:
         st.session_state.selected_pour_point = pour_from_input
-    bbox_from_input = s(st.session_state.bounding_box_input)
+    bbox_from_input = bounding_box_input_value()
     if bbox_from_input:
         st.session_state.selected_bounding_box = bbox_from_input
 
@@ -1582,6 +2073,7 @@ def on_pour_point_input_change() -> None:
 
 
 def on_bounding_box_input_change() -> None:
+    sync_manual_bounding_box_to_map()
     sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
     bump_config_preview_version()
 
@@ -1680,6 +2172,11 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
 
     spec = wx.merge_advanced_into_spec(spec, plan_cfg)
 
+    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    disc = lookup_plan_config(plan_cfg, "discretization", "DOMAIN_DISCRETIZATION")
+    if disc is not None and s(disc):
+        spec["discretization"] = symfluence_discretization_from_plan(plan_cfg, user_request)
+
     sym_domain = s(spec.get("domain_name"))
     if plan_uses_local_data(plan_cfg, run_steps, conversation_text_for_plan_rules(), data_dir=SYMFLUENCE_DATA_DIR):
         spec["DOWNLOAD_WSC_DATA"] = False
@@ -1688,10 +2185,19 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
 
     return hoist_plan_extra_config_to_spec(spec)
 
+
+def store_run_plan(plan: dict | None) -> None:
+    """Persist a compact plan (planner keys only) in session state."""
+    if plan is None:
+        st.session_state.run_plan = None
+        return
+    st.session_state.run_plan = normalize_plan_for_storage(plan)
+
+
 def plan_editor_text_from_run_plan() -> str:
     if st.session_state.get("run_plan") is None:
         return ""
-    return json.dumps(st.session_state.run_plan, indent=2)
+    return json.dumps(normalize_plan_for_storage(st.session_state.run_plan), indent=2)
 
 
 def plan_editor_widget_key() -> str:
@@ -1710,28 +2216,205 @@ def bump_workflow_chat_compose_version() -> None:
     ) + 1
 
 
+def _deep_copy_plan(plan: dict) -> dict:
+    return json.loads(json.dumps(plan))
+
+
+def _plan_differs(before: dict, after: dict) -> bool:
+    before_cfg = canonical_plan_config(before.get("config") or {})
+    after_cfg = canonical_plan_config(after.get("config") or {})
+    return (
+        before_cfg != after_cfg
+        or list(before.get("steps") or []) != list(after.get("steps") or [])
+    )
+
+
+def _chat_message_has_literal_config(text: str) -> bool:
+    from server.core.ui_config_fields import (
+        _extract_bbox_coords_from_text,
+        _extract_pour_point_coords_from_text,
+    )
+
+    if _extract_bbox_coords_from_text(text) or _extract_pour_point_coords_from_text(text):
+        return True
+    if re.search(
+        r'["\']?(?:bounding_box_coords|pour_point_coords|BOUNDING_BOX_COORDS|POUR_POINT_COORDS)["\']?\s*:',
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:domain_name|experiment_id|pour[_\s-]?point|bounding[_\s-]?box|\bbbox\b|station\s+id|"
+            r"experiment\s+time|spinup\s+period|calibration\s+period|evaluation\s+period|"
+            r"discretization|data_access|forcing_dataset)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
+    """Apply deterministic chat parsers before/after LLM refinement."""
+    before = canonical_plan_config(plan.get("config") or {})
+    patched = preserve_explicit_config_fields_from_prompt(
+        apply_chat_step_edits(
+            apply_chat_config_edits(_deep_copy_plan(plan), text),
+            text,
+        ),
+        text,
+    )
+    after = canonical_plan_config(patched.get("config") or {})
+    changed = (
+        after != before
+        or list(patched.get("steps") or []) != list(plan.get("steps") or [])
+    )
+    return patched, changed
+
+
+def commit_chat_plan_update(
+    current_plan: dict,
+    new_plan: dict,
+    *,
+    user_message: str,
+    conversation_text: str,
+) -> None:
+    new_plan = normalize_local_workflow_plan(
+        new_plan,
+        conversation_text,
+        data_dir=SYMFLUENCE_DATA_DIR,
+        skip_workflow_step_restore=True,
+    )
+    diff = summarize_plan_changes(current_plan, new_plan, user_message=user_message)
+    store_run_plan(new_plan)
+    st.session_state.pop("_committed_plan_steps", None)
+    apply_edited_plan_to_session(new_plan)
+    plan_cfg = (st.session_state.run_plan or {}).get("config") or {}
+    new_pour = s(lookup_plan_config(plan_cfg, "pour_point_coords", "POUR_POINT_COORDS"))
+    new_bbox = s(lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"))
+    if new_pour or new_bbox:
+        sync_spatial_selections(pour=new_pour, bbox=new_bbox)
+    st.session_state["_skip_input_panel_sync_once"] = True
+    refresh_plan_editor_from_state(force=True, remount=True)
+    update_run_plan_needs_user_input()
+    sync_mpi_to_run_plan()
+
+    plan = st.session_state.run_plan or {}
+    gated_steps = set(plan.get("steps") or []) <= {"validate_config", "dry_run"}
+    if gated_steps and not (plan.get("needs_user_input") or []):
+        restored = normalize_local_workflow_plan(
+            plan,
+            conversation_text,
+            data_dir=SYMFLUENCE_DATA_DIR,
+            skip_workflow_step_restore=False,
+        )
+        if list(restored.get("steps") or []) != list(plan.get("steps") or []):
+            store_run_plan(restored)
+            update_run_plan_needs_user_input()
+            refresh_plan_editor_from_state(force=True, remount=True)
+            step_diff = summarize_plan_changes(plan, restored, user_message=user_message)
+            if step_diff:
+                append_chat_message("assistant", step_diff, kind="diff")
+
+    if diff:
+        append_chat_message("assistant", diff, kind="diff")
+    elif list(new_plan.get("steps") or []) != list(current_plan.get("steps") or []):
+        append_chat_message(
+            "assistant",
+            summarize_plan_changes(current_plan, new_plan, user_message=user_message)
+            or "Plan steps updated.",
+            kind="diff",
+        )
+    elif _extract_bbox_coords_from_text(user_message):
+        bbox_val = s(
+            lookup_plan_config(
+                (st.session_state.run_plan or {}).get("config") or {},
+                "bounding_box_coords",
+                "BOUNDING_BOX_COORDS",
+            )
+        )
+        if bbox_val:
+            append_chat_message(
+                "assistant",
+                f"Set bounding box to `{bbox_val}`.",
+                kind="text",
+            )
+
+
+def _spatial_value_from_ui_or_plan(
+    input_key: str,
+    selected_key: str,
+    plan_cfg: dict,
+    plan_keys: tuple[str, ...],
+) -> str:
+    # Prefer map/chat selected_* over text widgets. Fall back to plan only when visible.
+    selected = s(st.session_state.get(selected_key))
+    if selected:
+        return selected
+    if plan_keys[0] == "pour_point_coords" and not _pour_point_visible_on_map():
+        return pour_point_input_value()
+    if plan_keys[0] == "bounding_box_coords" and not _bbox_visible_on_map():
+        return bounding_box_input_value()
+    return (
+        s(lookup_plan_config(plan_cfg, *plan_keys))
+        or (pour_point_input_value() if input_key == "pour_point_input" else bounding_box_input_value() if input_key == "bounding_box_input" else s(st.session_state.get(input_key)))
+    )
+
+
 def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
     """Push map picks and spatial text inputs into run_plan.config."""
     if st.session_state.get("run_plan") is None:
         return
-    pour = s(st.session_state.selected_pour_point) or s(st.session_state.pour_point_input)
-    bbox = s(st.session_state.selected_bounding_box) or s(st.session_state.bounding_box_input)
     plan = st.session_state.run_plan
     plan.setdefault("config", {})
     cfg = plan["config"]
+    pour = _spatial_value_from_ui_or_plan(
+        "pour_point_input",
+        "selected_pour_point",
+        cfg,
+        ("pour_point_coords", "POUR_POINT_COORDS"),
+    )
+    bbox = _spatial_value_from_ui_or_plan(
+        "bounding_box_input",
+        "selected_bounding_box",
+        cfg,
+        ("bounding_box_coords", "BOUNDING_BOX_COORDS"),
+    )
+    if not _pour_point_visible_on_map():
+        pour = ""
+    if not _bbox_visible_on_map():
+        bbox = ""
     if pour:
         cfg["pour_point_coords"] = pour
-    else:
+        cfg.pop("POUR_POINT_COORDS", None)
+    elif not s(lookup_plan_config(cfg, "pour_point_coords", "POUR_POINT_COORDS")):
         cfg.pop("pour_point_coords", None)
+        cfg.pop("POUR_POINT_COORDS", None)
     if bbox:
         cfg["bounding_box_coords"] = bbox
-    else:
+        cfg.pop("BOUNDING_BOX_COORDS", None)
+    elif not s(lookup_plan_config(cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS")):
         cfg.pop("bounding_box_coords", None)
+        cfg.pop("BOUNDING_BOX_COORDS", None)
+    sync_spatial_selections(pour, bbox)
     update_run_plan_needs_user_input()
+    store_run_plan(plan)
     if refresh_editor:
-        refresh_plan_editor_from_state(force=True)
+        request_plan_editor_sync_from_run_plan()
     else:
         st.session_state["_plan_editor_stash"] = plan_editor_text_from_run_plan()
+
+
+def _strip_hidden_spatial_fields_from_plan(plan: dict) -> dict:
+    out = json.loads(json.dumps(plan))
+    cfg = out.setdefault("config", {})
+    if st.session_state.get("pour_point_map_hidden"):
+        cfg.pop("pour_point_coords", None)
+        cfg.pop("POUR_POINT_COORDS", None)
+    if st.session_state.get("bbox_map_hidden"):
+        cfg.pop("bounding_box_coords", None)
+        cfg.pop("BOUNDING_BOX_COORDS", None)
+    return out
 
 
 def capture_plan_editor_draft() -> None:
@@ -1745,11 +2428,12 @@ def capture_plan_editor_draft() -> None:
         try:
             parsed = json.loads(editor_text)
             if isinstance(parsed, dict) and {"config", "steps"}.issubset(parsed.keys()):
-                st.session_state.run_plan = parsed
+                store_run_plan(_strip_hidden_spatial_fields_from_plan(parsed))
                 update_run_plan_needs_user_input()
         except Exception:
             pass
-    sync_spatial_fields_to_run_plan(refresh_editor=False)
+    if not st.session_state.pop("_spatial_just_cleared", False):
+        sync_spatial_fields_to_run_plan(refresh_editor=False)
     st.session_state["_plan_editor_stash"] = plan_editor_text_from_run_plan()
     st.session_state["_plan_editor_synced"] = s(st.session_state["_plan_editor_stash"])
 
@@ -1768,13 +2452,11 @@ def refresh_plan_editor_from_state(force: bool = False, *, remount: bool = False
                 return
         except Exception:
             return
-    if remount:
+    if remount or force:
         st.session_state.plan_editor_version = int(st.session_state.get("plan_editor_version", 0)) + 1
-        widget_key = plan_editor_widget_key()
     st.session_state["_plan_editor_stash"] = source
     st.session_state["_pending_plan_editor_text"] = source
     st.session_state["_plan_editor_synced"] = source.strip()
-    st.session_state[widget_key] = source
 
 
 def render_persistent_plan_editor(*, visible: bool) -> str:
@@ -1873,13 +2555,16 @@ def commit_plan_editor_to_session(
         return False, f"Plan JSON is invalid: {e}"
     if not isinstance(edited_plan, dict):
         return False, "Plan JSON must be an object."
-    st.session_state.run_plan = edited_plan
+    store_run_plan(edited_plan)
     st.session_state["_plan_editor_synced"] = plan_text.strip()
     steps = edited_plan.get("steps")
     if isinstance(steps, list):
         st.session_state["_committed_plan_steps"] = list(steps)
     if apply_ui:
-        apply_edited_plan_to_session(edited_plan)
+        if st.session_state.get("_spatial_widgets_live"):
+            defer_edited_plan_to_session()
+        else:
+            apply_edited_plan_to_session(edited_plan)
     return True, ""
 
 
@@ -1934,17 +2619,41 @@ def sync_input_panel_to_run_plan() -> None:
     """Push Input tab workflow settings into run_plan and refresh the plan JSON editor."""
     if not st.session_state.get("run_plan"):
         return
+    if st.session_state.pop("_skip_input_panel_sync_once", False):
+        bump_config_preview_version()
+        return
     sync_mpi_to_run_plan()
-    sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
+    sync_all_ui_fields_to_plan(refresh_editor=False)
+    request_plan_editor_sync_from_run_plan()
     bump_config_preview_version()
 
 
 def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bool = False) -> None:
+    plan = st.session_state.get("run_plan") or {}
+    existing_cfg = plan.get("config") or {}
     values = {
         "domain_name": s(st.session_state.domain_name),
         "experiment_id": s(st.session_state.experiment_id),
-        "pour_point_coords": s(st.session_state.pour_point_input) or s(st.session_state.selected_pour_point),
-        "bounding_box_coords": s(st.session_state.bounding_box_input) or s(st.session_state.selected_bounding_box),
+        "pour_point_coords": (
+            ""
+            if not _pour_point_visible_on_map()
+            else _spatial_value_from_ui_or_plan(
+                "pour_point_input",
+                "selected_pour_point",
+                existing_cfg,
+                ("pour_point_coords", "POUR_POINT_COORDS"),
+            )
+        ),
+        "bounding_box_coords": (
+            ""
+            if not _bbox_visible_on_map()
+            else _spatial_value_from_ui_or_plan(
+                "bounding_box_input",
+                "selected_bounding_box",
+                existing_cfg,
+                ("bounding_box_coords", "BOUNDING_BOX_COORDS"),
+            )
+        ),
         "domain_def": s(st.session_state.domain_def),
         "hydrological_model": current_hydrological_model(),
         "forcing_dataset": s(st.session_state.forcing_dataset),
@@ -1954,6 +2663,7 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
 
     st.session_state.selected_pour_point = values["pour_point_coords"]
     st.session_state.selected_bounding_box = values["bounding_box_coords"]
+    sync_spatial_selections(values["pour_point_coords"], values["bounding_box_coords"])
 
     if not st.session_state.get("run_plan"):
         return
@@ -1965,22 +2675,45 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
     for key, value in values.items():
         if value:
             cfg[key] = value
+            if key == "pour_point_coords":
+                cfg.pop("POUR_POINT_COORDS", None)
+            if key == "bounding_box_coords":
+                cfg.pop("BOUNDING_BOX_COORDS", None)
+        elif key in {"pour_point_coords", "bounding_box_coords"}:
+            if not s(lookup_plan_config(cfg, key, key.upper())):
+                cfg.pop(key, None)
+                cfg.pop("POUR_POINT_COORDS" if key == "pour_point_coords" else "BOUNDING_BOX_COORDS", None)
         else:
             cfg.pop(key, None)
 
     steps = plan.get("steps", []) or []
     convo = conversation_text_for_plan_rules()
-    required = get_required_config_fields_for_steps(steps, cfg, convo)
-    missing = [k for k in required if not s(cfg.get(k))]
-    if plan_uses_local_data(cfg, steps, convo, data_dir=SYMFLUENCE_DATA_DIR):
-        missing = [k for k in missing if k != "bounding_box_coords"]
+    missing = resolve_plan_missing_inputs(cfg, steps, convo)
     plan["needs_user_input"] = missing
 
-    st.session_state.run_plan = plan
+    store_run_plan(plan)
     wx.sync_advanced_config_to_plan()
 
     if refresh_editor:
-        refresh_plan_editor_from_state(force=force_editor)
+        request_plan_editor_sync_from_run_plan()
+
+
+def resolve_plan_missing_inputs(
+    plan_cfg: dict,
+    steps: list[str],
+    user_request: str = "",
+) -> list[str]:
+    """Compute needs_user_input from step requirements and domain-name policy."""
+    required = get_required_config_fields_for_steps(steps, plan_cfg, user_request)
+    missing = [k for k in required if not plan_config_field_present(plan_cfg, k)]
+    if domain_name_needs_user_input(plan_cfg, user_request, data_dir=SYMFLUENCE_DATA_DIR):
+        if "domain_name" not in missing:
+            missing.append("domain_name")
+    else:
+        missing = [k for k in missing if k != "domain_name"]
+    if plan_uses_local_data(plan_cfg, steps, user_request, data_dir=SYMFLUENCE_DATA_DIR):
+        missing = [k for k in missing if k != "bounding_box_coords"]
+    return missing
 
 
 def update_run_plan_needs_user_input() -> None:
@@ -1992,18 +2725,18 @@ def update_run_plan_needs_user_input() -> None:
     plan["config"] = cfg
     steps = plan.get("steps", []) or []
     convo = conversation_text_for_plan_rules()
-    required = get_required_config_fields_for_steps(steps, cfg, convo)
-    missing = [k for k in required if not s(cfg.get(k))]
-    if plan_uses_local_data(cfg, steps, convo, data_dir=SYMFLUENCE_DATA_DIR):
-        missing = [k for k in missing if k != "bounding_box_coords"]
-    plan["needs_user_input"] = missing
-    st.session_state.run_plan = plan
+    plan["needs_user_input"] = resolve_plan_missing_inputs(cfg, steps, convo)
+    store_run_plan(plan)
 
 
 MISSING_INPUT_GUIDANCE: dict[str, dict[str, str]] = {
     "domain_name": {
         "label": "Domain name",
-        "hint": "Short name for the watershed or study area.",
+        "hint": (
+            "Filesystem-safe basin project name (e.g. Bow_at_Banff_semi_distributed). "
+            "Required unless you name an existing SYMFLUENCE_data/domain_<name>/ folder "
+            "in the prompt."
+        ),
         "where": "Input → Workflow Settings (or fix below).",
     },
     "experiment_id": {
@@ -2078,6 +2811,8 @@ def set_plan_config_field(field: str, value: str) -> None:
 
     if field == "domain_name":
         st.session_state.domain_name = value
+        if value and not is_weak_domain_name(value):
+            plan["config"] = mark_domain_name_confirmed(plan["config"])
         if value and s(st.session_state.experiment_id):
             sync_run_folder_from_session(unlock=True)
     elif field == "experiment_id":
@@ -2086,6 +2821,7 @@ def set_plan_config_field(field: str, value: str) -> None:
             sync_run_folder_from_session(unlock=True)
     elif field == "pour_point_coords":
         st.session_state.selected_pour_point = value
+        st.session_state.pour_point_map_hidden = not bool(value)
         parsed = parse_pour_point(value)
         if parsed:
             lat, lon = parsed
@@ -2099,6 +2835,7 @@ def set_plan_config_field(field: str, value: str) -> None:
         mark_spatial_inputs_stale()
     elif field == "bounding_box_coords":
         st.session_state.selected_bounding_box = value
+        st.session_state.bbox_map_hidden = not bool(value)
         mark_spatial_inputs_stale()
     elif field == "experiment_time_start":
         st.session_state.tstart = value
@@ -2288,6 +3025,7 @@ def render_fix_missing_inputs_section(needs: list[str]) -> None:
 def set_pour_point_from_map(lat: float, lon: float) -> None:
     value = format_pour_point(lat, lon)
 
+    st.session_state.pour_point_map_hidden = False
     st.session_state.map_lat = lat
     st.session_state.map_lon = lon
     st.session_state.map_point_selected = True
@@ -2298,25 +3036,30 @@ def set_pour_point_from_map(lat: float, lon: float) -> None:
     st.session_state.bbox_point_1 = None
     st.session_state.bbox_point_2 = None
     st.session_state.bbox_selected = False
+    _clear_suppressed_map_clicks()
 
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
+    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
 def set_bounding_box_from_points(lat1: float, lon1: float, lat2: float, lon2: float) -> None:
     value = format_bounding_box(lat1, lon1, lat2, lon2)
 
+    st.session_state.bbox_map_hidden = False
     st.session_state.bbox_point_1 = (lat1, lon1)
     st.session_state.bbox_point_2 = (lat2, lon2)
     st.session_state.bbox_selected = True
 
     st.session_state.selected_bounding_box = value
+    _clear_suppressed_map_clicks()
 
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
+    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
@@ -2332,15 +3075,137 @@ def first_existing_gdf(paths: list[str]):
     return None
 
 
-MAP_LAYER_CHECKBOX_SPECS = [
+def _map_view_center_zoom(
+    pour_coords: tuple[float, float] | None,
+    bbox_bounds: tuple[float, float, float, float] | None,
+) -> tuple[list[float], int]:
+    """Default map center and zoom."""
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        return [(north + south) / 2.0, (west + east) / 2.0], WORKFLOW_MAP_ZOOM
+    if pour_coords is not None:
+        return [pour_coords[0], pour_coords[1]], WORKFLOW_MAP_ZOOM
+    return [51.0, -115.5], WORKFLOW_MAP_ZOOM
+
+
+MAP_FILL_LAYER_SPECS = [
     ("show_riverbasins_layer", "River basins", "riverbasins"),
     ("show_hrugru_layer", "HRUs / GRUs", "hrugru"),
-    ("show_rivernetwork_layer", "River network", "rivernetwork"),
     ("show_dem_layer", "DEM", "dem"),
     ("show_landclass_layer", "Landclass", "landclass"),
     ("show_soilclass_layer", "Soilclass", "soilclass"),
     ("show_forcing_layer", "ERA5 intersected", "forcing"),
 ]
+RIVER_NETWORK_LAYER_SPEC = ("show_rivernetwork_layer", "River network", "rivernetwork")
+MAP_LAYER_CHECKBOX_SPECS = MAP_FILL_LAYER_SPECS + [RIVER_NETWORK_LAYER_SPEC]
+
+
+def _current_fill_layer_selection() -> str | None:
+    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
+        if st.session_state.get(state_key):
+            return path_key
+    return None
+
+
+def _sync_fill_layer_flags_from_selection(selected_path_key: str | None) -> None:
+    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
+        st.session_state[state_key] = bool(selected_path_key) and path_key == selected_path_key
+
+
+def reset_map_layer_ui_state() -> None:
+    """Reset map layer widgets after loading a different run."""
+    for state_key, _, _ in MAP_LAYER_CHECKBOX_SPECS:
+        st.session_state[state_key] = False
+    for prefix in ("out", "in"):
+        for state_key, _, _ in MAP_LAYER_CHECKBOX_SPECS:
+            st.session_state.pop(f"{prefix}_{state_key}", None)
+        st.session_state.pop(f"{prefix}_review_fill_layer", None)
+        st.session_state.pop(f"{prefix}_show_rivernetwork_layer", None)
+        st.session_state.pop(f"{prefix}_show_rivernetwork_layer_disabled", None)
+
+
+def _shapefile_suffix_candidates(
+    *,
+    domain_def: str = "",
+    discretization: str = "",
+    plan_cfg: dict | None = None,
+) -> list[str]:
+    """
+    Candidate on-disk suffixes for river_basins / river_network shapefiles.
+
+    SYMFLUENCE often writes *_semidistributed.shp even when domain_def is
+    "delineate" (the delineation method, not the output folder name).
+    """
+    domain_def = s(domain_def).lower()
+    discretization = s(discretization).upper()
+    plan_cfg = plan_cfg or {}
+    spec = {
+        "domain_name": s(st.session_state.domain_name),
+        "domain_def": domain_def,
+        "discretization": discretization or s(plan_cfg.get("discretization")),
+        "steps": (st.session_state.run_plan or {}).get("steps") or [],
+    }
+    if is_semi_distributed_workflow(spec, plan_cfg):
+        ordered = ["semidistributed", "delineate", "distributed"]
+    elif domain_def in ("lumped", "point", "subset"):
+        ordered = [domain_def, "lumped"]
+    elif domain_def:
+        ordered = [domain_def, "semidistributed", "delineate", "lumped", "distributed", "point", "subset"]
+    else:
+        ordered = ["semidistributed", "delineate", "lumped", "distributed", "point", "subset"]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in ordered:
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _first_existing_shapefile(candidates: list[Path]) -> Path | None:
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _resolve_domain_shapefile(
+    directory: Path,
+    *,
+    name_builder,
+    suffixes: list[str],
+    glob_pattern: str,
+) -> str:
+    """Pick the first existing shapefile from explicit candidates, then glob."""
+    candidates = [directory / name_builder(suffix) for suffix in suffixes]
+    found = _first_existing_shapefile(candidates)
+    if found is not None:
+        return str(found)
+    matches = sorted(directory.glob(glob_pattern))
+    if matches:
+        return str(matches[0])
+    return str(candidates[0]) if candidates else ""
+
+
+def _resolve_hru_gru_shapefile(domain_root: Path, domain_name: str, experiment_id: str) -> str:
+    candidates = [legacy_catchment_path(SYMFLUENCE_DATA_DIR, domain_name)]
+    candidates.extend(
+        domain_catchment_shapefile_candidates(SYMFLUENCE_DATA_DIR, domain_name, experiment_id)
+    )
+    for layout in ("lumped", "distributed", "point", "subset"):
+        candidates.append(
+            domain_root
+            / "shapefiles"
+            / "catchment"
+            / layout
+            / experiment_id
+            / f"{domain_name}_HRUs_GRUs.shp"
+        )
+    found = _first_existing_shapefile(candidates)
+    if found is not None:
+        return str(found)
+    return str(candidates[0]) if candidates else ""
 
 
 def symfluence_domain_shapefile_paths(
@@ -2355,8 +3220,21 @@ def symfluence_domain_shapefile_paths(
 
     domain_name = symfluence_domain_name(domain_name, experiment_id)
     domain_root = symfluence_data_domain_dir(domain_name)
-    domain_def = s(st.session_state.domain_def) or "lumped"
+    plan_cfg = (st.session_state.run_plan or {}).get("config") or {}
+    domain_def = (
+        s(plan_cfg.get("domain_def"))
+        or s(st.session_state.domain_def)
+        or "lumped"
+    )
+    discretization = s(plan_cfg.get("discretization"))
+    suffixes = _shapefile_suffix_candidates(
+        domain_def=domain_def,
+        discretization=discretization,
+        plan_cfg=plan_cfg,
+    )
     catchment_base = domain_root / "shapefiles" / "catchment_intersection"
+    river_basins_dir = domain_root / "shapefiles" / "river_basins"
+    river_network_dir = domain_root / "shapefiles" / "river_network"
     return {
         "domain_root": str(domain_root),
         "dem": str(catchment_base / "with_dem" / "catchment_with_dem.shp"),
@@ -2367,25 +3245,18 @@ def symfluence_domain_shapefile_paths(
             / "with_forcing"
             / f"{domain_name}_ERA5_intersected_shapefile.shp"
         ),
-        "riverbasins": str(
-            domain_root
-            / "shapefiles"
-            / "river_basins"
-            / f"{domain_name}_riverBasins_{domain_def}.shp"
+        "riverbasins": _resolve_domain_shapefile(
+            river_basins_dir,
+            name_builder=lambda suffix: f"{domain_name}_riverBasins_{suffix}.shp",
+            suffixes=suffixes,
+            glob_pattern=f"{domain_name}_riverBasins_*.shp",
         ),
-        "hrugru": str(
-            domain_root
-            / "shapefiles"
-            / "catchment"
-            / domain_def
-            / experiment_id
-            / f"{domain_name}_HRUs_GRUs.shp"
-        ),
-        "rivernetwork": str(
-            domain_root
-            / "shapefiles"
-            / "river_network"
-            / f"{domain_name}_riverNetwork_{domain_def}.shp"
+        "hrugru": _resolve_hru_gru_shapefile(domain_root, domain_name, experiment_id),
+        "rivernetwork": _resolve_domain_shapefile(
+            river_network_dir,
+            name_builder=lambda suffix: f"{domain_name}_riverNetwork_{suffix}.shp",
+            suffixes=suffixes,
+            glob_pattern=f"{domain_name}_riverNetwork_*.shp",
         ),
     }
 
@@ -2395,38 +3266,751 @@ def shapefile_layer_available(path: str) -> bool:
 
 
 def render_map_layer_checkboxes(key_prefix: str) -> int:
-    """Layer toggles shared by Input and Output maps. Returns count of layers on disk."""
+    """Output review map: one fill layer (radio) plus optional river-network overlay."""
     paths = symfluence_domain_shapefile_paths()
     if not paths:
         st.info("Set **Domain name** and **Experiment ID** to check for review layers.")
         return 0
 
     available_count = 0
-    cols = st.columns(3)
-    for i, (state_key, label, path_key) in enumerate(MAP_LAYER_CHECKBOX_SPECS):
+    available_fills: list[tuple[str, str, str]] = []
+    for state_key, label, path_key in MAP_FILL_LAYER_SPECS:
         shp_path = paths.get(path_key, "")
-        available = shapefile_layer_available(shp_path)
-        if available:
+        if shapefile_layer_available(shp_path):
             available_count += 1
-        current = bool(st.session_state.get(state_key, False))
-        if not available and current:
-            st.session_state[state_key] = False
-            current = False
-        with cols[i % 3]:
-            st.session_state[state_key] = st.checkbox(
-                label,
-                value=current if available else False,
-                disabled=not available,
-                key=f"{key_prefix}_{state_key}",
-                help=shp_path if available else f"Not found yet:\n{shp_path}",
-            )
+            available_fills.append((state_key, label, path_key))
+
+    rn_state_key, rn_label, rn_path_key = RIVER_NETWORK_LAYER_SPEC
+    river_path = paths.get(rn_path_key, "")
+    river_available = shapefile_layer_available(river_path)
+    if river_available:
+        available_count += 1
+
+    if not available_fills and not river_available:
+        _sync_fill_layer_flags_from_selection(None)
+        st.session_state.show_rivernetwork_layer = False
+        return 0
+
+    if available_fills:
+        fill_path_keys = [path_key for _, _, path_key in available_fills]
+        fill_labels = {path_key: label for _, label, path_key in available_fills}
+        current_fill = _current_fill_layer_selection()
+        if current_fill not in fill_path_keys:
+            current_fill = fill_path_keys[0]
+        selected_fill = st.radio(
+            "Review fill layer",
+            options=fill_path_keys,
+            index=fill_path_keys.index(current_fill),
+            format_func=lambda path_key: fill_labels[path_key],
+            horizontal=True,
+            label_visibility="collapsed",
+            key=f"{key_prefix}_review_fill_layer",
+        )
+        _sync_fill_layer_flags_from_selection(selected_fill)
+    else:
+        _sync_fill_layer_flags_from_selection(None)
+
+    rn_help = river_path if river_available else f"Not found yet:\n{river_path}"
+    current_rn = bool(st.session_state.get(rn_state_key, False)) if river_available else False
+    if not river_available and st.session_state.get(rn_state_key):
+        st.session_state[rn_state_key] = False
+    st.session_state[rn_state_key] = st.checkbox(
+        rn_label,
+        value=current_rn,
+        disabled=not river_available,
+        key=f"{key_prefix}_{rn_state_key}",
+        help=rn_help,
+    )
+
     return available_count
 
 
+# Match symfluence.reporting.plotters.domain_plotter choropleth recipes.
+SYMFLUENCE_MAP_FILL_OPACITY = 0.7
+
+MAP_LAYER_CHOROPLETH_PROFILES: dict[str, str] = {
+    "HRUs / GRUs": "grus",
+    "River Basins": "grus",
+    "DEM Catchment": "elevation",
+    "Landclass Catchment": "landclass",
+    "Soilclass Catchment": "soilclass",
+    "ERA5 Intersected": "forcing",
+}
+
+MAP_LAYER_CMAP_BY_PROFILE: dict[str, str] = {
+    "grus": "viridis",
+    "elevation": "terrain",
+    "landclass": "Set2",
+    "soilclass": "Set3",
+    "forcing": "viridis",
+}
+
+MAP_LAYER_DEFAULT_TOOLTIPS: dict[str, list[str]] = {
+    "HRUs / GRUs": ["HRU_ID", "GRU_ID", "HRU_area", "elev_mean"],
+    "River Basins": ["GRU_ID", "GRU_area"],
+    "DEM Catchment": ["HRU_ID", "GRU_ID", "elev_mean"],
+    "Landclass Catchment": ["HRU_ID", "GRU_ID", "_land_class"],
+    "Soilclass Catchment": ["HRU_ID", "GRU_ID", "_soil_class"],
+    "ERA5 Intersected": ["S_1_GRU_ID", "S_1_HRU_ID", "S_1_order"],
+}
+
+MAP_LAYER_LEGEND_TITLES: dict[str, str] = {
+    "grus": "GRU units",
+    "elevation": "Elevation",
+    "landclass": "Land use class",
+    "soilclass": "Soil class",
+    "forcing": "GRU units (forcing)",
+}
+
+# Scrollable swatch list up to this many classes; above that use compact gradient summary.
+MAP_LEGEND_MAX_SWATCHES = 120
+MAP_LEGEND_TWO_COLUMN_MIN = 10
+MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 240
+
+
+def _pour_point_legend_icon_html() -> str:
+    """Small inline SVG matching the map pour-point pin."""
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="18" viewBox="0 0 24 36" '
+        'style="display:block;flex-shrink:0;" aria-hidden="true">'
+        '<path d="M12 0C5.4 0 0 5.4 0 12c0 9 12 24 12 24s12-15 12-24C24 5.4 18.6 0 12 0z" '
+        'fill="#2563eb" stroke="#ffffff" stroke-width="1.5"/>'
+        '<circle cx="12" cy="12" r="4" fill="#ffffff"/>'
+        "</svg>"
+    )
+
+
+def _bounding_box_legend_icon_html() -> str:
+    return (
+        '<span style="width:14px;height:10px;border:1.5px solid #dc2626;'
+        'background:rgba(220,38,38,0.15);border-radius:1px;flex-shrink:0;display:block;"></span>'
+    )
+
+
+def _river_network_legend_icon_html() -> str:
+    return (
+        '<span style="width:14px;height:0;border-top:3px solid #2563eb;'
+        'flex-shrink:0;display:block;margin-top:6px;"></span>'
+    )
+
+
+def _map_has_bounding_box() -> bool:
+    if not _bbox_visible_on_map():
+        return False
+    if st.session_state.get("bbox_selected") or st.session_state.get("bbox_point_1") is not None:
+        return True
+    for value in (
+        st.session_state.get("selected_bounding_box"),
+        bounding_box_input_value(),
+    ):
+        if s(value):
+            return True
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    return bool(
+        s(lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"))
+    )
+
+
+def _build_map_reference_legend_entries(
+    *,
+    show_rivernetwork_layer: bool = False,
+) -> list[dict[str, str]]:
+    """Symbol rows for pour point, bounding box, and optional river-network line."""
+    entries: list[dict[str, str]] = []
+    if _resolve_pour_point_lat_lon() is not None:
+        entries.append(
+            {
+                "label": html.escape("Pour point"),
+                "icon_html": _pour_point_legend_icon_html(),
+            }
+        )
+    if _map_has_bounding_box():
+        entries.append(
+            {
+                "label": html.escape("Bounding box"),
+                "icon_html": _bounding_box_legend_icon_html(),
+            }
+        )
+    if show_rivernetwork_layer:
+        entries.append(
+            {
+                "label": html.escape("River network"),
+                "icon_html": _river_network_legend_icon_html(),
+            }
+        )
+    return entries
+
+
+def _map_legend_reference_section_html() -> str:
+    return """
+              {% if this.reference_entries %}
+              <div style="border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px;">
+                <div style="font-size:10px;font-weight:600;color:#6b7280;margin-bottom:6px;">
+                  Map symbols
+                </div>
+                {% for ref in this.reference_entries %}
+                  <div style="display:flex;align-items:center;gap:6px;margin:3px 0;min-width:0;">
+                    <span style="width:14px;display:flex;align-items:center;justify-content:center;">
+                      {{ ref.icon_html | safe }}
+                    </span>
+                    <span style="color:#374151;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                      {{ ref.label }}
+                    </span>
+                  </div>
+                {% endfor %}
+              </div>
+              {% endif %}
+    """
+
+
+def _matplotlib_rgba_to_hex(rgba) -> str:
+    r, g, b = (int(round(255 * c)) for c in rgba[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _first_matching_column(gdf: gpd.GeoDataFrame, candidates: tuple[str, ...]) -> str | None:
+    for col in candidates:
+        if col in gdf.columns:
+            return col
+    return None
+
+
+def _add_dominant_fraction_column(gdf: gpd.GeoDataFrame, prefix: str, out_col: str) -> gpd.GeoDataFrame:
+    cols = [col for col in gdf.columns if col.startswith(prefix)]
+    if not cols:
+        return gdf
+    out = gdf.copy()
+    fractions = out[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    out[out_col] = fractions.idxmax(axis=1).str.extract(r"(\d+)$", expand=False)
+    return out
+
+
+def _add_elevation_class_column(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if "elevClass" in gdf.columns:
+        return gdf
+    out = gdf.copy()
+    if "elev_mean" not in out.columns and "S_1_elev_m" in out.columns:
+        out["elev_mean"] = pd.to_numeric(out["S_1_elev_m"], errors="coerce")
+    if "elev_mean" not in out.columns:
+        return out
+    values = pd.to_numeric(out["elev_mean"], errors="coerce")
+    valid = values.dropna()
+    if valid.empty:
+        return out
+    n_bins = int(min(9, max(3, valid.nunique())))
+    ranked = values.rank(method="first")
+    out["_elev_class"] = pd.qcut(ranked, q=n_bins, labels=False, duplicates="drop") + 1
+    return out
+
+
+def _prepare_gdf_for_choropleth(gdf: gpd.GeoDataFrame, profile: str) -> tuple[gpd.GeoDataFrame, str]:
+    if profile == "landclass":
+        prepared = _add_dominant_fraction_column(gdf, "IGBP_", "_land_class")
+        return prepared, "_land_class" if "_land_class" in prepared.columns else ""
+    if profile == "soilclass":
+        prepared = _add_dominant_fraction_column(gdf, "USGS_", "_soil_class")
+        return prepared, "_soil_class" if "_soil_class" in prepared.columns else ""
+    if profile == "elevation":
+        prepared = _add_elevation_class_column(gdf)
+        if "elevClass" in prepared.columns:
+            return prepared, "elevClass"
+        if "_elev_class" in prepared.columns:
+            return prepared, "_elev_class"
+        return prepared, ""
+    if profile == "forcing":
+        prepared = gdf.copy()
+        class_col = _first_matching_column(prepared, ("S_1_GRU_ID", "GRU_ID", "HRU_ID"))
+        if not class_col:
+            return prepared, ""
+        prepared["_map_class"] = pd.to_numeric(prepared[class_col], errors="coerce")
+        return prepared, "_map_class"
+    class_col = _first_matching_column(
+        gdf,
+        ("GRU_ID", "HRU_ID", "gru_id", "hru_id"),
+    )
+    return gdf, class_col or ""
+
+
+def _sort_class_values(values) -> list:
+    def sort_key(value):
+        try:
+            numeric = float(value)
+            if numeric.is_integer():
+                return (0, int(numeric))
+            return (0, numeric)
+        except (TypeError, ValueError):
+            return (1, str(value))
+
+    return sorted(values, key=sort_key)
+
+
+def _class_legend_label(
+    profile: str,
+    class_value,
+    gdf: gpd.GeoDataFrame,
+    class_col: str,
+    *,
+    compact: bool = False,
+) -> str:
+    if profile in {"grus", "forcing"}:
+        return str(class_value) if compact else f"GRU {class_value}"
+    if profile == "elevation" and "elev_mean" in gdf.columns:
+        subset = gdf[gdf[class_col] == class_value]["elev_mean"]
+        subset = pd.to_numeric(subset, errors="coerce").dropna()
+        if not subset.empty:
+            low = int(subset.min())
+            high = int(subset.max())
+            return f"{low}–{high} m" if low != high else f"{low} m"
+    if profile == "landclass":
+        return f"IGBP {class_value}"
+    if profile == "soilclass":
+        return f"USGS {class_value}"
+    return f"Class {class_value}"
+
+
+def _symfluence_class_color_lookup(
+    gdf: gpd.GeoDataFrame,
+    class_col: str,
+    cmap_name: str,
+    *,
+    profile: str = "grus",
+    continuous: bool = False,
+) -> tuple[dict, list[tuple[str, str]]]:
+    if not class_col or class_col not in gdf.columns:
+        return {}, []
+
+    unique_classes = _sort_class_values(gdf[class_col].dropna().unique())
+    n_classes = len(unique_classes)
+    if n_classes == 0:
+        return {}, []
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    base_cmap = plt.get_cmap(cmap_name)
+    if continuous or n_classes > 100 or cmap_name == "viridis":
+        colors = [_matplotlib_rgba_to_hex(base_cmap(i / n_classes)) for i in range(n_classes)]
+    elif n_classes > base_cmap.N:
+        extra_cmaps = ["Set3", "Set2", "Set1", "Paired", "tab20"]
+        all_colors: list = []
+        all_colors.extend([base_cmap(i) for i in np.linspace(0, 1, base_cmap.N)])
+        for extra_name in extra_cmaps:
+            if len(all_colors) >= n_classes:
+                break
+            extra_cmap = plt.get_cmap(extra_name)
+            all_colors.extend([extra_cmap(i) for i in np.linspace(0, 1, extra_cmap.N)])
+        colors = [_matplotlib_rgba_to_hex(color) for color in all_colors[:n_classes]]
+    else:
+        colors = [_matplotlib_rgba_to_hex(base_cmap(i)) for i in np.linspace(0, 1, n_classes)]
+
+    use_compact_labels = profile in {"grus", "forcing"} and n_classes >= MAP_LEGEND_TWO_COLUMN_MIN
+    lookup: dict = {}
+    legend_entries: list[tuple[str, str]] = []
+    for index, cls in enumerate(unique_classes):
+        color = colors[index]
+        legend_entries.append(
+            (
+                _class_legend_label(
+                    profile,
+                    cls,
+                    gdf,
+                    class_col,
+                    compact=use_compact_labels,
+                ),
+                color,
+            )
+        )
+        lookup[cls] = color
+        if isinstance(cls, (int, float)) and not isinstance(cls, bool):
+            lookup[str(int(cls)) if float(cls).is_integer() else str(cls)] = color
+    return lookup, legend_entries
+
+
+def _choropleth_legend_spec(
+    title: str,
+    legend_entries: list[tuple[str, str]],
+    *,
+    profile: str = "",
+) -> dict:
+    if not legend_entries:
+        return {}
+
+    count = len(legend_entries)
+    spec: dict = {
+        "title": title,
+        "count": count,
+        "profile": profile,
+        "start_color": legend_entries[0][1],
+        "end_color": legend_entries[-1][1],
+    }
+
+    if count > MAP_LEGEND_MAX_SWATCHES:
+        if profile in {"grus", "forcing"}:
+            spec.update(
+                {
+                    "mode": "gradient",
+                    "subtitle": "GRU ID (low → high)",
+                    "start_label": legend_entries[0][0],
+                    "end_label": legend_entries[-1][0],
+                }
+            )
+        else:
+            spec.update(
+                {
+                    "mode": "gradient",
+                    "subtitle": f"{count} classes (low → high)",
+                    "start_label": legend_entries[0][0],
+                    "end_label": legend_entries[-1][0],
+                }
+            )
+        return spec
+
+    spec.update(
+        {
+            "mode": "swatches",
+            "entries": legend_entries,
+            "two_column": count >= MAP_LEGEND_TWO_COLUMN_MIN,
+            "value_header": "GRU ID" if profile in {"grus", "forcing"} else "",
+        }
+    )
+    return spec
+
+
+def _add_choropleth_legend_to_map(
+    m: folium.Map,
+    legend_spec: dict,
+    *,
+    reference_entries: list[dict[str, str]] | None = None,
+) -> None:
+    reference_entries = reference_entries or []
+    if not legend_spec and not reference_entries:
+        return
+
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    legend = MacroElement()
+    legend.reference_entries = reference_entries
+    ref_section = _map_legend_reference_section_html()
+
+    if not legend_spec:
+        legend.title = "Map"
+        template = Template(
+            """
+            {% macro html(this, kwargs) %}
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                box-shadow:0 2px 8px rgba(0,0,0,0.18);">
+              <div style="font-weight:600;font-size:12px;color:#1f2937;margin-bottom:4px;">{{ this.title }}</div>
+            """
+            + ref_section
+            + """
+            </div>
+            {% endmacro %}
+            """
+        )
+        legend._template = template
+        legend.add_to(m)
+        return
+
+    legend.title = html.escape(legend_spec["title"])
+    legend.count = legend_spec["count"]
+    legend.start_color = legend_spec["start_color"]
+    legend.end_color = legend_spec["end_color"]
+
+    if legend_spec["mode"] == "swatches":
+        entries = [
+            {"label": html.escape(label), "color": color}
+            for label, color in legend_spec["entries"]
+        ]
+        legend.entries = entries
+        legend.two_column = bool(legend_spec.get("two_column"))
+        legend.value_header = html.escape(legend_spec.get("value_header") or "")
+        legend.scroll_max_height = MAP_LEGEND_SCROLL_MAX_HEIGHT_PX
+        template = Template(
+            """
+            {% macro html(this, kwargs) %}
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                box-shadow:0 2px 8px rgba(0,0,0,0.18);">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
+                <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
+                <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
+              </div>
+              <div style="height:10px;border-radius:5px;border:1px solid #cbd5e1;margin-bottom:8px;
+                background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
+              {% if this.value_header %}
+              <div style="display:grid;grid-template-columns:18px 1fr 18px 1fr;gap:4px 10px;
+                font-size:10px;color:#6b7280;margin-bottom:4px;">
+                <span></span><span>{{ this.value_header }}</span><span></span><span>{{ this.value_header }}</span>
+              </div>
+              {% endif %}
+              <div style="max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
+                {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:12px;{% endif %}">
+              {% for entry in this.entries %}
+                <div style="display:flex;align-items:center;gap:6px;margin:2px 0;min-width:0;">
+                  <span style="width:14px;height:14px;background:{{ entry.color }};
+                    border:1px solid rgba(0,0,0,0.35);border-radius:2px;flex-shrink:0;"></span>
+                  <span style="color:#374151;{% if this.value_header %}font-variant-numeric:tabular-nums;{% endif %}
+                    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ entry.label }}</span>
+                </div>
+              {% endfor %}
+              </div>
+            """
+            + ref_section
+            + """
+            </div>
+            {% endmacro %}
+            """
+        )
+    else:
+        legend.subtitle = html.escape(legend_spec.get("subtitle") or "")
+        legend.start_label = html.escape(legend_spec["start_label"])
+        legend.end_label = html.escape(legend_spec["end_label"])
+        template = Template(
+            """
+            {% macro html(this, kwargs) %}
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                box-shadow:0 2px 8px rgba(0,0,0,0.18);">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px;">
+                <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
+                <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
+              </div>
+              {% if this.subtitle %}
+              <div style="font-size:10px;color:#6b7280;margin-bottom:6px;">{{ this.subtitle }}</div>
+              {% endif %}
+              <div style="height:12px;border-radius:6px;border:1px solid #cbd5e1;
+                background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;color:#374151;">
+                <span style="text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ this.start_label }}</span>
+                <span style="text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ this.end_label }}</span>
+              </div>
+            """
+            + ref_section
+            + """
+            </div>
+            {% endmacro %}
+            """
+        )
+
+    legend._template = template
+    legend.add_to(m)
+
+
+def _feature_property_value(feature: dict, class_col: str):
+    props = feature.get("properties") or {}
+    candidates = (class_col, class_col.upper(), class_col.lower())
+    for key in candidates:
+        if key in props and props[key] is not None:
+            return props[key]
+    return None
+
+
+def _lookup_class_fill_color(class_value, color_by_class: dict) -> str:
+    if class_value in color_by_class:
+        return color_by_class[class_value]
+    text = str(class_value)
+    if text in color_by_class:
+        return color_by_class[text]
+    try:
+        numeric = float(class_value)
+        if numeric.is_integer():
+            int_key = int(numeric)
+            if int_key in color_by_class:
+                return color_by_class[int_key]
+    except (TypeError, ValueError):
+        pass
+    return "#888888"
+
+
+def _make_choropleth_style_functions(
+    class_col: str,
+    color_by_class: dict,
+) -> tuple[object, object]:
+    fill_opacity = SYMFLUENCE_MAP_FILL_OPACITY
+
+    def style_fn(feature):
+        fill = _lookup_class_fill_color(_feature_property_value(feature, class_col), color_by_class)
+        return {
+            "fillColor": fill,
+            "color": "#1a1a1a",
+            "weight": 1,
+            "fillOpacity": fill_opacity,
+        }
+
+    def highlight_fn(feature):
+        base = style_fn(feature)
+        return {**base, "weight": 2, "fillOpacity": min(0.9, fill_opacity + 0.1)}
+
+    return style_fn, highlight_fn
+
+
+def _symfluence_layer_choropleth(
+    gdf: gpd.GeoDataFrame,
+    layer_name: str,
+) -> tuple[gpd.GeoDataFrame, tuple[object, object] | None, dict]:
+    profile = MAP_LAYER_CHOROPLETH_PROFILES.get(layer_name)
+    if not profile:
+        return gdf, None, {}
+
+    prepared, class_col = _prepare_gdf_for_choropleth(gdf, profile)
+    if not class_col:
+        return gdf, None, {}
+
+    lookup, legend_entries = _symfluence_class_color_lookup(
+        prepared,
+        class_col,
+        MAP_LAYER_CMAP_BY_PROFILE[profile],
+        profile=profile,
+        continuous=profile in {"grus", "forcing"},
+    )
+    if not lookup:
+        return gdf, None, {}
+
+    title = MAP_LAYER_LEGEND_TITLES.get(profile, layer_name)
+    legend_spec = _choropleth_legend_spec(title, legend_entries, profile=profile)
+    return prepared, _make_choropleth_style_functions(class_col, lookup), legend_spec
+
+
+def _resolve_pour_point_lat_lon() -> tuple[float, float] | None:
+    if not _pour_point_visible_on_map():
+        return None
+
+    if st.session_state.get("map_point_selected") and st.session_state.get("map_lat") is not None and st.session_state.get("map_lon") is not None:
+        return float(st.session_state.map_lat), float(st.session_state.map_lon)
+
+    for value in (
+        st.session_state.get("selected_pour_point"),
+        pour_point_input_value(),
+    ):
+        parsed = parse_pour_point(s(value))
+        if parsed is not None:
+            return parsed
+
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    parsed = parse_pour_point(
+        s(lookup_plan_config(plan_cfg, "pour_point_coords", "POUR_POINT_COORDS"))
+    )
+    if parsed is not None:
+        return parsed
+    return None
+
+
+def _resolve_bounding_box_bounds() -> tuple[float, float, float, float] | None:
+    """Return (north, west, south, east) from map clicks, text input, or plan config."""
+    if not _bbox_visible_on_map():
+        return None
+
+    if (
+        st.session_state.bbox_selected
+        and st.session_state.bbox_point_1
+        and st.session_state.bbox_point_2
+    ):
+        lat1, lon1 = st.session_state.bbox_point_1
+        lat2, lon2 = st.session_state.bbox_point_2
+        north = max(lat1, lat2)
+        south = min(lat1, lat2)
+        east = max(lon1, lon2)
+        west = min(lon1, lon2)
+        return north, west, south, east
+
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    for value in (
+        st.session_state.get("selected_bounding_box"),
+        bounding_box_input_value(),
+        lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"),
+    ):
+        parsed = parse_bounding_box(s(value))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _add_bounding_box_overlay(
+    m: folium.Map,
+    north: float,
+    west: float,
+    south: float,
+    east: float,
+    *,
+    from_map_clicks: bool = False,
+) -> None:
+    folium.Rectangle(
+        bounds=[[south, west], [north, east]],
+        tooltip="Bounding box",
+        color="red",
+        weight=1,
+        fill=True,
+        fill_opacity=0.15,
+    ).add_to(m)
+    if from_map_clicks and st.session_state.bbox_point_1 and st.session_state.bbox_point_2:
+        lat1, lon1 = st.session_state.bbox_point_1
+        lat2, lon2 = st.session_state.bbox_point_2
+        folium.Marker(
+            [lat1, lon1],
+            tooltip="Bounding box corner 1",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(m)
+        folium.Marker(
+            [lat2, lon2],
+            tooltip="Bounding box corner 2",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(m)
+    else:
+        folium.Marker(
+            [north, west],
+            tooltip="Bounding box (north/west)",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(m)
+        folium.Marker(
+            [south, east],
+            tooltip="Bounding box (south/east)",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(m)
+
+
+def _pour_point_map_icon() -> folium.DivIcon:
+    """Inline SVG pin; icon_anchor at the pin tip (no CSS margins — those drift with zoom)."""
+    return folium.DivIcon(
+        html=(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="36" viewBox="0 0 24 36" '
+            'style="display:block;overflow:visible;" aria-hidden="true">'
+            '<path d="M12 0C5.4 0 0 5.4 0 12c0 9 12 24 12 24s12-15 12-24C24 5.4 18.6 0 12 0z" '
+            'fill="#2563eb" stroke="#ffffff" stroke-width="1.5"/>'
+            '<circle cx="12" cy="12" r="4" fill="#ffffff"/>'
+            "</svg>"
+        ),
+        icon_size=(24, 36),
+        icon_anchor=(12, 36),
+        class_name="sym-pour-point-marker",
+    )
+
+
+def _add_pour_point_marker(
+    m: folium.Map,
+    lat: float,
+    lon: float,
+    *,
+    tooltip: str = "Pour point",
+) -> None:
+    folium.Marker(
+        location=[lat, lon],
+        tooltip=tooltip,
+        icon=_pour_point_map_icon(),
+    ).add_to(m)
+
+
 def build_pour_point_map(
-    center_lat: float = 52.10,
-    center_lon: float = -106.66,
-    zoom: int = 7,
+    center_lat: float = 51.0,
+    center_lon: float = -115.5,
+    zoom: int = WORKFLOW_MAP_ZOOM,
     show_dem_layer: bool = True,
     show_landclass_layer: bool = False,
     show_soilclass_layer: bool = False,
@@ -2435,41 +4019,18 @@ def build_pour_point_map(
     show_forcing_layer: bool = False,
     show_rivernetwork_layer: bool = False,
 ):
-    # Keep map centered on selected pour point unless a completed bbox exists
-    if (
-        st.session_state.map_point_selected
-        and st.session_state.map_lat is not None
-        and st.session_state.map_lon is not None
-    ):
-        center_lat = st.session_state.map_lat
-        center_lon = st.session_state.map_lon
-        zoom = 8
-
-    # If bbox is completed, center on the bbox
-    if (
-        st.session_state.map_mode == "bounding_box"
-        and st.session_state.bbox_selected
-        and st.session_state.bbox_point_1 is not None
-        and st.session_state.bbox_point_2 is not None
-    ):
-        lat1, lon1 = st.session_state.bbox_point_1
-        lat2, lon2 = st.session_state.bbox_point_2
-        center_lat = (lat1 + lat2) / 2.0
-        center_lon = (lon1 + lon2) / 2.0
+    bbox_bounds = _resolve_bounding_box_bounds()
+    pour_coords = _resolve_pour_point_lat_lon()
+    center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
+    center_lat, center_lon = center[0], center[1]
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
 
     if (
-        st.session_state.map_point_selected
-        and st.session_state.map_lat is not None
-        and st.session_state.map_lon is not None
+        _bbox_visible_on_map()
+        and st.session_state.bbox_point_1 is not None
+        and not st.session_state.bbox_selected
     ):
-        folium.Marker(
-            [st.session_state.map_lat, st.session_state.map_lon],
-            tooltip="Selected pour point",
-        ).add_to(m)
-
-    if st.session_state.bbox_point_1 is not None and not st.session_state.bbox_selected:
         lat1, lon1 = st.session_state.bbox_point_1
         folium.Marker(
             [lat1, lon1],
@@ -2477,28 +4038,7 @@ def build_pour_point_map(
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-    if st.session_state.bbox_selected and st.session_state.bbox_point_1 and st.session_state.bbox_point_2:
-        lat1, lon1 = st.session_state.bbox_point_1
-        lat2, lon2 = st.session_state.bbox_point_2
-        north = max(lat1, lat2)
-        south = min(lat1, lat2)
-        east = max(lon1, lon2)
-        west = min(lon1, lon2)
-
-        m.fit_bounds([[south, west], [north, east]])
-
-        folium.Rectangle(
-            bounds=[[south, west], [north, east]],
-            tooltip="Selected bounding box",
-            color="red",
-            weight=1,
-            fill=True,
-            fill_opacity=0.15,
-        ).add_to(m)
-
-        folium.Marker([lat1, lon1], tooltip="Bounding box corner 1", icon=folium.Icon(color="red", icon="flag")).add_to(m)
-        folium.Marker([lat2, lon2], tooltip="Bounding box corner 2", icon=folium.Icon(color="red", icon="flag")).add_to(m)
-
+    active_legend_spec: dict = {}
     try:
         layer_paths = symfluence_domain_shapefile_paths()
         if layer_paths:
@@ -2510,33 +4050,33 @@ def build_pour_point_map(
             hrugru_path = layer_paths["hrugru"]
             rivernetwork_path = layer_paths["rivernetwork"]
 
-            if not st.session_state.map_point_selected:
-                review_gdf = first_existing_gdf([riverbasins_path, hrugru_path, rivernetwork_path])
-                if review_gdf is not None and not review_gdf.empty:
-                    minx, miny, maxx, maxy = review_gdf.total_bounds
-                    m.fit_bounds([[miny, minx], [maxy, maxx]])
-
-            def add_layer_if_exists(shp_path: str, layer_name: str, color: str, tooltip_fields: list[str] | None = None):
+            def add_layer_if_exists(
+                shp_path: str,
+                layer_name: str,
+                color: str,
+                tooltip_fields: list[str] | None = None,
+            ) -> tuple[gpd.GeoDataFrame | None, dict]:
                 if not os.path.exists(shp_path):
-                    return None
+                    return None, {}
 
                 gdf = gpd.read_file(shp_path)
                 if gdf.empty:
-                    return None
+                    return None, {}
 
-                if layer_name == "River Basins":
-                    style_fn = lambda x: {"color": color, "weight": 2, "fillOpacity": 0.05}
-                    highlight_fn = lambda x: {"weight": 2, "fillOpacity": 0.03}
-                elif layer_name == "HRUs / GRUs":
-                    style_fn = lambda x: {"color": color, "weight": 2, "fillOpacity": 0.00}
-                    highlight_fn = lambda x: {"weight": 3, "fillOpacity": 0.05}
-                elif layer_name == "River Network":
-                    style_fn = lambda x: {"color": color, "weight": 4, "fillOpacity": 0.00}
-                    highlight_fn = lambda x: {"weight": 6, "fillOpacity": 0.00}
+                legend_spec: dict = {}
+                if layer_name == "River Network":
+                    style_fn = lambda x, c=color: {"color": c, "weight": 2, "fillOpacity": 0.00}
+                    highlight_fn = lambda x, c=color: {"color": c, "weight": 4, "fillOpacity": 0.00}
                 else:
-                    style_fn = lambda x: {"color": color, "weight": 4, "fillOpacity": 0.10}
-                    highlight_fn = lambda x: {"weight": 6, "fillOpacity": 0.20}
+                    styled_gdf, choropleth_styles, legend_spec = _symfluence_layer_choropleth(gdf, layer_name)
+                    if choropleth_styles is not None:
+                        gdf = styled_gdf
+                        style_fn, highlight_fn = choropleth_styles
+                    else:
+                        style_fn = lambda x, c=color: {"color": c, "weight": 2, "fillOpacity": 0.10}
+                        highlight_fn = lambda x, c=color: {"weight": 3, "fillOpacity": 0.15}
 
+                tips = tooltip_fields or MAP_LAYER_DEFAULT_TOOLTIPS.get(layer_name, [])
                 geojson_kwargs = {
                     "data": gdf.__geo_interface__,
                     "name": layer_name,
@@ -2544,12 +4084,12 @@ def build_pour_point_map(
                     "highlight_function": highlight_fn,
                 }
 
-                if tooltip_fields:
-                    existing_fields = [f for f in tooltip_fields if f in gdf.columns]
+                if tips:
+                    existing_fields = [field for field in tips if field in gdf.columns]
                     if existing_fields:
                         geojson_kwargs["tooltip"] = folium.GeoJsonTooltip(
                             fields=existing_fields,
-                            aliases=[f"{f}: " for f in existing_fields],
+                            aliases=[f"{field}: " for field in existing_fields],
                             localize=True,
                             sticky=False,
                             labels=True,
@@ -2560,59 +4100,100 @@ def build_pour_point_map(
                         )
 
                 folium.GeoJson(**geojson_kwargs).add_to(m)
-                return gdf
+                return gdf, legend_spec
 
             active_gdfs = []
 
             if show_dem_layer:
-                gdf = add_layer_if_exists(dem_path, "DEM Catchment", "red")
+                gdf, legend_spec = add_layer_if_exists(dem_path, "DEM Catchment", "red")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_landclass_layer:
-                gdf = add_layer_if_exists(landclass_path, "Landclass Catchment", "green")
+                gdf, legend_spec = add_layer_if_exists(landclass_path, "Landclass Catchment", "green")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_soilclass_layer:
-                gdf = add_layer_if_exists(soilclass_path, "Soilclass Catchment", "orange")
+                gdf, legend_spec = add_layer_if_exists(soilclass_path, "Soilclass Catchment", "orange")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_forcing_layer:
-                gdf = add_layer_if_exists(forcing_path, "ERA5 Intersected", "gray")
+                gdf, legend_spec = add_layer_if_exists(forcing_path, "ERA5 Intersected", "gray")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_riverbasins_layer:
-                gdf = add_layer_if_exists(riverbasins_path, "River Basins", "purple", tooltip_fields=["GRU_ID", "GRU_area"])
+                gdf, legend_spec = add_layer_if_exists(riverbasins_path, "River Basins", "purple")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_hrugru_layer:
-                gdf = add_layer_if_exists(hrugru_path, "HRUs / GRUs", "brown", tooltip_fields=["HRU_ID", "GRU_ID", "HRU_area"])
+                gdf, legend_spec = add_layer_if_exists(hrugru_path, "HRUs / GRUs", "brown")
                 if gdf is not None:
                     active_gdfs.append(gdf)
+                    active_legend_spec = legend_spec
 
             if show_rivernetwork_layer:
-                gdf = add_layer_if_exists(rivernetwork_path, "River Network", "blue")
+                gdf, _legend_spec = add_layer_if_exists(rivernetwork_path, "River Network", "blue")
                 if gdf is not None:
                     active_gdfs.append(gdf)
-
-            if active_gdfs and not st.session_state.map_point_selected:
-                combined = active_gdfs[0]
-                for gdf in active_gdfs[1:]:
-                    combined = pd.concat([combined, gdf], ignore_index=True)
-                combined = gpd.GeoDataFrame(combined, geometry="geometry", crs=active_gdfs[0].crs)
-                if not combined.empty:
-                    minx, miny, maxx, maxy = combined.total_bounds
-                    m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     except Exception as e:
         st.warning(f"Shapefile layer load failed: {e}")
 
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        from_clicks = bool(
+            st.session_state.bbox_selected
+            and st.session_state.bbox_point_1
+            and st.session_state.bbox_point_2
+        )
+        _add_bounding_box_overlay(
+            m,
+            north,
+            west,
+            south,
+            east,
+            from_map_clicks=from_clicks,
+        )
+
+    _add_choropleth_legend_to_map(
+        m,
+        active_legend_spec,
+        reference_entries=_build_map_reference_legend_entries(
+            show_rivernetwork_layer=show_rivernetwork_layer,
+        ),
+    )
+
+    if pour_coords is not None:
+        tooltip = "Selected pour point" if st.session_state.get("map_point_selected") else "Pour point"
+        _add_pour_point_marker(m, pour_coords[0], pour_coords[1], tooltip=tooltip)
+
     folium.LayerControl().add_to(m)
     return m
+
+
+def render_workflow_map(
+    map_obj: folium.Map,
+    *,
+    key: str,
+    height: int | None = None,
+) -> dict | None:
+    """Folium map sized to the middle workflow column width."""
+    return st_folium(
+        map_obj,
+        key=key,
+        height=height or WORKFLOW_MAP_HEIGHT,
+        use_container_width=True,
+        returned_objects=["last_clicked"],
+    )
 
 
 def dump_yaml(data, path: Path):
@@ -2645,7 +4226,8 @@ def run_cmd_stream(cmd: list[str], cwd: Path, output_box, log_path: Path | None 
                 break
             if line:
                 collected.append(line)
-                output_box.code("".join(collected))
+                if output_box is not None:
+                    output_box.code("".join(collected))
                 if log_file is not None:
                     log_file.write(line)
                     log_file.flush()
@@ -2670,11 +4252,11 @@ def augment_request_with_ui(nl: str) -> str:
     if current_hydrological_model():
         lines.append(f"- hydrological_model: {current_hydrological_model()}")
 
-    effective_pour = s(st.session_state.selected_pour_point) or s(st.session_state.pour_point_input)
+    effective_pour = s(st.session_state.selected_pour_point) or pour_point_input_value()
     if effective_pour:
         lines.append(f"- pour_point_coords: {effective_pour}")
 
-    effective_bbox = s(st.session_state.selected_bounding_box) or s(st.session_state.bounding_box_input)
+    effective_bbox = s(st.session_state.selected_bounding_box) or bounding_box_input_value()
     if effective_bbox:
         lines.append(f"- bounding_box_coords: {effective_bbox}")
 
@@ -2744,7 +4326,7 @@ def run_generate_plan_from_nl_request() -> None:
         if not isinstance(plan["needs_user_input"], list) or not all(isinstance(x, str) for x in plan["needs_user_input"]):
             raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
 
-        st.session_state.run_plan = plan
+        store_run_plan(plan)
         st.session_state.pop("_committed_plan_steps", None)
         apply_plan_config_to_ui(plan)
         if s(st.session_state.get("run_folder")):
@@ -2783,6 +4365,57 @@ def apply_pending_nl_request_transcript() -> None:
     pending = st.session_state.pop("_pending_nl_transcript", None)
     if pending is not None:
         st.session_state.nl_request = pending
+
+
+def prepare_nl_request_before_render() -> None:
+    """Ensure the prompt text_area has content before Streamlit draws the widget."""
+    current = s(st.session_state.get("nl_request"))
+    if current and not is_plan_json_text(current):
+        return
+    saved = s(st.session_state.get("user_prompt"))
+    if saved and not is_plan_json_text(saved):
+        st.session_state.nl_request = saved
+
+
+def capture_nl_request_draft() -> None:
+    """Snapshot the prompt box when switching away from the Prompt tab."""
+    nl = s(st.session_state.get("nl_request"))
+    if nl and not is_plan_json_text(nl):
+        st.session_state.user_prompt = nl
+
+
+def render_persistent_nl_request(*, visible: bool) -> None:
+    """Mount the prompt text_area on every rerun so Prompt/Chat switches keep widget state."""
+    prepare_nl_request_before_render()
+    if visible:
+        def _render_prompt_body() -> None:
+            st.text_area(
+                "Describe what you want",
+                height=210,
+                key="nl_request",
+                placeholder="Example: Create a safe point-domain SUMMA workflow for Paradise SNOTEL...",
+                label_visibility="collapsed",
+            )
+
+        render_editable_block_with_copy(
+            "Describe what you want",
+            anchor_id="sym_copy_anchor_nl_request",
+            copy_key="copy_nl_prompt",
+            fallback_text=s(st.session_state.get("nl_request", "")),
+            render_body=_render_prompt_body,
+        )
+        return
+
+    st.text_area(
+        "Describe what you want",
+        height=68,
+        key="nl_request",
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        '<style>div.st-key-nl_request { display: none !important; }</style>',
+        unsafe_allow_html=True,
+    )
 
 
 def apply_pending_workflow_chat_draft() -> None:
@@ -2852,9 +4485,11 @@ def apply_plan_config_to_ui(plan: dict):
 
     if pour_point:
         st.session_state.selected_pour_point = pour_point
+        st.session_state.pour_point_map_hidden = False
 
     if bbox:
         st.session_state.selected_bounding_box = bbox
+        st.session_state.bbox_map_hidden = False
 
     if hydrological_model:
         st.session_state.hydrological_model = normalize_hydrological_model(hydrological_model)
@@ -2970,14 +4605,14 @@ st.markdown(
         gap: 1rem;
     }
     .sym-title {
-        font-size: 1.45rem;
+        font-size: 2.1rem;
         font-weight: 800;
         letter-spacing: -0.02em;
         margin: 0;
     }
     .sym-subtitle {
         color: #6b7280;
-        font-size: 0.85rem;
+        font-size: 1.5rem;
         font-weight: 500;
     }
     .sym-status {
@@ -3000,12 +4635,12 @@ st.markdown(
     }
     .card-title {
         font-weight: 750;
-        font-size: 0.9rem;
+        font-size: 1.3rem;
         margin-bottom: 0.2rem;
     }
     .card-subtitle {
         color: #6b7280;
-        font-size: 0.75rem;
+        font-size: 1.1rem;
         margin-bottom: 0.7rem;
     }
     .right-panel {
@@ -3079,7 +4714,7 @@ st.markdown(
 )
 
 st.markdown(
-    f"<style>{assistant_panel_button_css()}{workflow_panel_surface_css()}</style>",
+    f"<style>{assistant_panel_button_css()}{assistant_panel_toggle_css()}{spatial_input_css()}{workflow_panel_surface_css()}</style>",
     unsafe_allow_html=True,
 )
 
@@ -3112,7 +4747,7 @@ st.sidebar.markdown("## HydroAgent")
 current_page = st.sidebar.radio(
     "Navigation",
     ["Dashboard", "Workflows", "Experiments", "Data", "Templates", "Results", "Logs", "Settings"],
-    index=1,
+    key="hydroagent_nav_page",
 )
 
 with st.sidebar.expander("Local SYMFLUENCE paths", expanded=current_page == "Settings"):
@@ -3271,26 +4906,29 @@ def apply_loaded_run_to_session(
 ) -> None:
     st.session_state.run_folder = run_folder
     st.session_state.run_workspace_locked = True
+    st.session_state.assistant_panel_open = True
 
     if plan:
-        st.session_state.run_plan = plan
+        store_run_plan(plan)
         steps = plan.get("steps")
         if isinstance(steps, list):
             st.session_state["_committed_plan_steps"] = list(steps)
     else:
-        st.session_state.run_plan = {
+        store_run_plan({
             "config": plan_cfg,
             "steps": [],
             "needs_user_input": [],
             "notes": "Loaded from saved run.",
-        }
+        })
 
     apply_plan_config_to_ui(st.session_state.run_plan)
+    reset_map_layer_ui_state()
 
     pour = s(plan_cfg.get("pour_point_coords"))
     bbox = s(plan_cfg.get("bounding_box_coords"))
     if pour:
-        st.session_state.pour_point_input = pour
+        st.session_state.selected_pour_point = pour
+        st.session_state.pour_point_map_hidden = False
         parsed = parse_pour_point(pour)
         if parsed:
             lat, lon = parsed
@@ -3298,7 +4936,14 @@ def apply_loaded_run_to_session(
             st.session_state.map_lon = lon
             st.session_state.map_point_selected = True
     if bbox:
-        st.session_state.bounding_box_input = bbox
+        st.session_state.selected_bounding_box = bbox
+        st.session_state.bbox_map_hidden = False
+        parsed_bbox = parse_bounding_box(bbox)
+        if parsed_bbox:
+            north, west, south, east = parsed_bbox
+            st.session_state.bbox_point_1 = (north, west)
+            st.session_state.bbox_point_2 = (south, east)
+            st.session_state.bbox_selected = True
 
     mpi_val = plan_cfg.get("num_processes") or plan_cfg.get("mpi_processes")
     if mpi_val is not None:
@@ -3310,9 +4955,23 @@ def apply_loaded_run_to_session(
     if execution_log is not None:
         st.session_state.execution_log_text = execution_log
 
-    refresh_plan_editor_from_state()
+    run_cfg_path = RUNS_DIR / run_folder / "config.yaml"
+    if run_cfg_path.exists():
+        global cfg, preview_yaml
+        loaded_cfg = load_yaml(run_cfg_path)
+        if isinstance(loaded_cfg, dict):
+            cfg = loaded_cfg
+        preview_yaml = run_cfg_path
+        st.session_state["_loaded_config_yaml"] = run_cfg_path.read_text(encoding="utf-8")
+
+    st.session_state["_skip_input_panel_sync_once"] = True
+    request_plan_editor_sync_from_run_plan()
+    st.session_state.plan_editor_version = int(st.session_state.get("plan_editor_version", 0)) + 1
     bump_config_preview_version()
+    bump_input_panel_widget_versions()
     mark_spatial_inputs_stale()
+    sync_preview_artifacts()
+
 
 def load_assistant_run(run_folder: str) -> str | None:
     run_folder = s(run_folder)
@@ -3364,7 +5023,7 @@ def load_assistant_run(run_folder: str) -> str | None:
     recovered_prompt = load_user_prompt_from_run_dir(run_dir, execution_log)
     if recovered_prompt:
         st.session_state.user_prompt = recovered_prompt
-        st.session_state.nl_request = recovered_prompt
+        st.session_state["_pending_nl_transcript"] = recovered_prompt
 
     apply_loaded_run_to_session(
         run_folder,
@@ -3515,12 +5174,8 @@ def render_start_load_run_section() -> None:
                     key="select_assistant_run_folder",
                 )
                 if st.button("Load assistant run", key="load_assistant_run_btn", width="stretch"):
-                    err = load_assistant_run(selected)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success(f"Loaded run `{selected}`")
-                        st.rerun()
+                    st.session_state["_pending_load_run"] = selected
+                    st.rerun()
 
         else:
             domains = list_symfluence_data_domains()
@@ -3735,10 +5390,78 @@ def refine_plan_from_chat_message(user_text: str) -> None:
         )
         return
 
+    current_plan = _deep_copy_plan(st.session_state.run_plan)
+    conversation_text = conversation_text_for_plan_rules()
+    pre_patched, pre_changed = apply_chat_message_to_plan(current_plan, text)
+
+    if pre_changed and _chat_message_has_literal_config(text):
+        commit_chat_plan_update(
+            current_plan,
+            pre_patched,
+            user_message=text,
+            conversation_text=conversation_text,
+        )
+        append_chat_message(
+            "assistant",
+            "Updated the plan from your message.",
+            kind="text",
+        )
+        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
+        if missing:
+            append_chat_message(
+                "assistant",
+                "Still missing before execution: " + ", ".join(missing),
+                kind="warning",
+            )
+        save_chat_messages_to_run_folder()
+        return
+
+    steps_only_change = (
+        pre_changed
+        and list(pre_patched.get("steps") or []) != list(current_plan.get("steps") or [])
+        and canonical_plan_config(pre_patched.get("config") or {})
+        == canonical_plan_config(current_plan.get("config") or {})
+    )
+    if steps_only_change:
+        commit_chat_plan_update(
+            current_plan,
+            pre_patched,
+            user_message=text,
+            conversation_text=conversation_text,
+        )
+        append_chat_message(
+            "assistant",
+            "Updated the plan steps from your message.",
+            kind="text",
+        )
+        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
+        if missing:
+            append_chat_message(
+                "assistant",
+                "Still missing before execution: " + ", ".join(missing),
+                kind="warning",
+            )
+        save_chat_messages_to_run_folder()
+        return
+
     provider = s(st.session_state.get("llm_provider")) or "openai"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
     key = st.session_state.api_keys.get(provider)
     if not key:
+        if pre_changed:
+            commit_chat_plan_update(
+                current_plan,
+                pre_patched,
+                user_message=text,
+                conversation_text=conversation_text,
+            )
+            append_chat_message(
+                "assistant",
+                "Updated the plan from your message (no API key needed for this change).",
+                kind="text",
+            )
+            save_chat_messages_to_run_folder()
+            return
         append_chat_message(
             "assistant",
             f"Save your {provider_label} API key on the **Prompt** tab before refining the plan from chat.",
@@ -3746,6 +5469,20 @@ def refine_plan_from_chat_message(user_text: str) -> None:
         )
         return
     if not llm_provider_available(provider):
+        if pre_changed:
+            commit_chat_plan_update(
+                current_plan,
+                pre_patched,
+                user_message=text,
+                conversation_text=conversation_text,
+            )
+            append_chat_message(
+                "assistant",
+                "Updated the plan from your message.",
+                kind="text",
+            )
+            save_chat_messages_to_run_folder()
+            return
         append_chat_message(
             "assistant",
             f"{provider_label} is not available in this Python environment.",
@@ -3753,8 +5490,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
         )
         return
 
-    current_plan = dict(st.session_state.run_plan)
-    conversation_text = conversation_text_for_plan_rules()
+    working_plan = pre_patched if pre_changed else current_plan
     context_text = build_chat_refinement_context()
     model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
 
@@ -3764,47 +5500,19 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             api_key=key,
             model=model,
             user_message=text,
-            current_plan=current_plan,
+            current_plan=working_plan,
             conversation_text=conversation_text,
             context_text=context_text,
         )
-        if not updated:
-            patched = apply_chat_config_edits(dict(current_plan), text)
-            patched = apply_chat_step_edits(patched, text)
-            plan_cfg_before = (current_plan.get("config") or {})
-            plan_cfg_after = (patched.get("config") or {})
-            if (
-                list(patched.get("steps") or []) != list(current_plan.get("steps") or [])
-                or plan_cfg_after != plan_cfg_before
-            ):
-                new_plan = patched
-                updated = True
-
-        if updated:
-            new_plan = apply_chat_config_edits(new_plan, text)
-            new_plan = apply_chat_step_edits(new_plan, text)
-            new_plan = preserve_explicit_config_fields_from_prompt(new_plan, text)
-            new_plan = normalize_local_workflow_plan(
-                new_plan,
-                conversation_text,
-                data_dir=SYMFLUENCE_DATA_DIR,
-                skip_workflow_step_restore=True,
+        candidate = new_plan if updated else working_plan
+        final_plan, _ = apply_chat_message_to_plan(candidate, text)
+        if _plan_differs(current_plan, final_plan):
+            commit_chat_plan_update(
+                current_plan,
+                final_plan,
+                user_message=text,
+                conversation_text=conversation_text,
             )
-            diff = summarize_plan_changes(current_plan, new_plan, user_message=text)
-            st.session_state.run_plan = new_plan
-            st.session_state.pop("_committed_plan_steps", None)
-            apply_edited_plan_to_session(new_plan)
-            refresh_plan_editor_from_state(force=True, remount=True)
-            update_run_plan_needs_user_input()
-            sync_mpi_to_run_plan()
-            if diff:
-                append_chat_message("assistant", diff, kind="diff")
-            elif list(new_plan.get("steps") or []) != list(current_plan.get("steps") or []):
-                append_chat_message(
-                    "assistant",
-                    summarize_plan_changes(current_plan, new_plan, user_message=text) or "Plan steps updated.",
-                    kind="diff",
-                )
         append_chat_message("assistant", reply)
         missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
         if missing:
@@ -3815,6 +5523,20 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             )
         save_chat_messages_to_run_folder()
     except Exception as e:
+        if pre_changed:
+            commit_chat_plan_update(
+                current_plan,
+                pre_patched,
+                user_message=text,
+                conversation_text=conversation_text,
+            )
+            append_chat_message(
+                "assistant",
+                f"LLM refinement failed ({e}), but I applied the config change from your message.",
+                kind="info",
+            )
+            save_chat_messages_to_run_folder()
+            return
         append_chat_message(
             "assistant",
             f"I could not update the plan: {e}",
@@ -3930,8 +5652,12 @@ def render_workflow_chat_tab() -> None:
 
     provider = s(st.session_state.get("llm_provider")) or "openai"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
-    if not st.session_state.api_keys.get(provider):
-        st.warning(f"Save your {provider_label} API key on the **Prompt** tab to refine the plan from chat.")
+    has_api_key = bool(st.session_state.api_keys.get(provider))
+    if not has_api_key:
+        st.info(
+            f"Save your {provider_label} API key on the **Prompt** tab for open-ended plan refinement. "
+            "You can still send explicit config updates (bounding box, dates, pour point, etc.) without a key."
+        )
 
     messages = get_chat_messages()
     if not messages:
@@ -3963,7 +5689,6 @@ def render_workflow_chat_tab() -> None:
     if st.session_state.pop("_chat_send_empty", False):
         st.warning("Message is empty.")
 
-    chat_disabled = not st.session_state.api_keys.get(provider)
     compose_key = workflow_chat_compose_key()
     compose_value = s(st.session_state.get(compose_key))
 
@@ -4003,20 +5728,17 @@ def render_workflow_chat_tab() -> None:
                 "Message",
                 height=88,
                 key=compose_key,
-                disabled=chat_disabled,
                 placeholder="Ask about the plan or request changes…",
             )
             send_col, clear_col = st.columns(2)
             with send_col:
                 send_clicked = st.form_submit_button(
                     "Send",
-                    disabled=chat_disabled,
                     use_container_width=True,
                 )
             with clear_col:
                 clear_clicked = st.form_submit_button(
                     "Clear message",
-                    disabled=chat_disabled,
                     use_container_width=True,
                 )
 
@@ -4034,10 +5756,324 @@ def render_workflow_chat_tab() -> None:
     elif chat_input := st.chat_input(
         "Ask about the plan or request changes…",
         key="workflow_chat_input",
-        disabled=chat_disabled,
     ):
         queue_chat_refinement(chat_input)
         st.rerun()
+
+
+def render_workflow_assistant_panel() -> None:
+    """Right-hand LLM / plan / chat panel."""
+    st.markdown(
+        '<span class="sym-assistant-panel" aria-hidden="true"></span><div class="right-panel">',
+        unsafe_allow_html=True,
+    )
+    render_workflow_panel_dom_hooks()
+    apply_pending_assistant_panel_tab_focus()
+    capture_plan_editor_draft()
+    st.radio(
+        "Assistant panel",
+        options=[ASSISTANT_TAB_PROMPT, ASSISTANT_TAB_CHAT],
+        key=ASSISTANT_PANEL_TABS_KEY,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    on_prompt_tab = st.session_state.get(ASSISTANT_PANEL_TABS_KEY, ASSISTANT_TAB_PROMPT) != ASSISTANT_TAB_CHAT
+    plan_text_holder = ""
+
+    if not on_prompt_tab:
+        capture_nl_request_draft()
+        render_persistent_nl_request(visible=False)
+        if st.session_state.get("run_plan") is not None:
+            plan_text_holder = render_persistent_plan_editor(visible=False)
+        render_workflow_chat_tab()
+    else:
+        st.markdown("#### LLM Assistant")
+
+        if not FORCINGS_AVAILABLE:
+            st.warning("Local install: acquire_forcings is disabled. Use HPC/MAF or provide external forcings.")
+
+        persistent_cfg = load_persistent_config()
+        for _provider in ("openai", "gemini", "claude"):
+            _cfg_key = persistent_cfg.get(f"{_provider}_api_key")
+            if _cfg_key and not st.session_state.api_keys.get(_provider):
+                st.session_state.api_keys[_provider] = _cfg_key
+
+        provider_labels = list(LLM_PROVIDER_BY_LABEL.keys())
+        current_provider = s(st.session_state.get("llm_provider")) or "openai"
+        if current_provider not in LLM_PROVIDER_LABELS:
+            current_provider = "openai"
+            st.session_state.llm_provider = current_provider
+        current_provider_label = LLM_PROVIDER_LABELS[current_provider]
+        selected_provider_label = st.selectbox(
+            "Provider",
+            provider_labels,
+            index=provider_labels.index(current_provider_label),
+            key="provider_select",
+        )
+        st.session_state.llm_provider = LLM_PROVIDER_BY_LABEL[selected_provider_label]
+        active_provider = st.session_state.llm_provider
+        active_provider_label = LLM_PROVIDER_LABELS[active_provider]
+
+        if st.session_state.api_keys.get(active_provider):
+            st.success(f"{active_provider_label} API key loaded ✔")
+        else:
+            st.warning(f"No {active_provider_label} API key loaded")
+
+        api_key_help = {
+            "openai": "OpenAI API key.",
+            "gemini": "Google AI Studio / Gemini API key.",
+            "claude": "Anthropic API key from console.anthropic.com.",
+        }.get(active_provider, "LLM API key.")
+        api_key = st.text_input(
+            "Your API key",
+            type="password",
+            help=f"Stored only if you click Save key. {api_key_help}",
+        )
+
+        if st.button("Save key", key="save_openai_key", width="stretch", type="secondary"):
+            if api_key.strip():
+                st.session_state.api_keys[active_provider] = api_key.strip()
+                cfg_local = load_local_settings()
+                cfg_local[f"{active_provider}_api_key"] = api_key.strip()
+                save_local_settings(cfg_local)
+                st.success("API key saved on this machine.")
+            else:
+                st.error("API key is empty.")
+
+        if not llm_provider_available(active_provider):
+            st.error(
+                f"{active_provider_label} provider not available. "
+                "Install the required SDK package in the same Python that runs Streamlit."
+            )
+            import_error = llm_provider_import_error(active_provider)
+            if import_error:
+                st.code(import_error)
+            st.markdown(llm_provider_install_hint(active_provider))
+        else:
+            available_models = llm_models_for_provider(active_provider)
+            current_model = (
+                s(st.session_state.get("llm_model"))
+                or s(st.session_state.get("gpt_model"))
+                or DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
+            )
+            if current_model not in available_models:
+                current_model = DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
+            st.session_state.llm_model = st.selectbox(
+                "Model",
+                available_models,
+                index=available_models.index(current_model),
+                format_func=lambda model_id: llm_model_label(model_id, active_provider),
+            )
+            st.session_state.gpt_model = st.session_state.llm_model
+
+            apply_pending_nl_request_transcript()
+            if st.session_state.pop("_nl_transcribe_ok", False):
+                st.success("Transcription added. Review the prompt, then click Generate plan.")
+            render_persistent_nl_request(visible=True)
+
+            voice_provider, _voice_key = resolve_voice_transcription_provider()
+            if voice_provider:
+                voice_label = VOICE_PROVIDER_LABELS.get(voice_provider, "Voice")
+                st.markdown(f"**Voice input** ({voice_label} → prompt box)")
+                if voice_provider != active_provider:
+                    st.caption(
+                        f"Speech-to-text uses **{LLM_PROVIDER_LABELS[voice_provider]}** "
+                        f"(planner is **{active_provider_label}**)."
+                    )
+                if hasattr(st, "audio_input"):
+                    voice_audio = st.audio_input(
+                        "Record your request",
+                        key="voice_nl_request",
+                        help="Record audio, then click Transcribe to prompt.",
+                    )
+                else:
+                    voice_audio = st.file_uploader(
+                        "Upload audio (wav, mp3, m4a, webm)",
+                        type=["wav", "mp3", "m4a", "webm", "mpeg", "mpga"],
+                        key="voice_nl_upload",
+                    )
+
+                if st.button(
+                    "Transcribe to prompt",
+                    key="transcribe_voice_to_prompt",
+                    width="stretch",
+                    type="secondary",
+                ):
+                    if voice_audio is None:
+                        st.warning("Record or upload audio first.")
+                    else:
+                        audio_bytes = voice_audio.getvalue()
+                        filename = getattr(voice_audio, "name", None) or "recording.webm"
+                        transcript = transcribe_voice_to_nl_request(audio_bytes, filename)
+                        if transcript:
+                            if st.session_state.get("run_plan"):
+                                st.session_state["_pending_workflow_chat_draft"] = transcript
+                                st.session_state["_chat_transcribe_ok"] = True
+                                request_assistant_chat_tab()
+                            else:
+                                st.session_state["_pending_nl_transcript"] = transcript
+                                st.session_state["_nl_transcribe_ok"] = True
+                            st.rerun()
+            else:
+                st.caption(
+                    "Save an **OpenAI** API key to transcribe voice (Whisper). "
+                    "Claude has no speech-to-text API."
+                )
+
+            st.markdown(
+                '<div class="assistant-plan-divider">------------------</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Generate plan",
+                key="generate_plan_gpt",
+                width="stretch",
+                type="secondary",
+            ):
+                run_generate_plan_from_nl_request()
+
+        if st.session_state.get("run_plan") is not None:
+            plan_text_holder = render_persistent_plan_editor(visible=True)
+            update_run_plan_needs_user_input()
+
+            if st.button(
+                "Resolve dependencies",
+                key="resolve_dependencies",
+                width="stretch",
+                type="secondary",
+            ):
+                ok, err = commit_plan_editor_to_session(
+                    plan_text=plan_text_holder or current_plan_editor_text()
+                )
+                if not ok:
+                    st.error(err)
+                    st.stop()
+                resolved_plan = resolve_requested_plan_dependencies(st.session_state.run_plan)
+                store_run_plan(resolved_plan)
+                steps = resolved_plan.get("steps")
+                if isinstance(steps, list):
+                    st.session_state["_committed_plan_steps"] = list(steps)
+                refresh_plan_editor_from_state(force=True, remount=True)
+                st.success("Dependencies resolved from operation catalog.")
+                st.rerun()
+
+            st.session_state.want_create_pour_point = st.checkbox(
+                "Also run create_pour_point",
+                value=st.session_state.want_create_pour_point,
+            )
+            st.session_state.allow_run = st.checkbox(
+                "Allow dangerous run steps",
+                value=st.session_state.get("allow_run", False),
+            )
+            st.text_input(
+                "Type RUN to allow dangerous execution",
+                key="danger_phrase",
+                help="Required for run_model or calibrate_model.",
+            )
+
+            needs = st.session_state.run_plan.get("needs_user_input", []) or []
+            if needs:
+                st.warning(
+                    f"{len(needs)} required field(s) missing before execution. "
+                    "Use the section below or the Input tab."
+                )
+                render_fix_missing_inputs_section(needs)
+
+            assistant_shortcut_out = st.empty()
+            wx.render_run_shortcuts_section(
+                execute_bundle_fn=lambda key: execute_step_bundle(key, assistant_shortcut_out),
+                location="assistant",
+            )
+
+            assistant_cal_out = st.empty()
+
+            def _assistant_run_calibrate() -> None:
+                if not st.session_state.allow_run:
+                    st.error("Enable **Allow dangerous run steps** first.")
+                    return
+                with st.spinner("Running calibration…"):
+                    rc, _ = execute_single_symfluence_step("calibrate_model", assistant_cal_out)
+                if rc == 0:
+                    st.success("Calibration step finished.")
+                else:
+                    st.error(f"Calibration failed (return code {rc}).")
+
+            wx.render_calibration_section(
+                execute_calibrate_fn=_assistant_run_calibrate,
+                location="assistant",
+            )
+            steps_set = set(st.session_state.run_plan.get("steps", []) or [])
+            needs_confirm = bool(steps_set & DANGER_STEPS)
+            can_execute = len(needs) == 0
+            confirm_ok = True
+
+            if needs_confirm:
+                confirm_ok = st.checkbox("Confirm: this may take a long time / download data", value=False)
+
+            if workflow_running_for_current_run():
+                st.caption("Workflow running — open the **Output** tab for progress and command output.")
+
+            exec_col, clear_col = st.columns(2)
+            with exec_col:
+                exec_btn = st.button(
+                    "Execute plan",
+                    disabled=(
+                        (not can_execute)
+                        or (not confirm_ok)
+                        or workflow_running_for_current_run()
+                    ),
+                    key="execute_plan_button",
+                    width="stretch",
+                    type="secondary",
+                )
+            with clear_col:
+                clear_plan = st.button(
+                    "Clear plan",
+                    key="clear_plan_button",
+                    width="stretch",
+                    type="secondary",
+                )
+
+            if clear_plan:
+                clear_chat_messages(clear_plan=True)
+                st.success("Plan cleared.")
+                st.rerun()
+
+            if exec_btn:
+                active_run_dir = RUNS_DIR / s(st.session_state.run_folder)
+                if active_run_dir.is_dir() and workflow_is_running(active_run_dir):
+                    st.error(
+                        "Workflow is already running for this run folder. "
+                        "Wait for it to finish before clicking Execute again."
+                    )
+                    st.stop()
+                ok, err = commit_plan_editor_to_session(
+                    plan_text=plan_text_holder or current_plan_editor_text()
+                )
+                if not ok:
+                    st.error(err)
+                    st.stop()
+                update_run_plan_needs_user_input()
+                try:
+                    plan_cfg = (st.session_state.run_plan or {}).get("config", {}) or {}
+                    validation_cfg = {
+                        "SYMFLUENCE_CODE_DIR": normalize_path_text(SYMFLUENCE_REPO),
+                        "SYMFLUENCE_DATA_DIR": normalize_path_text(SYMFLUENCE_DATA_DIR) + "/",
+                        "DOMAIN_NAME": s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
+                        "EXPERIMENT_ID": s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
+                        "POUR_POINT_COORDS": s(plan_cfg.get("pour_point_coords")) or s(st.session_state.selected_pour_point),
+                        "BOUNDING_BOX_COORDS": s(plan_cfg.get("bounding_box_coords")) or s(st.session_state.selected_bounding_box),
+                        "HYDROLOGICAL_MODEL": current_hydrological_model(plan_cfg),
+                        "DOMAIN_DEFINITION_METHOD": s(plan_cfg.get("domain_def")) or s(st.session_state.domain_def),
+                        "EXPERIMENT_TIME_START": s(plan_cfg.get("experiment_time_start")) or s(st.session_state.tstart),
+                        "EXPERIMENT_TIME_END": s(plan_cfg.get("experiment_time_end")) or s(st.session_state.tend),
+                    }
+                    validate_spec(validation_cfg)
+                    st.session_state.execute_plan = True
+                except Exception as e:
+                    st.error(f"Validation failed before execution: {e}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def load_user_prompt_from_run_dir(run_dir: Path, execution_log: str = "") -> str:
@@ -4064,7 +6100,7 @@ def write_run_metadata_files(outdir: Path, plan: dict, spec_dict: dict | None = 
     """Persist plan.json (and optional spec.json) under runs/<domain>_<experiment>/."""
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "plan.json").write_text(
-        json.dumps(plan or {}, indent=2),
+        json.dumps(normalize_plan_for_storage(plan or {}), indent=2),
         encoding="utf-8",
     )
     prompt = user_prompt_for_metadata()
@@ -4102,7 +6138,7 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 
     current_bbox_local = (
         s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
+        or bounding_box_input_value()
         or s(plan_cfg_local.get("bounding_box_coords"))
     )
 
@@ -4237,6 +6273,12 @@ def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
         f.write("$ " + " ".join(cmd) + "\n\n")
 
     rc, out = run_cmd_stream(cmd, SYMFLUENCE_REPO, output_box, log_path=log_path)
+    if step == "model_specific_preprocessing" and rc == 0 and summa_preprocessing_hru_mismatch(out):
+        rc = 1
+        out += (
+            "\nAssistant blocked this step: forcing HRU IDs do not match the catchment shapefile. "
+            "Re-run discretize_domain (after define_domain) or wipe the domain folder and start fresh.\n"
+        )
     footer = f"\n[STEP {step}] return code: {rc}\n"
     append_session_execution_log(out + footer)
     with log_path.open("a", encoding="utf-8") as f:
@@ -4467,12 +6509,11 @@ def render_workflow_input_tab() -> None:
         st.session_state.tend = format_datetime_value(end_date, end_time)
     
     st.caption(f"Experiment time window: `{st.session_state.tstart}` → `{st.session_state.tend}`")
-    wx.render_advanced_config_section()
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown(
         '<div class="card"><div class="card-title">Map & Spatial Inputs</div>'
-        '<div class="card-subtitle">Select a pour point or bounding box; overlay review layers when shapefiles exist.</div>',
+        '<div class="card-subtitle">Select a pour point or bounding box on the map.</div>',
         unsafe_allow_html=True,
     )
     
@@ -4481,113 +6522,59 @@ def render_workflow_input_tab() -> None:
         options=["pour_point", "bounding_box"],
         format_func=lambda x: "Pour point" if x == "pour_point" else "Bounding box",
         horizontal=True,
+        label_visibility="collapsed",
     )
 
-    with st.expander("Review layers", expanded=False):
-        st.caption(
-            "Inspect delineation outputs on this map. Layers are enabled only when the shapefile exists under "
-            f"`{SYMFLUENCE_DATA_DIR}/domain_<name>_<experiment>/`."
+    process_pending_spatial_clears()
+
+    st.session_state["_spatial_widgets_live"] = True
+    pour_col, bbox_col = st.columns(2, gap="medium")
+    with pour_col:
+        st.text_input(
+            "Pour point (lat/lon)",
+            key=pour_point_widget_key(),
+            on_change=on_pour_point_input_change,
         )
-        available = render_map_layer_checkboxes("in")
-        if available == 0 and symfluence_domain_shapefile_paths():
-            st.caption("No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first.")
+        if st.button("Clear pour point", key="clear_selected_pour_point"):
+            _handle_clear_pour_point()
+            st.rerun()
+    with bbox_col:
+        st.text_input(
+            "Bounding box (north/west/south/east)",
+            key=bounding_box_widget_key(),
+            on_change=on_bounding_box_input_change,
+        )
+        if st.button("Clear bounding box", key="clear_selected_bbox"):
+            _handle_clear_bounding_box()
+            st.rerun()
 
     map_obj = build_pour_point_map(
-        show_dem_layer=st.session_state.show_dem_layer,
-        show_landclass_layer=st.session_state.show_landclass_layer,
-        show_soilclass_layer=st.session_state.show_soilclass_layer,
-        show_riverbasins_layer=st.session_state.show_riverbasins_layer,
-        show_hrugru_layer=st.session_state.show_hrugru_layer,
-        show_forcing_layer=st.session_state.show_forcing_layer,
-        show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
+        show_dem_layer=False,
+        show_landclass_layer=False,
+        show_soilclass_layer=False,
+        show_riverbasins_layer=False,
+        show_hrugru_layer=False,
+        show_forcing_layer=False,
+        show_rivernetwork_layer=False,
     )
-    map_data = st_folium(map_obj, width=900, height=430, key="input_selection_map")
+    map_data = render_workflow_map(map_obj, key=workflow_input_map_widget_key(), height=430)
+    handle_workflow_map_selection(map_data)
     
-    if map_data and map_data.get("last_clicked"):
-        clicked = map_data["last_clicked"]
-        lat = clicked["lat"]
-        lon = clicked["lng"]
-    
-        if is_new_map_click(lat, lon):
-            if st.session_state.map_mode == "pour_point":
-                current = format_pour_point(lat, lon)
-                if s(st.session_state.selected_pour_point) != current:
-                    set_pour_point_from_map(lat, lon)
-                    st.rerun()
-            elif st.session_state.map_mode == "bounding_box":
-                p1 = st.session_state.bbox_point_1
-                if p1 is None:
-                    st.session_state.bbox_point_1 = (lat, lon)
-                    st.session_state.bbox_point_2 = None
-                    st.session_state.bbox_selected = False
-                    sync_spatial_fields_to_run_plan(refresh_editor=True)
-                    st.rerun()
-                elif not st.session_state.bbox_selected:
-                    lat1, lon1 = st.session_state.bbox_point_1
-                    set_bounding_box_from_points(lat1, lon1, lat, lon)
-                    st.rerun()
-                else:
-                    st.session_state.bbox_point_1 = (lat, lon)
-                    st.session_state.bbox_point_2 = None
-                    st.session_state.bbox_selected = False
-                    st.session_state.selected_bounding_box = ""
-                    mark_spatial_inputs_stale()
-                    st.rerun()
-
-    clear_a, clear_b = st.columns(2)
-    with clear_a:
-        if st.button("Clear pour point", key="clear_selected_pour_point"):
-            st.session_state.map_lat = None
-            st.session_state.map_lon = None
-            st.session_state.map_point_selected = False
-            st.session_state.selected_pour_point = ""
-            st.session_state.last_map_click = None
-            mark_spatial_inputs_stale()
-            sync_spatial_fields_to_run_plan(refresh_editor=True)
-            st.rerun()
-    with clear_b:
-        if st.button("Clear bounding box", key="clear_selected_bbox"):
-            st.session_state.bbox_point_1 = None
-            st.session_state.bbox_point_2 = None
-            st.session_state.bbox_selected = False
-            st.session_state.selected_bounding_box = ""
-            st.session_state.last_map_click = None
-            mark_spatial_inputs_stale()
-            sync_spatial_fields_to_run_plan(refresh_editor=True)
-            st.rerun()
-
     status_col1, status_col2 = st.columns(2)
     with status_col1:
-        if st.session_state.map_point_selected:
+        if st.session_state.map_point_selected and _pour_point_visible_on_map():
             st.success(f"Selected pour point: {s(st.session_state.selected_pour_point)}")
             st.caption(f"Latitude: {st.session_state.map_lat:.7f} | Longitude: {st.session_state.map_lon:.7f}")
-        elif st.session_state.bbox_point_1 and not st.session_state.bbox_selected:
+        elif st.session_state.bbox_point_1 and not st.session_state.bbox_selected and _bbox_visible_on_map():
             lat1, lon1 = st.session_state.bbox_point_1
             st.info(f"Bounding box corner 1: {lat1:.7f}, {lon1:.7f}")
     with status_col2:
-        if st.session_state.bbox_selected:
+        if st.session_state.bbox_selected and _bbox_visible_on_map():
             st.success(f"Selected bounding box: {s(st.session_state.selected_bounding_box)}")
         elif st.session_state.map_mode == "bounding_box":
             st.caption("Bounding box mode: click first corner, then opposite corner.")
-    
-    if st.session_state.refresh_spatial_inputs:
-        mark_spatial_inputs_stale()
-        st.session_state.refresh_spatial_inputs = False
-    refresh_spatial_input_widgets()
-
-    st.text_input(
-        "Pour point (lat/lon)",
-        key="pour_point_input",
-        on_change=on_pour_point_input_change,
-    )
-    st.text_input(
-        "Bounding box (north/west/south/east)",
-        key="bounding_box_input",
-        on_change=on_bounding_box_input_change,
-    )
 
     sync_input_panel_to_run_plan()
-    render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
         execute_bundle_fn=lambda key: execute_step_bundle(key, shortcut_output),
@@ -4602,16 +6589,8 @@ def sync_preview_artifacts() -> None:
     plan_cfg = effective_plan_config_for_preview()
     spec_dict = build_spec_dict(plan_cfg)
     
-    current_pour = (
-        s(st.session_state.selected_pour_point)
-        or s(plan_cfg.get("pour_point_coords"))
-    )
-    
-    current_bbox = (
-        s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
-        or s(plan_cfg.get("bounding_box_coords"))
-    )
+    current_pour = visible_selected_pour() or s(plan_cfg.get("pour_point_coords"))
+    current_bbox = visible_selected_bbox() or s(plan_cfg.get("bounding_box_coords"))
     
     if current_pour:
         spec_dict["pour_point_coords"] = current_pour
@@ -4641,16 +6620,8 @@ def sync_preview_artifacts() -> None:
     else:
         cfg.pop("HYDROLOGICAL_MODEL", None)
     
-    current_pour = (
-        s(st.session_state.selected_pour_point)
-        or s(plan_cfg.get("pour_point_coords"))
-    )
-    
-    current_bbox = (
-        s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
-        or s(plan_cfg.get("bounding_box_coords"))
-    )
+    current_pour = visible_selected_pour() or s(plan_cfg.get("pour_point_coords"))
+    current_bbox = visible_selected_bbox() or s(plan_cfg.get("bounding_box_coords"))
     
     if current_pour:
         cfg["POUR_POINT_COORDS"] = current_pour
@@ -4681,10 +6652,8 @@ def sync_preview_artifacts() -> None:
     elif "hydrological_model" in plan_to_save["config"]:
         plan_to_save["config"].pop("hydrological_model", None)
     
-    effective_pour = (
-        s(st.session_state.selected_pour_point)
-        or s((st.session_state.run_plan or {}).get("config", {}).get("pour_point_coords"))
-        or ""
+    effective_pour = visible_selected_pour() or s(
+        (st.session_state.run_plan or {}).get("config", {}).get("pour_point_coords")
     )
     if effective_pour:
         plan_to_save["config"]["pour_point_coords"] = effective_pour
@@ -4703,13 +6672,11 @@ def sync_preview_artifacts() -> None:
     mpi_val = resolve_num_processes_from_plan_cfg(plan_to_save.get("config") or {}) or int(
         st.session_state.mpi
     )
-    plan_to_save["config"]["NUM_PROCESSES"] = mpi_val
     plan_to_save["config"]["num_processes"] = mpi_val
+    plan_to_save["config"].pop("NUM_PROCESSES", None)
     
-    effective_bbox = (
-        s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
-        or s((st.session_state.run_plan or {}).get("config", {}).get("bounding_box_coords"))
+    effective_bbox = visible_selected_bbox() or s(
+        (st.session_state.run_plan or {}).get("config", {}).get("bounding_box_coords")
     )
     
     if effective_bbox:
@@ -4717,6 +6684,7 @@ def sync_preview_artifacts() -> None:
     elif "bounding_box_coords" in plan_to_save["config"]:
         plan_to_save["config"].pop("bounding_box_coords", None)
     
+    plan_to_save = normalize_plan_for_storage(plan_to_save)
     with open(preview_plan_json, "w", encoding="utf-8") as f:
         json.dump(plan_to_save, f, indent=2)
 
@@ -4724,33 +6692,57 @@ def sync_preview_artifacts() -> None:
         mirror_preview_plan_to_run_folder(plan_to_save, spec_dict)
 
 
+def workflow_output_config_preview() -> tuple[str, str]:
+    """YAML text and caption path for the Output tab (prefers the loaded run's config.yaml)."""
+    run_folder = s(st.session_state.run_folder)
+    if run_folder:
+        run_cfg = RUNS_DIR / run_folder / "config.yaml"
+        if run_cfg.exists():
+            text = run_cfg.read_text(encoding="utf-8")
+            if text.strip():
+                return text, str(run_cfg)
+
+    cached = s(st.session_state.get("_loaded_config_yaml"))
+    if cached.strip():
+        run_cfg = RUNS_DIR / run_folder / "config.yaml" if run_folder else None
+        return cached, str(run_cfg) if run_cfg else "(loaded run)"
+
+    if isinstance(cfg, dict) and cfg:
+        return yaml.safe_dump(cfg, sort_keys=False), str(preview_yaml)
+
+    preview_path = PREVIEW_DIR / "config_preview.yaml"
+    if preview_path.exists():
+        text = preview_path.read_text(encoding="utf-8")
+        if text.strip():
+            return text, str(preview_path)
+
+    return "", "(preview not generated yet)"
+
+
 def render_workflow_output_tab() -> None:
-    global output_box, progress_box, validate_btn, dryrun_btn, setup_btn, run_btn
+    global validate_btn, dryrun_btn, setup_btn, run_btn
 
     st.subheader("Generated config.yaml")
+    preview_text, caption_path = workflow_output_config_preview()
+    if not preview_text.strip():
+        st.info("No config preview yet. Load a run from **Experiments** or set domain and experiment on **Input**.")
     st.text_area(
         "Generated config preview",
-        value=yaml.safe_dump(cfg, sort_keys=False),
+        value=preview_text,
         height=320,
         disabled=True,
         label_visibility="collapsed",
         key=config_preview_widget_key(),
     )
-    st.caption(f"Preview only: {preview_yaml}")
+    st.caption(f"Preview only: {caption_path}")
 
-    wx.render_run_results_section(
-        cfg=cfg,
-        runs_dir=RUNS_DIR,
-        symfluence_data_dir=SYMFLUENCE_DATA_DIR,
-        layer_paths_fn=symfluence_domain_shapefile_paths,
-        default_postprocess_domain_dir_fn=default_postprocess_domain_dir,
-        run_py_tool_fn=run_py_tool,
-    )
-    
-    with st.expander("Output map layers", expanded=False):
-        st.caption("Same review layers as the Input tab. Toggles stay in sync between tabs.")
-        render_map_layer_checkboxes("out")
-
+    with st.expander("Review layers", expanded=False):
+        st.caption(
+            "Choose one fill layer below, and optionally overlay **River network**. "
+        )
+        available = render_map_layer_checkboxes("out")
+        if available == 0 and symfluence_domain_shapefile_paths():
+            st.caption("No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first.")
         output_map = build_pour_point_map(
             show_dem_layer=st.session_state.show_dem_layer,
             show_landclass_layer=st.session_state.show_landclass_layer,
@@ -4760,7 +6752,7 @@ def render_workflow_output_tab() -> None:
             show_forcing_layer=st.session_state.show_forcing_layer,
             show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
         )
-        st_folium(output_map, width=900, height=360, key="output_layers_map")
+        render_workflow_map(output_map, key="output_layers_map", height=360)
 
     with st.expander("Advanced", expanded=False):
         st.markdown("**Manual SYMFLUENCE steps**")
@@ -4785,24 +6777,15 @@ def render_workflow_output_tab() -> None:
         if not st.session_state.allow_run:
             st.caption("Enable **Allow dangerous run steps** in the assistant panel to use Run Model Only.")
 
-        st.caption("Routed discharge extract/summarize and hydrograph metrics are in **Run results** above.")
+        st.caption("Routed discharge extract/summarize and hydrograph metrics are on the **Results** page.")
 
-    st.subheader("Workflow progress")
-    progress_box = st.empty()
-    if st.session_state.get("run_plan"):
-        progress_box.markdown(render_workflow_progress(st.session_state.run_plan, st.session_state.get("execution_log_text", "")))
-    
-    st.subheader("Command output")
-    output_box = st.empty()
-    if st.session_state.get("execution_log_text"):
-        output_box.code(st.session_state.execution_log_text)
+    render_workflow_output_execution_section()
 
 
 # -----------------------------------------------------------------------------
 # Workflows layout: main Input/Output tabs + right Prompt/Chat panel
 # -----------------------------------------------------------------------------
 # Integer height enables Streamlit scroll regions; CSS sizes them to the viewport.
-WORKFLOW_PANEL_HEIGHT = 720
 
 # Sidebar pages (non-Workflows) — after helper definitions so callbacks exist.
 if current_page != "Workflows":
@@ -4856,8 +6839,25 @@ if current_page != "Workflows":
     st.stop()
 
 st.markdown('<div class="sym-workflow-panels" aria-hidden="true"></div>', unsafe_allow_html=True)
+st.session_state["_spatial_widgets_live"] = False
 process_pending_chat_refinement()
-main_col, assistant_col = st.columns([0.72, 0.28], gap="large")
+process_pre_widget_plan_sync()
+apply_pending_nl_request_transcript()
+_active_run_dir = RUNS_DIR / s(st.session_state.run_folder) if s(st.session_state.run_folder) else None
+if _active_run_dir and _active_run_dir.is_dir():
+    sync_workflow_execution_state(_active_run_dir, st.session_state)
+assistant_panel_open = bool(st.session_state.get("assistant_panel_open", True))
+if assistant_panel_open:
+    main_col, toggle_col, assistant_col = st.columns([0.72, 0.02, 0.28], gap="large")
+else:
+    main_col, toggle_col, assistant_col = st.columns([0.98, 0.02, 0.001], gap="small")
+
+with toggle_col:
+    toggle_label = "\u276F" if assistant_panel_open else "\u276E"
+    toggle_help = "Hide assistant panel" if assistant_panel_open else "Show assistant panel"
+    if st.button(toggle_label, key=ASSISTANT_PANEL_TOGGLE_KEY, help=toggle_help):
+        st.session_state.assistant_panel_open = not assistant_panel_open
+        st.rerun()
 
 with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     st.markdown('<span class="sym-main-panel" aria-hidden="true"></span>', unsafe_allow_html=True)
@@ -4877,319 +6877,8 @@ with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
         render_workflow_output_tab()
 
 with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
-    st.markdown(
-        '<span class="sym-assistant-panel" aria-hidden="true"></span><div class="right-panel">',
-        unsafe_allow_html=True,
-    )
-    render_workflow_panel_dom_hooks()
-    apply_pending_assistant_panel_tab_focus()
-    capture_plan_editor_draft()
-    st.radio(
-        "Assistant panel",
-        options=[ASSISTANT_TAB_PROMPT, ASSISTANT_TAB_CHAT],
-        key=ASSISTANT_PANEL_TABS_KEY,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    on_prompt_tab = st.session_state.get(ASSISTANT_PANEL_TABS_KEY, ASSISTANT_TAB_PROMPT) != ASSISTANT_TAB_CHAT
-    plan_text_holder = ""
-
-    if not on_prompt_tab:
-        if st.session_state.get("run_plan") is not None:
-            plan_text_holder = render_persistent_plan_editor(visible=False)
-        render_workflow_chat_tab()
-    else:
-        st.markdown("#### LLM Assistant")
-
-        if not FORCINGS_AVAILABLE:
-            st.warning("Local install: acquire_forcings is disabled. Use HPC/MAF or provide external forcings.")
-
-        persistent_cfg = load_persistent_config()
-        for _provider in ("openai", "gemini", "claude"):
-            _cfg_key = persistent_cfg.get(f"{_provider}_api_key")
-            if _cfg_key and not st.session_state.api_keys.get(_provider):
-                st.session_state.api_keys[_provider] = _cfg_key
-
-        provider_labels = list(LLM_PROVIDER_BY_LABEL.keys())
-        current_provider = s(st.session_state.get("llm_provider")) or "openai"
-        if current_provider not in LLM_PROVIDER_LABELS:
-            current_provider = "openai"
-            st.session_state.llm_provider = current_provider
-        current_provider_label = LLM_PROVIDER_LABELS[current_provider]
-        selected_provider_label = st.selectbox(
-            "Provider",
-            provider_labels,
-            index=provider_labels.index(current_provider_label),
-            key="provider_select",
-        )
-        st.session_state.llm_provider = LLM_PROVIDER_BY_LABEL[selected_provider_label]
-        active_provider = st.session_state.llm_provider
-        active_provider_label = LLM_PROVIDER_LABELS[active_provider]
-
-        if st.session_state.api_keys.get(active_provider):
-            st.success(f"{active_provider_label} API key loaded ✔")
-        else:
-            st.warning(f"No {active_provider_label} API key loaded")
-
-        api_key_help = {
-            "openai": "OpenAI API key.",
-            "gemini": "Google AI Studio / Gemini API key.",
-            "claude": "Anthropic API key from console.anthropic.com.",
-        }.get(active_provider, "LLM API key.")
-        api_key = st.text_input(
-            "Your API key",
-            type="password",
-            help=f"Stored only if you click Save key. {api_key_help}",
-        )
-
-        if st.button("Save key", key="save_openai_key", width="stretch", type="secondary"):
-            if api_key.strip():
-                st.session_state.api_keys[active_provider] = api_key.strip()
-                cfg_local = load_local_settings()
-                cfg_local[f"{active_provider}_api_key"] = api_key.strip()
-                save_local_settings(cfg_local)
-                st.success("API key saved on this machine.")
-            else:
-                st.error("API key is empty.")
-
-        if not llm_provider_available(active_provider):
-            st.error(
-                f"{active_provider_label} provider not available. "
-                "Install the required SDK package in the same Python that runs Streamlit."
-            )
-            import_error = llm_provider_import_error(active_provider)
-            if import_error:
-                st.code(import_error)
-            st.markdown(llm_provider_install_hint(active_provider))
-        else:
-            available_models = llm_models_for_provider(active_provider)
-            current_model = (
-                s(st.session_state.get("llm_model"))
-                or s(st.session_state.get("gpt_model"))
-                or DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
-            )
-            if current_model not in available_models:
-                current_model = DEFAULT_LLM_MODEL.get(active_provider, available_models[0])
-            st.session_state.llm_model = st.selectbox(
-                "Model",
-                available_models,
-                index=available_models.index(current_model),
-                format_func=lambda model_id: llm_model_label(model_id, active_provider),
-            )
-            st.session_state.gpt_model = st.session_state.llm_model
-
-            apply_pending_nl_request_transcript()
-            if st.session_state.pop("_nl_transcribe_ok", False):
-                st.success("Transcription added. Review the prompt, then click Generate plan.")
-            def _render_prompt_body() -> None:
-                st.text_area(
-                    "Describe what you want",
-                    height=210,
-                    key="nl_request",
-                    placeholder="Example: Create a safe point-domain SUMMA workflow for Paradise SNOTEL...",
-                    label_visibility="collapsed",
-                )
-
-            render_editable_block_with_copy(
-                "Describe what you want",
-                anchor_id="sym_copy_anchor_nl_request",
-                copy_key="copy_nl_prompt",
-                fallback_text=s(st.session_state.get("nl_request", "")),
-                render_body=_render_prompt_body,
-            )
-
-            voice_provider, _voice_key = resolve_voice_transcription_provider()
-            if voice_provider:
-                voice_label = VOICE_PROVIDER_LABELS.get(voice_provider, "Voice")
-                st.markdown(f"**Voice input** ({voice_label} → prompt box)")
-                if voice_provider != active_provider:
-                    st.caption(
-                        f"Speech-to-text uses **{LLM_PROVIDER_LABELS[voice_provider]}** "
-                        f"(planner is **{active_provider_label}**)."
-                    )
-                if hasattr(st, "audio_input"):
-                    voice_audio = st.audio_input(
-                        "Record your request",
-                        key="voice_nl_request",
-                        help="Record audio, then click Transcribe to prompt.",
-                    )
-                else:
-                    voice_audio = st.file_uploader(
-                        "Upload audio (wav, mp3, m4a, webm)",
-                        type=["wav", "mp3", "m4a", "webm", "mpeg", "mpga"],
-                        key="voice_nl_upload",
-                    )
-
-                if st.button(
-                    "Transcribe to prompt",
-                    key="transcribe_voice_to_prompt",
-                    width="stretch",
-                    type="secondary",
-                ):
-                    if voice_audio is None:
-                        st.warning("Record or upload audio first.")
-                    else:
-                        audio_bytes = voice_audio.getvalue()
-                        filename = getattr(voice_audio, "name", None) or "recording.webm"
-                        transcript = transcribe_voice_to_nl_request(audio_bytes, filename)
-                        if transcript:
-                            if st.session_state.get("run_plan"):
-                                st.session_state["_pending_workflow_chat_draft"] = transcript
-                                st.session_state["_chat_transcribe_ok"] = True
-                                request_assistant_chat_tab()
-                            else:
-                                st.session_state["_pending_nl_transcript"] = transcript
-                                st.session_state["_nl_transcribe_ok"] = True
-                            st.rerun()
-            else:
-                st.caption(
-                    "Save an **OpenAI** API key to transcribe voice (Whisper). "
-                    "Claude has no speech-to-text API."
-                )
-
-            st.markdown(
-                '<div class="assistant-plan-divider">------------------</div>',
-                unsafe_allow_html=True,
-            )
-            if st.button(
-                "Generate plan",
-                key="generate_plan_gpt",
-                width="stretch",
-                type="secondary",
-            ):
-                run_generate_plan_from_nl_request()
-
-        if st.session_state.get("run_plan") is not None:
-            plan_text_holder = render_persistent_plan_editor(visible=True)
-            update_run_plan_needs_user_input()
-
-            if st.button(
-                "Resolve dependencies",
-                key="resolve_dependencies",
-                width="stretch",
-                type="secondary",
-            ):
-                ok, err = commit_plan_editor_to_session(
-                    plan_text=plan_text_holder or current_plan_editor_text()
-                )
-                if not ok:
-                    st.error(err)
-                    st.stop()
-                resolved_plan = resolve_requested_plan_dependencies(st.session_state.run_plan)
-                st.session_state.run_plan = resolved_plan
-                steps = resolved_plan.get("steps")
-                if isinstance(steps, list):
-                    st.session_state["_committed_plan_steps"] = list(steps)
-                refresh_plan_editor_from_state(force=True, remount=True)
-                st.success("Dependencies resolved from operation catalog.")
-                st.rerun()
-
-            st.session_state.want_create_pour_point = st.checkbox(
-                "Also run create_pour_point",
-                value=st.session_state.want_create_pour_point,
-            )
-            st.session_state.allow_run = st.checkbox(
-                "Allow dangerous run steps",
-                value=st.session_state.get("allow_run", False),
-            )
-            st.text_input(
-                "Type RUN to allow dangerous execution",
-                key="danger_phrase",
-                help="Required for run_model or calibrate_model.",
-            )
-            confirm_danger_run = s(st.session_state.get("danger_phrase", "")) == "RUN"
-
-            needs = st.session_state.run_plan.get("needs_user_input", []) or []
-            if needs:
-                st.warning(
-                    f"{len(needs)} required field(s) missing before execution. "
-                    "Use the section below or the Input tab."
-                )
-                render_fix_missing_inputs_section(needs)
-
-            assistant_shortcut_out = st.empty()
-            wx.render_run_shortcuts_section(
-                execute_bundle_fn=lambda key: execute_step_bundle(key, assistant_shortcut_out),
-                location="assistant",
-            )
-
-            assistant_cal_out = st.empty()
-
-            def _assistant_run_calibrate() -> None:
-                if not st.session_state.allow_run:
-                    st.error("Enable **Allow dangerous run steps** first.")
-                    return
-                with st.spinner("Running calibration…"):
-                    rc, _ = execute_single_symfluence_step("calibrate_model", assistant_cal_out)
-                if rc == 0:
-                    st.success("Calibration step finished.")
-                else:
-                    st.error(f"Calibration failed (return code {rc}).")
-
-            wx.render_calibration_section(
-                execute_calibrate_fn=_assistant_run_calibrate,
-                location="assistant",
-            )
-            steps_set = set(st.session_state.run_plan.get("steps", []) or [])
-            needs_confirm = bool(steps_set & DANGER_STEPS)
-            can_execute = len(needs) == 0
-            confirm_ok = True
-
-            if needs_confirm:
-                confirm_ok = st.checkbox("Confirm: this may take a long time / download data", value=False)
-
-            exec_col, clear_col = st.columns(2)
-            with exec_col:
-                exec_btn = st.button(
-                    "Execute plan",
-                    disabled=(not can_execute) or (not confirm_ok),
-                    key="execute_plan_button",
-                    width="stretch",
-                    type="secondary",
-                )
-            with clear_col:
-                clear_plan = st.button(
-                    "Clear plan",
-                    key="clear_plan_button",
-                    width="stretch",
-                    type="secondary",
-                )
-
-            if clear_plan:
-                clear_chat_messages(clear_plan=True)
-                st.success("Plan cleared.")
-                st.rerun()
-
-            if exec_btn:
-                ok, err = commit_plan_editor_to_session(
-                    plan_text=plan_text_holder or current_plan_editor_text()
-                )
-                if not ok:
-                    st.error(err)
-                    st.stop()
-                update_run_plan_needs_user_input()
-                try:
-                    plan_cfg = (st.session_state.run_plan or {}).get("config", {}) or {}
-                    validation_cfg = {
-                        "SYMFLUENCE_CODE_DIR": normalize_path_text(SYMFLUENCE_REPO),
-                        "SYMFLUENCE_DATA_DIR": normalize_path_text(SYMFLUENCE_DATA_DIR) + "/",
-                        "DOMAIN_NAME": s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
-                        "EXPERIMENT_ID": s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
-                        "POUR_POINT_COORDS": s(plan_cfg.get("pour_point_coords")) or s(st.session_state.selected_pour_point),
-                        "BOUNDING_BOX_COORDS": s(plan_cfg.get("bounding_box_coords")) or s(st.session_state.selected_bounding_box),
-                        "HYDROLOGICAL_MODEL": current_hydrological_model(plan_cfg),
-                        "DOMAIN_DEFINITION_METHOD": s(plan_cfg.get("domain_def")) or s(st.session_state.domain_def),
-                        "EXPERIMENT_TIME_START": s(plan_cfg.get("experiment_time_start")) or s(st.session_state.tstart),
-                        "EXPERIMENT_TIME_END": s(plan_cfg.get("experiment_time_end")) or s(st.session_state.tend),
-                    }
-                    validate_spec(validation_cfg)
-                    st.session_state.execute_plan = True
-                    st.success("Execution started. See the Output tab.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Validation failed before execution: {e}")
-
-    st.markdown('</div>', unsafe_allow_html=True)
+    if assistant_panel_open:
+        render_workflow_assistant_panel()
 
 
 def show_text(text: str):
@@ -5213,20 +6902,12 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     )
     if isinstance(committed_steps, list) and committed_steps:
         plan["steps"] = list(committed_steps)
-    st.session_state.run_plan = plan
+    store_run_plan(plan)
     plan_cfg = (plan or {}).get("config", {}) or {}
     spec_dict = build_spec_dict(plan_cfg)
 
-    current_pour = (
-        s(st.session_state.selected_pour_point)
-        or s(plan_cfg.get("pour_point_coords"))
-    )
-
-    current_bbox = (
-        s(st.session_state.selected_bounding_box)
-        or s(st.session_state.bounding_box_input)
-        or s(plan_cfg.get("bounding_box_coords"))
-    )
+    current_pour = visible_selected_pour() or s(plan_cfg.get("pour_point_coords"))
+    current_bbox = visible_selected_bbox() or s(plan_cfg.get("bounding_box_coords"))
 
     if current_pour:
         spec_dict["pour_point_coords"] = current_pour
@@ -5303,167 +6984,95 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         data_dir=SYMFLUENCE_DATA_DIR,
         symfluence_domain=symfluence_domain,
     )
-    st.session_state.run_plan = plan
+    store_run_plan(plan)
 
     steps = plan.get("steps", []) or []
 
+    pour_coords = (
+        s(lookup_plan_config(plan_cfg, "pour_point_coords", "POUR_POINT_COORDS"))
+        or s(st.session_state.selected_pour_point)
+        or pour_point_input_value()
+    )
+    bbox_coords = (
+        s(lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"))
+        or s(st.session_state.selected_bounding_box)
+        or bounding_box_input_value()
+    )
+    bbox_ok, bbox_msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
+    if pour_coords and bbox_coords and not bbox_ok:
+        st.error(bbox_msg)
+        st.session_state.workflow_executing = False
+        st.stop()
+
+    danger_confirmed = s(st.session_state.get("danger_phrase", "")) == "RUN"
     danger_found = [step for step in steps if step in DANGER_STEPS]
     has_danger = len(danger_found) > 0
     if has_danger:
         st.warning(f"Dangerous steps detected: {', '.join(danger_found)}")
         if not st.session_state.allow_run:
             st.error("Check the allow-run box before executing dangerous steps.")
+            st.session_state.workflow_executing = False
             st.stop()
-        if not confirm_danger_run:
+        if not danger_confirmed:
             st.error("Type RUN exactly to allow dangerous execution.")
+            st.session_state.workflow_executing = False
             st.stop()
 
-    log: list[str] = []
-    st.session_state.execution_log_text = ""
     logs_dir = outdir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / "execution.log"
-    log_path.write_text("", encoding="utf-8")
-    st.info(f"Execution log path: {log_path}")
+    log_path = execution_log_path(outdir)
 
-    preamble = execution_log_preamble(plan)
-    log.append(preamble)
-    log.append(f"\nUsing config: {out_yaml}\n")
-    show_text("".join(log))
-    st.session_state.execution_log_text = "".join(log)
-    progress_box.markdown(render_workflow_progress(plan, "".join(log)))
-
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(preamble)
-        f.write(f"\nUsing config: {out_yaml}\n")
-
-    for step in steps:
-        if step == "validate_config":
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write("\n===== STEP: validate_config =====\n")
-            try:
-                validate_spec(cfg)
-                log.append("\nInternal validation OK ✅\n")
-                show_text("".join(log))
-                st.session_state.execution_log_text = "".join(log)
-                progress_box.markdown(render_workflow_progress(plan, "".join(log)))
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write("Internal validation OK ✅\n")
-            except Exception as e:
-                log.append(f"\nInternal validation FAILED ❌: {e}\n")
-                log.append("\nStopping due to failure.\n")
-                show_text("".join(log))
-                st.session_state.execution_log_text = "".join(log)
-                progress_box.markdown(render_workflow_progress(plan, "".join(log)))
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(f"Internal validation FAILED ❌: {e}\n")
-                    f.write("Stopping due to failure.\n")
-                break
-            continue
-
-        if step not in SUPPORTED_STEPS:
-            log.append(f"\nSKIP unknown step: {step}\n")
-            show_text("".join(log))
-            continue
-
-        basin_domain = symfluence_domain_name(
-            s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
-            s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
+    completed = set()
+    if log_path.exists() and log_path.stat().st_size > 0:
+        completed = completed_steps_from_log(log_path.read_text(encoding="utf-8"))
+    remaining_steps = [step for step in steps if step not in completed]
+    resume = bool(
+        st.session_state.get("run_workspace_locked")
+        and completed
+        and remaining_steps
+    )
+    if resume:
+        st.warning(
+            "Resuming from the last completed step in execution.log "
+            "(skipped steps are not re-run)."
         )
-        symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
-        experiment_id = s(plan_cfg.get("experiment_id")) or "run_1"
 
-        if step == "model_specific_preprocessing" and symfluence_domain and (
-            domain_has_complete_local_workflow(
-                SYMFLUENCE_DATA_DIR, symfluence_domain, experiment_id
-            )
-            or domain_has_complete_local_workflow(
-                SYMFLUENCE_DATA_DIR, basin_domain, experiment_id
-            )
-            or local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, symfluence_domain)
-            or local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, basin_domain)
-        ):
-            restore_domain = symfluence_domain
-            if local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, restore_domain):
-                if local_catchment_needs_restore(SYMFLUENCE_DATA_DIR, basin_domain):
-                    restore_domain = basin_domain
-                log.append(
-                    "\nRestoring local catchment shapefiles from semidistributed/into "
-                    "(legacy catchment path had wrong HRU IDs).\n"
-                )
-                restore_local_domain_artifacts(
-                    SYMFLUENCE_DATA_DIR,
-                    restore_domain,
-                    experiment_id,
-                )
+    prepare_execution_log(outdir, plan, out_yaml, resume=resume)
+    st.session_state.execution_log_text = log_path.read_text(encoding="utf-8")
 
-        cmd = build_symfluence_step_cmd(step, out_yaml)
-        log.append(f"\n===== STEP: {step} =====\n$ {' '.join(cmd)}\n\n")
-        show_text("".join(log))
-        st.session_state.execution_log_text = "".join(log)
-        progress_box.markdown(render_workflow_progress(plan, "".join(log)))
+    try:
+        launch_background_workflow(
+            outdir,
+            {
+                "symfluence_repo": str(SYMFLUENCE_REPO),
+                "symfluence_data_dir": str(SYMFLUENCE_DATA_DIR),
+                "symfluence_python": str(SYMFLUENCE_PYTHON),
+                "user_request": user_request,
+                "resume": resume,
+            },
+        )
+        st.session_state.workflow_executing = True
+        st.session_state["_workflow_just_started"] = True
+        st.session_state["_workflow_poll_active"] = True
+        st.rerun()
+    except RuntimeError as e:
+        st.error(str(e))
+        st.session_state.workflow_executing = False
+    except Exception as e:
+        st.error(f"Failed to start workflow: {e}")
+        st.session_state.workflow_executing = False
 
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(f"\n===== STEP: {step} =====\n")
-            f.write("$ " + " ".join(cmd) + "\n\n")
+if current_page == "Workflows":
+    _poll_run_dir = active_workflow_run_dir()
+    if _poll_run_dir and workflow_is_running(_poll_run_dir):
+        st.session_state["_workflow_poll_active"] = True
+        import time
 
-        rc, out = run_cmd_stream(cmd, SYMFLUENCE_REPO, output_box, log_path=log_path)
-        log.append(out)
-        log.append(f"\n[STEP {step}] return code: {rc}\n")
-
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(f"\n[STEP {step}] return code: {rc}\n")
-
-        if rc != 0:
-            log.append("\nStopping due to failure.\n")
-            show_text("".join(log))
-            st.session_state.execution_log_text = "".join(log)
-            progress_box.markdown(render_workflow_progress(plan, "".join(log)))
-            break
-
-        if step == "setup_project" and not user_requires_fresh_cloud_workflow(
-            user_request, plan_cfg
-        ):
-            copied: list[str] = []
-            source_domain = infer_reuse_source_domain(
-                user_request,
-                basin_domain,
-                SYMFLUENCE_DATA_DIR,
-            )
-            if source_domain and user_request_reuses_local_domain_data(user_request):
-                copied = copy_reusable_domain_artifacts(
-                    SYMFLUENCE_DATA_DIR,
-                    source_domain,
-                    symfluence_domain,
-                )
-            elif symfluence_domain != basin_domain:
-                copied = seed_mac_duplicate_domain_from_basin(
-                    SYMFLUENCE_DATA_DIR,
-                    basin_domain,
-                    symfluence_domain,
-                )
-            if copied:
-                seed_msg = (
-                    "\nSeeded reusable local artifacts into "
-                    f"`domain_{symfluence_domain}` from existing on-disk data:\n"
-                    + "\n".join(f"  - {item}" for item in copied)
-                    + "\n"
-                )
-                log.append(seed_msg)
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(seed_msg)
-                plan = ensure_skip_process_observed_when_local_streamflow(
-                    plan,
-                    user_request,
-                    data_dir=SYMFLUENCE_DATA_DIR,
-                    symfluence_domain=symfluence_domain,
-                )
-                st.session_state.run_plan = plan
-                steps = plan.get("steps", []) or []
-
-        show_text("".join(log))
-        st.session_state.execution_log_text = "".join(log)
-        progress_box.markdown(render_workflow_progress(plan, "".join(log)))
+        time.sleep(5)
+        st.rerun()
+    elif st.session_state.pop("_workflow_poll_active", False) and _poll_run_dir:
+        sync_workflow_execution_state(_poll_run_dir, st.session_state)
+        st.rerun()
 
 if validate_btn:
     rc, msg = execute_validate_config_step(output_box)

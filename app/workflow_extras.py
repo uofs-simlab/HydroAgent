@@ -94,6 +94,13 @@ def workflow_context(
     }
 
 
+def _first_existing_artifact(candidates: list[Path]) -> Path | None:
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> list[dict]:
     rows: list[dict] = []
     domain_root = ctx.get("domain_root")
@@ -129,35 +136,75 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
         add("ERA5 intersection", layer_paths.get("forcing"), "geospatial")
 
     if domain_root and domain_root.exists():
-        add("fileManager.txt", domain_root / "fileManager.txt", "domain")
-        add("forcingFileList.txt", domain_root / "forcing" / "forcingFileList.txt", "forcing")
-        add("forcing / raw_data", domain_root / "forcing" / "raw_data", "forcing")
+        file_manager = _first_existing_artifact(
+            [
+                domain_root / "settings" / "SUMMA" / "fileManager.txt",
+                domain_root / "fileManager.txt",
+            ]
+        )
+        add(
+            "fileManager.txt",
+            file_manager or (domain_root / "settings" / "SUMMA" / "fileManager.txt"),
+            "domain",
+        )
+        forcing_list = _first_existing_artifact(
+            [
+                domain_root / "settings" / "SUMMA" / "forcingFileList.txt",
+                domain_root / "forcing" / "forcingFileList.txt",
+            ]
+        )
+        add(
+            "forcingFileList.txt",
+            forcing_list or (domain_root / "settings" / "SUMMA" / "forcingFileList.txt"),
+            "forcing",
+        )
+        forcing_raw = _first_existing_artifact(
+            [
+                domain_root / "data" / "forcing" / "raw_data",
+                domain_root / "forcing" / "raw_data",
+            ]
+        )
+        add(
+            "forcing / raw_data",
+            forcing_raw or (domain_root / "data" / "forcing" / "raw_data"),
+            "forcing",
+        )
 
     add("Simulations folder", sim_dir, "simulation")
     add("SUMMA output folder", sim_dir / "SUMMA" if sim_dir else None, "simulation")
     add("mizuRoute folder", mizu_dir, "simulation")
     add("mizuRoute NetCDF (exp_*.nc)", mizu_dir, "simulation")
     if mizu_dir and mizu_dir.exists():
-        nc_count = len(list(mizu_dir.glob("exp_*.h.*.nc")))
+        exp_id = s(ctx.get("experiment_id"))
+        history_globs = ["*.h.*.nc", "exp_*.h.*.nc"]
+        if exp_id:
+            history_globs.insert(0, f"{exp_id}*.h.*.nc")
+        history_files: list[Path] = []
+        for pattern in history_globs:
+            history_files = sorted(mizu_dir.glob(pattern))
+            if history_files:
+                break
+        nc_count = len(history_files)
         rows.append(
             {
                 "category": "simulation",
                 "artifact": "mizuRoute history files",
                 "status": "found" if nc_count else "missing",
-                "path": f"{mizu_dir} ({nc_count} files)",
+                "path": (
+                    f"{history_files[0]} (+{nc_count - 1} more)"
+                    if nc_count > 1
+                    else (str(history_files[0]) if nc_count else str(mizu_dir))
+                ),
             }
         )
     add("routed_flow.csv", mizu_dir / "routed_flow.csv" if mizu_dir else None, "simulation")
 
-    if data_dir:
-        obs_candidates = [
-            data_dir / "observations" / "streamflow" / "preprocessed" / f"{combined}_streamflow_processed.csv",
-            data_dir / "observations" / "streamflow" / "preprocessed" / f"{ctx.get('domain_name')}_streamflow_processed.csv",
-        ]
-        for i, obs_path in enumerate(obs_candidates):
-            if obs_path.exists() or i == 0:
-                add("Observed streamflow (processed)", obs_path, "evaluation")
-                break
+    if data_dir and domain_root:
+        from server.core.plan_rules import domain_streamflow_processed_path
+
+        domain_name = s(ctx.get("domain_name"))
+        obs_path = domain_streamflow_processed_path(data_dir, domain_name)
+        add("Observed streamflow (processed)", obs_path, "evaluation")
 
     add("Assistant run folder", assistant_run, "assistant")
     add("Assistant config.yaml", assistant_run / "config.yaml" if assistant_run else None, "assistant")
@@ -175,16 +222,13 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
 
 
 def resolve_observed_streamflow_path(ctx: dict, data_dir: Path) -> Path | None:
-    combined = ctx.get("combined_name") or ""
-    domain_name = ctx.get("domain_name") or ""
-    candidates = [
-        data_dir / "observations" / "streamflow" / "preprocessed" / f"{combined}_streamflow_processed.csv",
-        data_dir / "observations" / "streamflow" / "preprocessed" / f"{domain_name}_streamflow_processed.csv",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    return None
+    domain_name = s(ctx.get("domain_name"))
+    if not domain_name:
+        return None
+    from server.core.plan_rules import domain_streamflow_processed_path
+
+    path = domain_streamflow_processed_path(data_dir, domain_name)
+    return path if path.is_file() else None
 
 
 def resolve_simulated_flow_path(ctx: dict) -> Path | None:
@@ -962,6 +1006,16 @@ def render_experiments_page(
 ) -> None:
     st.subheader("Experiments")
     st.caption("Past assistant runs under the local `runs/` folder.")
+    flash = st.session_state.pop("_experiments_load_flash", None)
+    if flash:
+        kind, payload = flash
+        if kind == "error":
+            st.error(payload)
+        else:
+            st.success(
+                f"Loaded `{payload}` into workflow. "
+                "Open **Workflows** and select **Output** to view the config preview."
+            )
     rows = []
     for name in list_assistant_run_dirs(runs_dir, run_folder_skip):
         run_dir = runs_dir / name
@@ -1016,12 +1070,10 @@ def render_experiments_page(
         if load_run_fn:
             err = load_run_fn(pick)
             if err:
-                st.error(err)
+                st.session_state["_experiments_load_flash"] = ("error", err)
             else:
-                st.success(f"Loaded `{pick}`. Open **Workflows** to continue.")
-        else:
-            st.session_state["_pending_load_run"] = pick
-            st.success(f"Run `{pick}` queued. Open **Workflows** to apply.")
+                st.session_state["_experiments_load_flash"] = ("success", pick)
+            st.rerun()
 
     if execute_calibrate_fn:
         cal_out = st.empty()

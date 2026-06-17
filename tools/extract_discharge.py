@@ -5,7 +5,7 @@ import pandas as pd
 
 def main():
     # assumes you run from a domain's mizuRoute output folder
-    files = sorted(glob.glob("exp_*.h.*.nc"))
+    files = sorted(glob.glob("*.h.*.nc") or glob.glob("exp_*.h.*.nc"))
     if not files:
         raise SystemExit("No mizuRoute history files found (exp_*.h.*.nc).")
 

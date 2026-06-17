@@ -193,17 +193,19 @@ Rules:
     - CATCHMENT_SHP_NAME: {domain_name}_HRUs_elevation.shp when reusing a copied semi-distributed domain
     Omit define_domain if the user is reusing 02b artifacts; include discretize_domain only.
 
+46f. When the user requests a lumped basin workflow (discretization lumped, domain_def lumped, domain name containing _lumped, or "Do not use mizuRoute" for a lumped case), output discretization as "GRUs" (SYMFLUENCE SUB_GRID_DISCRETIZATION value). "lumped" describes routing/parameter regionalization, not DOMAIN_DISCRETIZATION. Put ROUTING_DELINEATION: lumped and PARAMETER_REGIONALIZATION: lumped in extra_config. Omit routing_model when the user says not to use mizuRoute.
+
 46d. When the user says data is already copied into SYMFLUENCE_data/domain_<name>/, do not download attributes/forcings/observations, and existing catchment/forcing artifacts are present, OMIT define_domain and discretize_domain even if listed in the prompt step order. Re-delineation overwrites catchment shapefiles and breaks HRU ID alignment with existing SUMMA forcing files. Use the existing shapefiles under shapefiles/catchment/ and data/forcing/SUMMA_input/. This rule does NOT apply when the user says from scratch, data_access CLOUD, do not reuse local artifacts, or lists workflow_steps that must include define_domain and discretize_domain.
 
 46e. When the user requests a from-scratch cloud workflow (data_access CLOUD, acquire_attributes, acquire_forcings, define_domain, discretize_domain, process_observed_data), include ALL of those steps in order. Never omit define_domain or discretize_domain for fresh cloud acquisition runs. Honor an explicit workflow_steps list from the user exactly, including duplicate postprocess_results when listed twice.
 
-47. domain_name must be extracted from the user request when explicitly mentioned, for example:
-    - Bow River
-    - Saskatchewan River
-    - Logan River
-    - paradise
+47. domain_name must be set only when the user explicitly provides it, for example:
+    - domain_name Bow_at_Banff_semi_distributed
+    - domain name Bow_at_Banff_lumped
+    - reuse domain_Bow_at_Banff_semi_distributed
+    Do NOT infer domain_name from river names, dates, or phrases like "run summa for Bow river".
 
-48. If the domain is not clearly specified, leave domain_name null and request it from the user.
+48. If the domain is not clearly specified with domain_name (or an existing domain_<name> folder), leave domain_name null and add domain_name to needs_user_input. Never guess short names like Bow, River, or 2025.
 
 49. If the user asks for a SNOTEL or observed SWE workflow and provides a station number, include:
     - DOWNLOAD_SNOTEL

@@ -59,3 +59,20 @@ def bump_all_input_widget_versions() -> None:
     bump_experiment_datetime_widget_version()
     bump_mpi_widget_version()
     bump_config_preview_version()
+
+
+def spatial_input_widget_version() -> int:
+    return int(st.session_state.get("spatial_input_widget_version", 0))
+
+
+def spatial_input_widget_key(name: str) -> str:
+    return f"{name}_v{spatial_input_widget_version()}"
+
+
+def bump_spatial_input_widget_version() -> None:
+    """Remount pour-point / bounding-box text inputs (e.g. after clear)."""
+    st.session_state.spatial_input_widget_version = spatial_input_widget_version() + 1
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if key_text.startswith("pour_point_input") or key_text.startswith("bounding_box_input"):
+            st.session_state.pop(key, None)

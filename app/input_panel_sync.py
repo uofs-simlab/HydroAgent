@@ -36,12 +36,31 @@ def _parse_pour_point(value: str) -> tuple[float, float] | None:
         return None
 
 
+def _parse_bounding_box(value: str) -> tuple[float, float, float, float] | None:
+    value = _s(value).replace(",", "/")
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split("/") if part.strip()]
+    if len(parts) != 4:
+        return None
+    try:
+        north, west, south, east = (float(parts[i]) for i in range(4))
+        if north < south:
+            north, south = south, north
+        if east < west:
+            west, east = east, west
+        return north, west, south, east
+    except Exception:
+        return None
+
+
 def _sync_spatial_field(cfg: dict, plan_key: str, session_key: str, input_key: str) -> None:
     """Sync spatial plan fields into session state without touching widget keys directly."""
-    _ = input_key  # Widget keys are refreshed via refresh_spatial_inputs on the next run.
+    _ = input_key  # Text inputs refresh via process_pre_widget_plan_sync on the next run.
     raw = lookup_plan_config(cfg, plan_key)
-    if raw is not None and _s(raw):
-        val = _s(raw).replace(",", "/")
+    val = _s(raw) if raw is not None else ""
+    if val:
+        val = val.replace(",", "/")
         st.session_state[session_key] = val
         if plan_key == "pour_point_coords":
             parsed = _parse_pour_point(val)
@@ -50,12 +69,28 @@ def _sync_spatial_field(cfg: dict, plan_key: str, session_key: str, input_key: s
                 st.session_state.map_lat = lat
                 st.session_state.map_lon = lon
                 st.session_state.map_point_selected = True
-    elif plan_key in cfg and cfg.get(plan_key) is None:
-        st.session_state[session_key] = ""
-        if plan_key == "pour_point_coords":
-            st.session_state.map_lat = None
-            st.session_state.map_lon = None
-            st.session_state.map_point_selected = False
+                st.session_state.pour_point_map_hidden = False
+        elif plan_key == "bounding_box_coords":
+            parsed = _parse_bounding_box(val)
+            if parsed:
+                north, west, south, east = parsed
+                st.session_state.bbox_point_1 = (north, west)
+                st.session_state.bbox_point_2 = (south, east)
+                st.session_state.bbox_selected = True
+                st.session_state.bbox_map_hidden = False
+        return
+
+    st.session_state[session_key] = ""
+    if plan_key == "pour_point_coords":
+        st.session_state.pour_point_map_hidden = True
+        st.session_state.map_lat = None
+        st.session_state.map_lon = None
+        st.session_state.map_point_selected = False
+    elif plan_key == "bounding_box_coords":
+        st.session_state.bbox_map_hidden = True
+        st.session_state.bbox_point_1 = None
+        st.session_state.bbox_point_2 = None
+        st.session_state.bbox_selected = False
 
 
 def _sync_scalar_field(cfg: dict, plan_key: str, *, normalizer=None) -> None:

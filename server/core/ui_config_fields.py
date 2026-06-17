@@ -20,6 +20,11 @@ from server.core.symfluence_options import (
     _UNSUPPORTED_HYDRO_MODELS,
 )
 
+
+def _s(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
 # Canonical planner key -> session_state key (when different)
 SESSION_KEY_ALIASES: dict[str, str] = {
     "experiment_time_start": "tstart",
@@ -161,27 +166,60 @@ def lookup_plan_config(cfg: dict | None, *keys: str) -> Any:
     return None
 
 
+_SPATIAL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "pour_point_coords": ("pour_point_coords", "POUR_POINT_COORDS"),
+    "bounding_box_coords": ("bounding_box_coords", "BOUNDING_BOX_COORDS"),
+}
+
+
+def plan_config_field_present(cfg: dict | None, key: str) -> bool:
+    """True when a first-class plan config field has a non-empty value."""
+    aliases = _SPATIAL_FIELD_ALIASES.get(key)
+    if aliases:
+        value = lookup_plan_config(cfg, *aliases)
+    else:
+        yaml_key = FIRST_CLASS_FIELD_MAP.get(key)
+        keys: list[str] = [key]
+        if yaml_key:
+            keys.append(yaml_key)
+        value = lookup_plan_config(cfg, *keys)
+    if value is None:
+        return False
+    return bool(str(value).strip())
+
+
 def set_plan_config_value(cfg: dict, key: str, value: Any) -> None:
-    """Write a value to plan.config using canonical key and mirrors."""
+    """Write a value to plan.config using planner-facing keys only."""
+    storage_key = preferred_plan_storage_key(key)
     if value is None or value == "":
+        cfg.pop(storage_key, None)
         cfg.pop(key, None)
+        yaml_key = FIRST_CLASS_FIELD_MAP.get(storage_key)
+        if yaml_key:
+            cfg.pop(yaml_key, None)
+        meta = next(
+            (f for f in CHAT_EDITABLE_FIELDS if preferred_plan_storage_key(f["key"]) == storage_key),
+            None,
+        )
+        if meta:
+            for alias in meta.get("aliases") or []:
+                cfg.pop(alias, None)
+            for mirror in meta.get("mirror") or []:
+                cfg.pop(mirror, None)
         return
-    cfg[key] = value
-    meta = next((f for f in CHAT_EDITABLE_FIELDS if f["key"] == key), None)
+    cfg[storage_key] = value
+    meta = next(
+        (f for f in CHAT_EDITABLE_FIELDS if preferred_plan_storage_key(f["key"]) == storage_key),
+        None,
+    )
     if meta:
-        for alias in meta.get("aliases") or []:
-            cfg[alias] = value
         for mirror in meta.get("mirror") or []:
-            cfg[mirror] = value
-    yaml_key = FIRST_CLASS_FIELD_MAP.get(key)
+            cfg.pop(mirror, None)
+        for alias in meta.get("aliases") or []:
+            cfg.pop(alias, None)
+    yaml_key = FIRST_CLASS_FIELD_MAP.get(storage_key)
     if yaml_key:
-        cfg[yaml_key] = value
-    if key == "NUM_PROCESSES":
-        cfg["num_processes"] = value
-    if key == "population_size":
-        cfg["POPULATION_SIZE"] = value
-    if key == "iterations":
-        cfg["NUMBER_OF_ITERATIONS"] = value
+        cfg.pop(yaml_key, None)
 
 
 def _normalize_chat_datetime(value: str, *, default_hm: str) -> str:
@@ -200,6 +238,163 @@ def _extract_hydrological_model(text: str) -> str | None:
             normalized = normalize_hydrological_model(model)
             return normalized or None
     return None
+
+
+def normalize_domain_name_value(raw: str) -> str:
+    """Keep a single domain token; drop trailing 'and experiment_id …' from combined phrases."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    raw = re.split(r"\s+and\s+experiment_id\b", raw, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    match = re.match(r"^([A-Za-z0-9_\-]+)", raw)
+    if match:
+        return match.group(1)
+    cleaned = re.sub(r"\s+", "_", raw)
+    cleaned = re.sub(r"[^A-Za-z0-9_\-]", "", cleaned)
+    return cleaned
+
+
+_OPTIONAL_QUOTES = r'["\']?'
+_PP_COORDS_CAPTURE = (
+    rf"{_OPTIONAL_QUOTES}"
+    r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"
+    rf"{_OPTIONAL_QUOTES}"
+)
+_BBOX_COORDS_CAPTURE = (
+    rf"{_OPTIONAL_QUOTES}"
+    r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"
+    rf"{_OPTIONAL_QUOTES}"
+)
+
+
+def _quoted_field_name(name: str) -> str:
+    return rf'["\']?{re.escape(name)}["\']?'
+
+
+def _normalize_coord_token(raw: str) -> str:
+    return raw.replace(",", "/").strip().strip('"').strip("'").rstrip(".,;")
+
+
+def _extract_bbox_coords_from_text(text: str) -> str | None:
+    patterns = [
+        rf"\bbounding\s+box(?:\s+coords|\s+coordinates)?\s*{_BBOX_COORDS_CAPTURE}",
+        rf"\bbounding[_\s-]?box(?:\s+coords|\s+coordinates)?\s+(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+        rf"\bbounding_box_coords\s*[=:]?\s*(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+        rf"\bBOUNDING_BOX_COORDS\s*[=:]?\s*(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+        rf"{_quoted_field_name('bounding_box_coords')}\s*[=:]\s*{_BBOX_COORDS_CAPTURE}",
+        rf"{_quoted_field_name('BOUNDING_BOX_COORDS')}\s*[=:]\s*{_BBOX_COORDS_CAPTURE}",
+        rf"\b(?:change|set|update|use)\s+{_quoted_field_name('bounding_box_coords')}\s*[=:]\s*{_BBOX_COORDS_CAPTURE}",
+        rf"\b(?:change|set|update|use)\s+{_quoted_field_name('BOUNDING_BOX_COORDS')}\s*[=:]\s*{_BBOX_COORDS_CAPTURE}",
+        rf"\b(?:change|set|update|use)\s+(?:the\s+)?(?:bounding\s+box|bbox)\s+(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+        rf"\b(?:bounding\s+box|bbox)\s+(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+        rf"\bbbox\s+(?:to\s+)?{_BBOX_COORDS_CAPTURE}",
+    ]
+    for pat in patterns:
+        match = re.search(pat, text, flags=re.IGNORECASE)
+        if match:
+            return _normalize_coord_token(match.group(1))
+    return None
+
+
+def _extract_pour_point_coords_from_text(text: str) -> str | None:
+    patterns = [
+        rf"\bpour\s+point(?:\s+coords|\s+coordinates)?\s+{_PP_COORDS_CAPTURE}",
+        rf"\bpour[_\s-]?point(?:\s+coords|\s+coordinates)?\s+(?:to\s+)?{_PP_COORDS_CAPTURE}",
+        rf"\bpour_point_coords\s*[=:]?\s*(?:to\s+)?{_PP_COORDS_CAPTURE}",
+        rf"{_quoted_field_name('pour_point_coords')}\s*[=:]\s*{_PP_COORDS_CAPTURE}",
+        rf"{_quoted_field_name('POUR_POINT_COORDS')}\s*[=:]\s*{_PP_COORDS_CAPTURE}",
+        rf"\b(?:change|set|update|use)\s+{_quoted_field_name('pour_point_coords')}\s*[=:]\s*{_PP_COORDS_CAPTURE}",
+        rf"\b(?:change|set|update|use)\s+(?:the\s+)?pour\s+point\s+(?:to\s+)?{_PP_COORDS_CAPTURE}",
+    ]
+    for pat in patterns:
+        match = re.search(pat, text, flags=re.IGNORECASE)
+        if match:
+            return _normalize_coord_token(match.group(1))
+    return None
+
+
+def normalize_discretization_value(raw: str) -> str:
+    """Normalize planner/chat discretization tokens (user-facing intent)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper()
+    lower = raw.lower()
+    if upper in {"G", "GR", "GRU"}:
+        return "GRUs"
+    if upper.startswith("GRU"):
+        return "GRUs"
+    if upper in {"H", "HR"}:
+        return "HRUs"
+    if upper.startswith("HRU"):
+        return "HRUs"
+    if lower in {"l", "lump"} or lower.startswith("lumped"):
+        return "lumped"
+    if lower.startswith("lump"):
+        return "lumped"
+    if lower == "elevation":
+        return "elevation"
+    return raw
+
+
+def is_lumped_workflow(plan_cfg: dict | None, user_request: str = "") -> bool:
+    """True when the user wants a lumped-basin workflow (not semi-distributed GRU routing)."""
+    plan_cfg = plan_cfg or {}
+    user_request = (user_request or "").lower()
+    domain = _s(plan_cfg.get("domain_name")).lower()
+    domain_def = _s(plan_cfg.get("domain_def")).lower()
+    disc = normalize_discretization_value(
+        _s(lookup_plan_config(plan_cfg, "discretization", "DOMAIN_DISCRETIZATION"))
+    ).lower()
+    if disc in {"lumped", "l", "lump"}:
+        return True
+    if domain_def == "lumped":
+        return True
+    if domain and "lumped" in domain and "semi" not in domain:
+        return True
+    if re.search(r"\bdiscretiz\w+\s+lumped\b", user_request):
+        return True
+    if re.search(r"\blumped\s+(?:basin|summa|workflow)\b", user_request):
+        return True
+    if re.search(r"\brun\s+a\s+lumped\b", user_request):
+        return True
+    return False
+
+
+def symfluence_discretization_from_plan(
+    plan_cfg: dict | None,
+    user_request: str = "",
+) -> str:
+    """Map planner discretization to a SYMFLUENCE SUB_GRID_DISCRETIZATION value."""
+    plan_cfg = plan_cfg or {}
+    raw = _s(lookup_plan_config(plan_cfg, "discretization", "DOMAIN_DISCRETIZATION"))
+    normalized = normalize_discretization_value(raw)
+    if is_lumped_workflow(plan_cfg, user_request):
+        return "GRUs"
+    if normalized:
+        return normalized
+    return "GRUs"
+
+
+def user_forbids_mizuroute(user_request: str) -> bool:
+    text = (user_request or "").lower()
+    return bool(
+        re.search(
+            r"do\s+not\s+use\s+mizuRoute|without\s+mizuRoute|no\s+mizuRoute|not\s+use\s+mizuRoute",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def normalize_routing_model_value(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    if lower in {"m", "miz", "mizu", "mizuroute"}:
+        return "mizuRoute"
+    return raw
 
 
 def _field_lookup_patterns(field: dict[str, Any]) -> list[str]:
@@ -235,6 +430,32 @@ def _field_lookup_patterns(field: dict[str, Any]) -> list[str]:
                 rf"\b{esc}\s*[=:]\s*(\d{{4}}-\d{{2}}-\d{{2}}(?:\s+\d{{1,2}}:\d{{2}})?)",
                 rf"\b{esc}\s+(?:to\s+)?(\d{{4}}-\d{{2}}-\d{{2}}(?:\s+\d{{1,2}}:\d{{2}})?)",
             ])
+        elif key == "domain_name":
+            patterns.extend([
+                rf"\b{esc}\s*[=:]\s*([A-Za-z0-9_\-]+)",
+                rf"\b{esc}\s+(?:to\s+)?([A-Za-z0-9_\-]+)",
+            ])
+        elif key == "experiment_id":
+            patterns.extend([
+                rf"\b{esc}\s*[=:]\s*([A-Za-z0-9_\-]+)",
+                rf"\b{esc}\s+(?:to\s+)?([A-Za-z0-9_\-]+)",
+            ])
+        elif field_type == "coords_bbox":
+            qesc = _quoted_field_name(esc)
+            patterns.extend([
+                rf"{qesc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b(?:use|set|update|change)\s+{qesc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b{esc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b{esc}\s+(?:to\s+)?{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+            ])
+        elif field_type == "coords_pp":
+            qesc = _quoted_field_name(esc)
+            patterns.extend([
+                rf"{qesc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b(?:use|set|update|change)\s+{qesc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b{esc}\s*[=:]\s*{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+                rf"\b{esc}\s+(?:to\s+)?{_OPTIONAL_QUOTES}(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?){_OPTIONAL_QUOTES}",
+            ])
         else:
             value_pat = r"([A-Za-z0-9_\-]+)" if field.get("options") else r"([^\n,;]+?)"
             patterns.extend([
@@ -258,14 +479,158 @@ def _coerce_field_value(field: dict[str, Any], raw: str) -> Any:
         return normalize_hydrological_model(raw)
     if field.get("key") == "forcing_dataset":
         return normalize_forcing_dataset(raw)
+    if field.get("key") == "domain_name":
+        return normalize_domain_name_value(raw)
+    if field.get("key") == "discretization":
+        return normalize_discretization_value(raw)
     if field_type == "period":
         return re.sub(r"\s*,\s*", ", ", raw)
+    if field_type in {"coords_bbox", "coords_pp"}:
+        return _normalize_coord_token(raw)
     options = field.get("options") or []
     if options:
         for opt in options:
             if opt and opt.lower() == raw.lower():
                 return opt
     return coerce_scalar_value(raw)
+
+
+def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
+    """
+    Extract explicit key=value and common natural-language settings from a planning prompt.
+    Safety net when the LLM planner drops or replaces user-specified values.
+    """
+    if not isinstance(plan, dict) or not prompt_text:
+        return plan
+
+    cfg = dict(plan.get("config") or {})
+    text = prompt_text
+    changed = False
+
+    def set_field(key: str, value: Any) -> None:
+        nonlocal changed
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return
+        set_plan_config_value(cfg, key, value)
+        changed = True
+
+    patterns_str: list[tuple[str, str]] = [
+        ("domain_name", r"\bdomain_name\s+([A-Za-z0-9_\-]+)"),
+        ("experiment_id", r"\bexperiment_id\s+([A-Za-z0-9_\-]+)"),
+        ("forcing_dataset", r"\bforcing_dataset\s+([A-Za-z0-9_\-]+)"),
+        ("domain_def", r"\bdomain_def\s+([A-Za-z0-9_\-]+)"),
+        ("discretization", r"\bdiscretization\s+([A-Za-z0-9_\-]+)"),
+        ("data_access", r"\bdata_access\s+([A-Za-z0-9_]+)"),
+        ("routing_model", r"\brouting\s+model\s+([A-Za-z0-9_\-]+)"),
+        ("station_id", r"\b(?:WSC\s+)?station\s+ID\s+([A-Za-z0-9_\-]+)"),
+        ("delineation_method", r"\bdelineation\s+method\s+([A-Za-z0-9_]+)"),
+        ("DELINEATION_METHOD", r"\bDELINEATION_METHOD\s+([A-Za-z0-9_]+)"),
+        ("streamflow_data_provider", r"\b(?:download\s+)?(WSC|USGS|VI|NIWA)\s+streamflow(?:\s+data)?\b"),
+        ("domain_def", r"\bdomain\s+definition\s+method\s+(delineate|lumped|point|subset|semidistributed|distributed)"),
+        ("discretization", r"\bdiscretization\s+(GRUs?|HRUs?|elevation|landclass|soilclass)"),
+    ]
+    for key, pat in patterns_str:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if key == "discretization":
+            set_field(key, normalize_discretization_value(raw))
+            continue
+        if key == "domain_def":
+            set_field(key, raw.lower())
+            continue
+        if key == "domain_name":
+            set_field(key, normalize_domain_name_value(raw))
+            from server.core.plan_rules import mark_domain_name_confirmed
+
+            cfg = mark_domain_name_confirmed(cfg)
+            continue
+        if key == "routing_model":
+            set_field(key, raw)
+            continue
+        if key == "streamflow_data_provider":
+            set_field(key, raw.upper())
+            continue
+        set_field(key, raw)
+
+    model_match = re.search(
+        r"\bhydrological\s+model\s+(SUMMA|FUSE|VIC|CLM)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if model_match:
+        set_field("hydrological_model", normalize_hydrological_model(model_match.group(1)))
+
+    if re.search(r"\bcloud\s+data\s+access\b", text, flags=re.IGNORECASE):
+        set_field("data_access", "cloud")
+
+    forcing_match = re.search(
+        r"\b(?:with\s+)?(ERA5|NLDAS|GLDAS|local)\s+forcing\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if forcing_match:
+        set_field("forcing_dataset", normalize_forcing_dataset(forcing_match.group(1)))
+
+    coord_patterns: list[tuple[str, str]] = [
+        ("pour_point_coords", r"\bpour\s+point(?:\s+coords|\s+coordinates)?\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
+        (
+            "bounding_box_coords",
+            r"\bbounding\s+box(?:\s+coords|\s+coordinates)?\s+"
+            r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
+        ),
+        ("pour_point_coords", r"\bpour_point_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
+        (
+            "bounding_box_coords",
+            r"\bbounding_box_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
+        ),
+    ]
+    for key, pat in coord_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            set_field(key, m.group(1).replace(",", "/").rstrip(".,;"))
+
+    time_patterns: list[tuple[str, str, str]] = [
+        ("experiment_time_start", r"\bexperiment\s+time\s+start\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", "01:00"),
+        ("experiment_time_end", r"\bexperiment\s+time\s+end\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", "23:00"),
+        ("experiment_time_start", r"\bexperiment_time_start\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", "01:00"),
+        ("experiment_time_end", r"\bexperiment_time_end\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", "23:00"),
+    ]
+    for key, pat, default_hm in time_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            set_field(key, _normalize_chat_datetime(m.group(1), default_hm=default_hm))
+
+    period_patterns: list[tuple[str, str]] = [
+        ("spinup_period", r"\bspinup\s+period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+        ("calibration_period", r"\bcalibration\s+period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+        ("evaluation_period", r"\bevaluation\s+period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+        ("spinup_period", r"\bspinup_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+        ("calibration_period", r"\bcalibration_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+        ("evaluation_period", r"\bevaluation_period\s+(\d{4}-\d{2}-\d{2}\s*,\s*\d{4}-\d{2}-\d{2})"),
+    ]
+    for key, pat in period_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            set_field(key, re.sub(r"\s*,\s*", ", ", m.group(1)))
+
+    int_patterns: list[tuple[str, str]] = [
+        ("stream_threshold", r"\bstream\s+threshold\s+([0-9]+(?:\.[0-9]+)?)"),
+        ("STREAM_THRESHOLD", r"\bSTREAM_THRESHOLD\s+([0-9]+(?:\.[0-9]+)?)"),
+        ("stream_threshold", r"\bstream_threshold\s+([0-9]+(?:\.[0-9]+)?)"),
+    ]
+    for key, pat in int_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(1)
+            set_field(key, int(float(raw)) if float(raw).is_integer() else float(raw))
+
+    if not changed:
+        return plan
+    out = dict(plan)
+    out["config"] = cfg
+    return out
 
 
 def apply_comprehensive_chat_config_edits(plan: dict, user_message: str) -> dict:
@@ -365,22 +730,13 @@ def apply_comprehensive_chat_config_edits(plan: dict, user_message: str) -> dict
         changed = True
 
     # Coordinates
-    pp = re.search(
-        r"\bpour[_\s-]?point(?:\s+coords)?\s+(?:to\s+)?(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
-        text,
-        flags=re.IGNORECASE,
-    )
+    pp = _extract_pour_point_coords_from_text(text)
     if pp:
-        set_plan_config_value(cfg, "pour_point_coords", pp.group(1).replace(",", "/"))
+        set_plan_config_value(cfg, "pour_point_coords", pp)
         changed = True
-    bbox = re.search(
-        r"\bbounding[_\s-]?box(?:\s+coords)?\s+(?:to\s+)?"
-        r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
-        text,
-        flags=re.IGNORECASE,
-    )
+    bbox = _extract_bbox_coords_from_text(text)
     if bbox:
-        set_plan_config_value(cfg, "bounding_box_coords", bbox.group(1).replace(",", "/"))
+        set_plan_config_value(cfg, "bounding_box_coords", bbox)
         changed = True
 
     # Registry explicit patterns for every field
@@ -466,8 +822,111 @@ def canonical_plan_config(cfg: dict | None) -> dict[str, Any]:
         canon = canonical_config_key(key)
         if normalize_config_compare_value(value) is None:
             continue
+        if canon == "discretization" and isinstance(value, str):
+            value = normalize_discretization_value(value)
+        elif canon == "routing_model" and isinstance(value, str):
+            value = normalize_routing_model_value(value)
         canonical[canon] = value
     return canonical
+
+
+_YAML_TO_PLANNER_KEY = {yaml_key: planner_key for planner_key, yaml_key in FIRST_CLASS_FIELD_MAP.items()}
+
+_CANONICAL_TO_STORAGE_KEY: dict[str, str] = {
+    "NUM_PROCESSES": "num_processes",
+    "MPI_PROCESSES": "mpi_processes",
+    "NUMBER_OF_ITERATIONS": "iterations",
+    "POPULATION_SIZE": "population_size",
+    "STATION_ID": "station_id",
+    "ROUTING_MODEL": "routing_model",
+    "DATA_ACCESS": "data_access",
+    "DOMAIN_DEFINITION_METHOD": "domain_def",
+    "DOMAIN_DISCRETIZATION": "discretization",
+    "PET_METHOD": "pet_method",
+    "SPINUP_PERIOD": "spinup_period",
+    "CALIBRATION_PERIOD": "calibration_period",
+    "EVALUATION_PERIOD": "evaluation_period",
+    "ITERATIVE_OPTIMIZATION_ALGORITHM": "iterative_optimization_algorithm",
+    "OPTIMIZATION_METRIC": "optimization_metric",
+    "OPTIMIZATION_TARGET": "optimization_target",
+    "CALIBRATION_TIMESTEP": "calibration_timestep",
+    "DOWNLOAD_SNOTEL": "download_snotel",
+    "SNOTEL_STATION": "snotel_station",
+    "PARAMS_TO_CALIBRATE": "params_to_calibrate",
+}
+
+PLAN_TOP_LEVEL_CONFIG_KEYS: set[str] = set(CHAT_EDITABLE_KEYS)
+PLAN_TOP_LEVEL_CONFIG_KEYS |= set(FIRST_CLASS_FIELD_MAP.keys())
+PLAN_TOP_LEVEL_CONFIG_KEYS |= {
+    "data_access",
+    "delineation_method",
+    "stream_threshold",
+    "num_processes",
+    "mpi_processes",
+    "routing_model",
+    "station_id",
+    "streamflow_data_provider",
+    "pet_method",
+    "spinup_period",
+    "calibration_period",
+    "evaluation_period",
+    "iterative_optimization_algorithm",
+    "optimization_metric",
+    "optimization_target",
+    "calibration_timestep",
+    "iterations",
+    "population_size",
+    "download_snotel",
+    "snotel_station",
+    "params_to_calibrate",
+}
+
+
+def preferred_plan_storage_key(key: str) -> str:
+    """Planner-facing config key (snake_case); YAML mirrors are not stored in plan JSON."""
+    canon = canonical_config_key(key)
+    if canon in _CANONICAL_TO_STORAGE_KEY:
+        return _CANONICAL_TO_STORAGE_KEY[canon]
+    if canon in _YAML_TO_PLANNER_KEY:
+        return _YAML_TO_PLANNER_KEY[canon]
+    if key in FIRST_CLASS_FIELD_MAP:
+        return key
+    return canon
+
+
+def compact_plan_config(cfg: dict | None) -> dict:
+    """One planner key per setting; non-standard keys live under extra_config."""
+    merged = canonical_plan_config(cfg)
+    preferred: dict[str, Any] = {}
+    overflow: dict[str, Any] = {}
+
+    for raw_key, value in merged.items():
+        if normalize_config_compare_value(value) is None:
+            continue
+        storage_key = preferred_plan_storage_key(raw_key)
+        if storage_key in preferred:
+            continue
+        if storage_key in PLAN_TOP_LEVEL_CONFIG_KEYS:
+            preferred[storage_key] = value
+        else:
+            overflow[storage_key] = value
+
+    for key in list(overflow.keys()):
+        if key in preferred:
+            overflow.pop(key, None)
+
+    if overflow:
+        preferred["extra_config"] = overflow
+    return preferred
+
+
+def normalize_plan_for_storage(plan: dict | None) -> dict:
+    """Compact plan.config for session state, plan.json, and the JSON editor."""
+    if not isinstance(plan, dict):
+        return {}
+    out = dict(plan)
+    out["config"] = compact_plan_config(out.get("config"))
+    return out
 
 
 def config_keys_mentioned_in_chat(user_message: str) -> set[str]:
