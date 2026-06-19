@@ -7,12 +7,18 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from server.core.plan_rules import (
+    default_symfluence_data_dir,
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
     extract_explicit_domain_name_from_request,
+    extract_ordered_steps_from_request,
     mark_domain_name_confirmed,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
+    pour_point_workflow_skips_bbox,
+    request_indicates_local_data_reuse,
+    sort_plan_steps_by_workflow_order,
+    try_restore_local_recovery_plan,
 )
 
 PLANNER_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "planner_prompt.txt"
@@ -259,7 +265,13 @@ def finalize_run_plan(
         cfg = mark_domain_name_confirmed(cfg)
     elif cfg.get("domain_name"):
         cfg["domain_name"] = _normalize_domain_name_for_config(cfg["domain_name"])
+        if explicit_domain and explicit_domain.lower() == _s(cfg["domain_name"]).lower():
+            cfg = mark_domain_name_confirmed(cfg)
 
+    plan["config"] = cfg
+    data_dir = default_symfluence_data_dir()
+    plan = try_restore_local_recovery_plan(plan, user_request, data_dir=data_dir)
+    cfg = dict(plan.get("config") or {})
     plan["config"] = cfg
 
     required_user_fields = [
@@ -270,11 +282,23 @@ def finalize_run_plan(
         "experiment_time_end",
     ]
 
+    data_dir = default_symfluence_data_dir()
     steps_now = plan.get("steps", []) or []
-    if plan_requires_bounding_box(cfg, steps_now, user_request):
+    steps_for_validation = list(steps_now)
+    ordered_steps = extract_ordered_steps_from_request(user_request)
+    if len(ordered_steps) >= 3:
+        steps_for_validation = ordered_steps
+
+    if (
+        not pour_point_workflow_skips_bbox(
+            cfg, steps_for_validation, user_request, data_dir=data_dir
+        )
+        and plan_requires_bounding_box(
+            cfg, steps_for_validation, user_request, data_dir=data_dir
+        )
+    ):
         required_user_fields.append("bounding_box_coords")
 
-    data_dir = Path.home() / "installs" / "SYMFLUENCE_data"
     missing = [
         f
         for f in required_user_fields
@@ -285,13 +309,46 @@ def finalize_run_plan(
         or (f != "domain_name" and not cfg.get(f))
     ]
 
-    if missing:
+    if (
+        missing == ["bounding_box_coords"]
+        and request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir)
+    ):
+        missing = []
+
+    missing_core = [
+        field
+        for field in missing
+        if field != "bounding_box_coords"
+    ]
+    bbox_missing = "bounding_box_coords" in missing
+
+    if missing_core:
         plan["needs_user_input"] = missing
         plan["steps"] = ["validate_config", "dry_run"]
         plan["notes"] = (
             f"Missing required inputs: {', '.join(missing)}. "
             "Returning a safe validation/dry-run plan until those values are provided."
         )
+    elif bbox_missing:
+        plan["needs_user_input"] = ["bounding_box_coords"]
+        from server.core.plan_rules import _append_plan_note
+
+        _append_plan_note(
+            plan,
+            "Missing required inputs: bounding_box_coords. "
+            "Workflow steps preserved; provide a bounding box before cloud acquisition.",
+        )
+    else:
+        plan["needs_user_input"] = []
+
+    if (
+        not missing_core
+        and not bbox_missing
+        and len(ordered_steps) >= 3
+        and set(plan.get("steps") or []) <= {"validate_config", "dry_run"}
+    ):
+        plan["steps"] = ordered_steps
+        plan["needs_user_input"] = []
 
     plan = ensure_domain_name_user_input(plan, user_request, data_dir=data_dir)
     plan = normalize_local_workflow_plan(
@@ -325,7 +382,7 @@ def finalize_run_plan(
     ]
 
     current_steps = plan.get("steps", []) or []
-    ordered_steps = [step for step in preferred_order if step in current_steps]
+    ordered_steps = sort_plan_steps_by_workflow_order(current_steps)
     if ordered_steps:
         plan["steps"] = ordered_steps
 
@@ -396,6 +453,7 @@ def finalize_plan_refinement(
     current_plan: Dict[str, Any],
     conversation_text: str,
     data_dir: Path | None = None,
+    preserve_workflow_steps: bool = False,
 ) -> tuple[str, Dict[str, Any], bool]:
     reply = s(result.get("reply")) or "Done."
     update_plan = bool(result.get("update_plan"))
@@ -411,11 +469,46 @@ def finalize_plan_refinement(
     if missing_top:
         raise RuntimeError(f"Refined plan missing keys: {missing_top}")
 
+    llm_steps = list(new_plan.get("steps") or [])
+    if preserve_workflow_steps:
+        cur_cfg = dict(current_plan.get("config") or {})
+        new_cfg = dict(new_plan.get("config") or {})
+        for key, value in cur_cfg.items():
+            if value in (None, "", [], {}):
+                continue
+            if not new_cfg.get(key):
+                new_cfg[key] = value
+        new_plan["config"] = new_cfg
+
     new_plan = finalize_run_plan(
         new_plan,
         conversation_text,
         skip_workflow_step_restore=True,
     )
+
+    if preserve_workflow_steps:
+        needs = list(new_plan.get("needs_user_input") or [])
+        missing_core = [field for field in needs if field != "bounding_box_coords"]
+        gated = set(new_plan.get("steps") or []) <= {"validate_config", "dry_run"}
+        restore_steps = [
+            step
+            for step in (llm_steps or list(current_plan.get("steps") or []))
+            if step
+        ]
+        if (
+            gated
+            and not missing_core
+            and restore_steps
+            and not set(restore_steps) <= {"validate_config", "dry_run"}
+        ):
+            new_plan["steps"] = sort_plan_steps_by_workflow_order(restore_steps)
+            new_plan = normalize_local_workflow_plan(
+                new_plan,
+                conversation_text,
+                data_dir=data_dir,
+                skip_workflow_step_restore=True,
+            )
+
     return reply, new_plan, True
 
 

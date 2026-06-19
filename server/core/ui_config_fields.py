@@ -432,6 +432,7 @@ def _field_lookup_patterns(field: dict[str, Any]) -> list[str]:
             ])
         elif key == "domain_name":
             patterns.extend([
+                rf"\b(?:change|set|update)\s+(?:the\s+)?{esc}\s+(?:to\s+)?([A-Za-z0-9_\-]+)",
                 rf"\b{esc}\s*[=:]\s*([A-Za-z0-9_\-]+)",
                 rf"\b{esc}\s+(?:to\s+)?([A-Za-z0-9_\-]+)",
             ])
@@ -522,7 +523,7 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
         ("discretization", r"\bdiscretization\s+([A-Za-z0-9_\-]+)"),
         ("data_access", r"\bdata_access\s+([A-Za-z0-9_]+)"),
         ("routing_model", r"\brouting\s+model\s+([A-Za-z0-9_\-]+)"),
-        ("station_id", r"\b(?:WSC\s+)?station\s+ID\s+([A-Za-z0-9_\-]+)"),
+        ("station_id", r"\b(?:WSC\s+)?station\s+ID\s*[`'\"]?\s*(\d{2}[A-Z]{2}\d{3})[`'\"]?"),
         ("delineation_method", r"\bdelineation\s+method\s+([A-Za-z0-9_]+)"),
         ("DELINEATION_METHOD", r"\bDELINEATION_METHOD\s+([A-Za-z0-9_]+)"),
         ("streamflow_data_provider", r"\b(?:download\s+)?(WSC|USGS|VI|NIWA)\s+streamflow(?:\s+data)?\b"),
@@ -719,6 +720,16 @@ def apply_comprehensive_chat_config_edits(plan: dict, user_message: str) -> dict
         set_plan_config_value(cfg, "domain_def", domain_nl.group(1).lower())
         changed = True
 
+    # Natural-language domain name (e.g. "use BOWRiver3 as domain name")
+    domain_name_nl = re.search(
+        r"\buse\s+([A-Za-z0-9_\-]+)\s+as\s+(?:the\s+)?domain(?:\s+name|_name)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if domain_name_nl:
+        set_plan_config_value(cfg, "domain_name", normalize_domain_name_value(domain_name_nl.group(1)))
+        changed = True
+
     # Station ID natural language
     station_nl = re.search(
         r"\b(?:station(?:\s+id)?|gauging\s+station)\s+(?:to\s+)?([A-Za-z0-9_\-]+)\b",
@@ -755,6 +766,11 @@ def apply_comprehensive_chat_config_edits(plan: dict, user_message: str) -> dict
 
     if not changed:
         return plan
+    domain = _s(cfg.get("domain_name"))
+    if domain:
+        from server.core.plan_rules import apply_user_provided_domain_name
+
+        cfg = apply_user_provided_domain_name(cfg, domain)
     out = dict(plan)
     out["config"] = cfg
     return out

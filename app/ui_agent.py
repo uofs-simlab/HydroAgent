@@ -98,6 +98,7 @@ from server.core.run_naming import (
     allocate_unique_run_folder,
     assistant_run_is_established,
     parse_mac_duplicate_suffix,
+    placeholder_run_needs_rename,
     preview_run_folder_name,
     resolve_run_workspace,
     run_folder_belongs_to_workspace,
@@ -108,19 +109,31 @@ from server.core.run_naming import (
 from server.core.plan_rules import (
     apply_chat_config_edits,
     apply_chat_step_edits,
+    apply_chat_step_order_edits,
     domain_catchment_shapefile_candidates,
     domain_has_local_dem,
+    domain_has_local_era5_raw_forcing,
     domain_has_local_streamflow,
     domain_has_complete_local_workflow,
     domain_name_needs_user_input,
+    ensure_skip_acquire_forcings_when_local_forcing,
+    ensure_skip_model_agnostic_when_local_preprocessing,
     ensure_skip_process_observed_when_local_streamflow,
+    extract_explicit_domain_name_from_request,
     extract_station_id_from_request,
+    resolve_station_id_from_plan,
     infer_goal_steps_from_request,
     is_weak_domain_name,
-    mark_domain_name_confirmed,
+    apply_user_provided_domain_name,
+    merge_step_dependencies_preserving_order,
+    normalize_committed_plan_config,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
     plan_uses_local_data,
+    resolve_plan_step_dependencies,
+    request_indicates_local_data_reuse,
+    should_reuse_existing_symfluence_domain,
+    sort_plan_steps_by_workflow_order,
     strip_user_forbidden_download_steps,
     user_requires_fresh_cloud_workflow,
 )
@@ -377,7 +390,7 @@ ASSISTANT_PANEL_TOGGLE_KEY = "assistant_panel_toggle"
 # Middle workflow column: scroll region height (px) and map iframe height inside it.
 WORKFLOW_PANEL_HEIGHT = 720
 WORKFLOW_MAP_HEIGHT = 520
-WORKFLOW_MAP_ZOOM = 8
+WORKFLOW_MAP_ZOOM = 2
 WORKFLOW_SECTION_KEY = "workflow_section"
 EXECUTION_LOG_TAIL_CHARS = 120_000
 
@@ -814,6 +827,23 @@ def sanitize_config_token(name: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in s(name)).strip("_")
 
 
+def reuse_existing_domain_data_from_session(plan_cfg: dict | None = None) -> bool:
+    plan_cfg = plan_cfg or {}
+    user_request = (
+        user_prompt_for_metadata()
+        or conversation_text_for_plan_rules()
+        or s(st.session_state.get("nl_request", ""))
+    )
+    cfg = dict(plan_cfg)
+    if not cfg.get("domain_name"):
+        cfg["domain_name"] = s(st.session_state.domain_name)
+    return should_reuse_existing_symfluence_domain(
+        user_request,
+        cfg,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
+
+
 def symfluence_domain_name(domain_name: str, experiment_id: str = "") -> str:
     """Basin identifier for SYMFLUENCE DOMAIN_NAME (never includes experiment_id)."""
     domain_name = sanitize_config_token(domain_name)
@@ -841,18 +871,20 @@ def sync_run_folder_from_session(*, unlock: bool = False) -> None:
     experiment_id = s(st.session_state.experiment_id)
     if not domain_name or not experiment_id:
         return
-    if unlock:
-        st.session_state.run_workspace_locked = False
-    current = s(st.session_state.get("run_folder"))
-    if st.session_state.get("run_workspace_locked") and current:
-        return
     basin = symfluence_domain_name(domain_name, experiment_id)
-    if current and not unlock and assistant_run_is_established(current, RUNS_DIR):
+    current = s(st.session_state.get("run_folder"))
+    needs_rename = placeholder_run_needs_rename(current, basin, experiment_id)
+    if unlock or needs_rename:
+        st.session_state.run_workspace_locked = False
+    if st.session_state.get("run_workspace_locked") and current and not needs_rename:
+        return
+    if current and not unlock and not needs_rename and assistant_run_is_established(current, RUNS_DIR):
         return
     _, mac_n = parse_mac_duplicate_suffix(current)
     if (
         current
         and not unlock
+        and not needs_rename
         and mac_n is not None
         and run_folder_belongs_to_workspace(current, basin, experiment_id)
     ):
@@ -864,6 +896,7 @@ def sync_run_folder_from_session(*, unlock: bool = False) -> None:
         runs_dir=RUNS_DIR,
         data_dir=SYMFLUENCE_DATA_DIR,
         workspace_locked=bool(st.session_state.get("run_workspace_locked")),
+        reuse_existing_domain_data=reuse_existing_domain_data_from_session(),
     )
     st.session_state.run_folder = run_folder
 
@@ -882,7 +915,10 @@ def finalize_spec_for_symfluence(spec_dict: dict) -> dict:
         runs_dir=RUNS_DIR,
         data_dir=SYMFLUENCE_DATA_DIR,
         workspace_locked=bool(st.session_state.get("run_workspace_locked")),
+        reuse_existing_domain_data=reuse_existing_domain_data_from_session(spec_dict),
     )
+    if reuse_existing_domain_data_from_session(spec_dict):
+        sym_domain = basin
     if user_requires_fresh_cloud_workflow(user_request, spec_dict):
         sym_domain = basin
     spec_dict["domain_name"] = sym_domain
@@ -1137,87 +1173,13 @@ def current_hydrological_model(plan_cfg: dict | None = None) -> str:
 
 def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> dict:
     catalog = load_catalog()
-    steps = list(plan.get("steps", []) or [])
     user_request = user_request or conversation_text_for_plan_rules()
-
-    goal_steps = [step for step in steps if step not in ("validate_config", "dry_run")]
-    if not goal_steps:
-        goal_steps = infer_goal_steps_from_request(user_request)
-        if not goal_steps and re.search(r"\bsumma\b", user_request, flags=re.IGNORECASE):
-            goal_steps = ["run_model"]
-
-    resolved_steps: list[str] = []
-    for goal in goal_steps:
-        try:
-            chain = resolve_step_dependencies(goal, catalog, include_validate=False)
-        except Exception:
-            chain = [goal]
-        for item in chain:
-            if item not in resolved_steps:
-                resolved_steps.append(item)
-
-    if "validate_config" not in resolved_steps:
-        resolved_steps.insert(0, "validate_config")
-
-    if "dry_run" not in steps:
-        resolved_steps = [step for step in resolved_steps if step != "dry_run"]
-
-    resolved_steps = sorted(
-        resolved_steps,
-        key=lambda step: WORKFLOW_PRIORITY.get(step, 999),
-    )
-
-    new_plan = json.loads(json.dumps(plan))
-    new_plan["steps"] = resolved_steps
-
-    cfg = new_plan.setdefault("config", {})
-
-    required_config_fields = set()
-
-    for op in catalog.get("operations", []):
-        if op.get("name") in resolved_steps:
-            for req in op.get("requires", []):
-                if req in {
-                    "pour_point_coords",
-                    "bounding_box_coords",
-                    "experiment_time_start",
-                    "experiment_time_end",
-                    "domain_name",
-                    "experiment_id",
-                    "domain_def",
-                    "hydrological_model",
-                }:
-                    required_config_fields.add(req)
-
-    missing = []
-    for field in sorted(required_config_fields):
-        if not s(cfg.get(field)):
-            missing.append(field)
-
-    if plan_uses_local_data(cfg, resolved_steps, data_dir=SYMFLUENCE_DATA_DIR):
-        missing = [f for f in missing if f != "bounding_box_coords"]
-
-    new_plan["needs_user_input"] = missing
-
-    notes = str(new_plan.get("notes", "")).strip()
-    if not missing and "Missing required inputs:" in notes:
-        notes = re.sub(
-            r"Missing required inputs:.*?(?=\s*\||$)",
-            "",
-            notes,
-            flags=re.IGNORECASE,
-        ).strip(" |")
-    new_plan["notes"] = (
-        notes + " | Dependencies resolved from SYMFLUENCE operation catalog."
-    ).strip(" |")
-
-    new_plan = strip_user_forbidden_download_steps(new_plan, user_request)
-    new_plan = normalize_local_workflow_plan(
-        new_plan,
+    return resolve_plan_step_dependencies(
+        plan,
         user_request,
+        catalog=catalog,
         data_dir=SYMFLUENCE_DATA_DIR,
     )
-    return new_plan
 
 def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     cmd = [sys.executable, script_path] + args
@@ -2078,6 +2040,35 @@ def on_bounding_box_input_change() -> None:
     bump_config_preview_version()
 
 
+def sync_workflow_settings_to_plan(*, refresh_editor: bool = True) -> None:
+    """Push Input-tab workflow settings into run_plan (on Enter / field blur)."""
+    sync_run_folder_from_session(unlock=True)
+    if st.session_state.get("run_plan"):
+        sync_all_ui_fields_to_plan(refresh_editor=refresh_editor, force_editor=refresh_editor)
+        update_run_plan_needs_user_input()
+    bump_config_preview_version()
+
+
+def on_input_domain_name_change() -> None:
+    st.session_state.domain_name = s(
+        st.session_state.get(input_panel_widget_key("input_domain_name"))
+    )
+    sync_workflow_settings_to_plan()
+
+
+def on_input_experiment_id_change() -> None:
+    st.session_state.experiment_id = s(
+        st.session_state.get(input_panel_widget_key("input_experiment_id"))
+    )
+    sync_workflow_settings_to_plan()
+
+
+def on_fix_missing_plan_field_change(field: str) -> None:
+    """Apply a fix-missing text field to the plan and refresh Input-tab widgets."""
+    widget_key = f"fix_missing_{field}"
+    set_plan_config_field(field, s(st.session_state.get(widget_key)))
+
+
 def resolve_data_access_from_plan(plan_cfg: dict | None) -> str:
     """Read data_access / DATA_ACCESS from plan config or extra_config."""
     plan_cfg = plan_cfg or {}
@@ -2108,9 +2099,37 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     plan_cfg = plan_cfg or {}
     run_steps = (st.session_state.get("run_plan") or {}).get("steps") or []
     domain_name = s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name)
-    data_access = resolve_data_access_from_plan(plan_cfg) or "cloud"
-    if {"acquire_attributes", "acquire_forcings"} & set(run_steps):
-        data_access = "cloud"
+    user_request = (
+        user_prompt_for_metadata()
+        or conversation_text_for_plan_rules()
+        or s(st.session_state.get("nl_request", ""))
+    )
+    data_access = resolve_data_access_from_plan(plan_cfg) or "local"
+
+    if plan_uses_local_data(plan_cfg, run_steps, user_request, data_dir=SYMFLUENCE_DATA_DIR):
+        data_access = "local"
+    elif domain_name and domain_has_local_era5_raw_forcing(SYMFLUENCE_DATA_DIR, domain_name):
+        if request_indicates_local_data_reuse(user_request, plan_cfg, data_dir=SYMFLUENCE_DATA_DIR):
+            data_access = "local"
+        elif "acquire_forcings" in run_steps and not domain_has_local_dem(
+            SYMFLUENCE_DATA_DIR, domain_name
+        ):
+            data_access = "cloud"
+    elif {"acquire_attributes", "acquire_forcings"} & set(run_steps):
+        needs_cloud = False
+        if domain_name:
+            if "acquire_forcings" in run_steps and not domain_has_local_era5_raw_forcing(
+                SYMFLUENCE_DATA_DIR, domain_name
+            ):
+                needs_cloud = True
+            if "acquire_attributes" in run_steps and not domain_has_local_dem(
+                SYMFLUENCE_DATA_DIR, domain_name
+            ):
+                needs_cloud = True
+        else:
+            needs_cloud = True
+        if needs_cloud:
+            data_access = "cloud"
     elif domain_name and not domain_has_local_dem(SYMFLUENCE_DATA_DIR, domain_name):
         if {"define_domain", "discretize_domain", "acquire_attributes"} & set(run_steps):
             data_access = "cloud"
@@ -2147,9 +2166,13 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         "forcing_dataset": s(lookup_plan_config(plan_cfg, "forcing_dataset", "FORCING_DATASET"))
         or s(st.session_state.forcing_dataset) or None,
         "station_id": (
-            s(lookup_plan_config(plan_cfg, "station_id", "STATION_ID"))
-            or s(st.session_state.station_id)
-            or extract_station_id_from_request(s(st.session_state.get("nl_request", "")))
+            resolve_station_id_from_plan(
+                plan_cfg,
+                user_prompt_for_metadata()
+                or conversation_text_for_plan_rules()
+                or s(st.session_state.get("nl_request", "")),
+                fallback=s(st.session_state.station_id),
+            )
             or None
         ),
 
@@ -2258,12 +2281,18 @@ def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
     """Apply deterministic chat parsers before/after LLM refinement."""
     before = canonical_plan_config(plan.get("config") or {})
     patched = preserve_explicit_config_fields_from_prompt(
-        apply_chat_step_edits(
-            apply_chat_config_edits(_deep_copy_plan(plan), text),
+        apply_chat_step_order_edits(
+            apply_chat_step_edits(
+                apply_chat_config_edits(_deep_copy_plan(plan), text),
+                text,
+            ),
             text,
         ),
         text,
     )
+    steps = sort_plan_steps_by_workflow_order(list(patched.get("steps") or []))
+    if steps:
+        patched["steps"] = steps
     after = canonical_plan_config(patched.get("config") or {})
     changed = (
         after != before
@@ -2272,19 +2301,41 @@ def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
     return patched, changed
 
 
+def _confirm_domain_from_chat_message(plan: dict, user_message: str) -> dict:
+    """Mark domain_name confirmed when the user explicitly sets it in chat."""
+    if not isinstance(plan, dict) or not s(user_message):
+        return plan
+    out = dict(plan)
+    cfg = dict(out.get("config") or {})
+    explicit = extract_explicit_domain_name_from_request(user_message)
+    if explicit:
+        cfg = apply_user_provided_domain_name(cfg, explicit)
+    elif re.search(r"\bdomain_name\b|\bdomain\s+name\b", user_message, flags=re.IGNORECASE):
+        domain = _s(cfg.get("domain_name"))
+        if domain:
+            cfg = apply_user_provided_domain_name(cfg, domain)
+    out["config"] = cfg
+    return out
+
+
 def commit_chat_plan_update(
     current_plan: dict,
     new_plan: dict,
     *,
     user_message: str,
     conversation_text: str,
+    emit_chat_messages: bool = True,
 ) -> None:
+    new_plan = _confirm_domain_from_chat_message(new_plan, user_message)
     new_plan = normalize_local_workflow_plan(
         new_plan,
         conversation_text,
         data_dir=SYMFLUENCE_DATA_DIR,
         skip_workflow_step_restore=True,
     )
+    sorted_steps = sort_plan_steps_by_workflow_order(list(new_plan.get("steps") or []))
+    if sorted_steps:
+        new_plan["steps"] = sorted_steps
     diff = summarize_plan_changes(current_plan, new_plan, user_message=user_message)
     store_run_plan(new_plan)
     st.session_state.pop("_committed_plan_steps", None)
@@ -2315,6 +2366,9 @@ def commit_chat_plan_update(
             step_diff = summarize_plan_changes(plan, restored, user_message=user_message)
             if step_diff:
                 append_chat_message("assistant", step_diff, kind="diff")
+
+    if not emit_chat_messages:
+        return
 
     if diff:
         append_chat_message("assistant", diff, kind="diff")
@@ -2361,6 +2415,28 @@ def _spatial_value_from_ui_or_plan(
     )
 
 
+def _plan_config_spatial_value(plan_cfg: dict, field: str) -> str:
+    if field == "pour_point_coords":
+        return s(lookup_plan_config(plan_cfg, "pour_point_coords", "POUR_POINT_COORDS"))
+    if field == "bounding_box_coords":
+        return s(lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"))
+    return ""
+
+
+def _preserve_plan_scalar_when_ui_empty() -> frozenset[str]:
+    return frozenset(
+        {
+            "domain_name",
+            "experiment_id",
+            "domain_def",
+            "hydrological_model",
+            "forcing_dataset",
+            "experiment_time_start",
+            "experiment_time_end",
+        }
+    )
+
+
 def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
     """Push map picks and spatial text inputs into run_plan.config."""
     if st.session_state.get("run_plan") is None:
@@ -2380,10 +2456,12 @@ def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
         cfg,
         ("bounding_box_coords", "BOUNDING_BOX_COORDS"),
     )
+    plan_pour = _plan_config_spatial_value(cfg, "pour_point_coords")
+    plan_bbox = _plan_config_spatial_value(cfg, "bounding_box_coords")
     if not _pour_point_visible_on_map():
-        pour = ""
+        pour = pour or plan_pour
     if not _bbox_visible_on_map():
-        bbox = ""
+        bbox = bbox or plan_bbox
     if pour:
         cfg["pour_point_coords"] = pour
         cfg.pop("POUR_POINT_COORDS", None)
@@ -2408,12 +2486,33 @@ def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
 def _strip_hidden_spatial_fields_from_plan(plan: dict) -> dict:
     out = json.loads(json.dumps(plan))
     cfg = out.setdefault("config", {})
-    if st.session_state.get("pour_point_map_hidden"):
-        cfg.pop("pour_point_coords", None)
-        cfg.pop("POUR_POINT_COORDS", None)
-    if st.session_state.get("bbox_map_hidden"):
-        cfg.pop("bounding_box_coords", None)
-        cfg.pop("BOUNDING_BOX_COORDS", None)
+    cfg = normalize_committed_plan_config(cfg)
+    out["config"] = cfg
+    return out
+
+
+def _merge_plan_editor_draft(parsed: dict) -> dict:
+    """Apply editor JSON while preserving live Input-tab values and domain confirmation."""
+    out = dict(parsed)
+    out["config"] = _plan_cfg_with_live_ui_fields(out.get("config") or {})
+    return out
+
+
+def _normalize_plan_from_editor_draft(plan: dict) -> dict:
+    out = dict(plan)
+    cfg = normalize_committed_plan_config(out.get("config") or {})
+    out["config"] = cfg
+    pour = _plan_config_spatial_value(cfg, "pour_point_coords")
+    bbox = _plan_config_spatial_value(cfg, "bounding_box_coords")
+    if pour:
+        st.session_state.selected_pour_point = pour
+        st.session_state.pour_point_map_hidden = False
+    if bbox:
+        st.session_state.selected_bounding_box = bbox
+        st.session_state.bbox_map_hidden = False
+    domain = s(cfg.get("domain_name"))
+    if domain:
+        st.session_state.domain_name = domain
     return out
 
 
@@ -2421,6 +2520,7 @@ def capture_plan_editor_draft() -> None:
     """Persist in-flight plan JSON before the assistant panel rerenders another tab."""
     if st.session_state.get("run_plan") is None:
         return
+    prepare_plan_editor_before_render()
     widget_key = plan_editor_widget_key()
     editor_text = s(st.session_state.get(widget_key))
     synced_text = s(st.session_state.get("_plan_editor_synced"))
@@ -2428,7 +2528,7 @@ def capture_plan_editor_draft() -> None:
         try:
             parsed = json.loads(editor_text)
             if isinstance(parsed, dict) and {"config", "steps"}.issubset(parsed.keys()):
-                store_run_plan(_strip_hidden_spatial_fields_from_plan(parsed))
+                store_run_plan(_merge_plan_editor_draft(parsed))
                 update_run_plan_needs_user_input()
         except Exception:
             pass
@@ -2555,6 +2655,7 @@ def commit_plan_editor_to_session(
         return False, f"Plan JSON is invalid: {e}"
     if not isinstance(edited_plan, dict):
         return False, "Plan JSON must be an object."
+    edited_plan = _normalize_plan_from_editor_draft(edited_plan)
     store_run_plan(edited_plan)
     st.session_state["_plan_editor_synced"] = plan_text.strip()
     steps = edited_plan.get("steps")
@@ -2606,10 +2707,10 @@ def get_required_config_fields_for_steps(
                     if req in config_fields:
                         required.add(req)
     except Exception:
-        if plan_requires_bounding_box(plan_cfg, steps, user_request):
+        if plan_requires_bounding_box(plan_cfg, steps, user_request, data_dir=SYMFLUENCE_DATA_DIR):
             required.add("bounding_box_coords")
 
-    if not plan_requires_bounding_box(plan_cfg, steps, user_request):
+    if not plan_requires_bounding_box(plan_cfg, steps, user_request, data_dir=SYMFLUENCE_DATA_DIR):
         required.discard("bounding_box_coords")
 
     return sorted(required)
@@ -2624,7 +2725,7 @@ def sync_input_panel_to_run_plan() -> None:
         return
     sync_mpi_to_run_plan()
     sync_all_ui_fields_to_plan(refresh_editor=False)
-    request_plan_editor_sync_from_run_plan()
+    refresh_plan_editor_from_state(force=True, remount=True)
     bump_config_preview_version()
 
 
@@ -2635,23 +2736,29 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
         "domain_name": s(st.session_state.domain_name),
         "experiment_id": s(st.session_state.experiment_id),
         "pour_point_coords": (
-            ""
-            if not _pour_point_visible_on_map()
-            else _spatial_value_from_ui_or_plan(
+            _spatial_value_from_ui_or_plan(
                 "pour_point_input",
                 "selected_pour_point",
                 existing_cfg,
                 ("pour_point_coords", "POUR_POINT_COORDS"),
             )
+            if _pour_point_visible_on_map()
+            else (
+                _plan_config_spatial_value(existing_cfg, "pour_point_coords")
+                or s(st.session_state.selected_pour_point)
+            )
         ),
         "bounding_box_coords": (
-            ""
-            if not _bbox_visible_on_map()
-            else _spatial_value_from_ui_or_plan(
+            _spatial_value_from_ui_or_plan(
                 "bounding_box_input",
                 "selected_bounding_box",
                 existing_cfg,
                 ("bounding_box_coords", "BOUNDING_BOX_COORDS"),
+            )
+            if _bbox_visible_on_map()
+            else (
+                _plan_config_spatial_value(existing_cfg, "bounding_box_coords")
+                or s(st.session_state.selected_bounding_box)
             )
         ),
         "domain_def": s(st.session_state.domain_def),
@@ -2672,6 +2779,8 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
     plan.setdefault("config", {})
     cfg = plan["config"]
 
+    preserve_when_empty = _preserve_plan_scalar_when_ui_empty()
+
     for key, value in values.items():
         if value:
             cfg[key] = value
@@ -2683,8 +2792,19 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
             if not s(lookup_plan_config(cfg, key, key.upper())):
                 cfg.pop(key, None)
                 cfg.pop("POUR_POINT_COORDS" if key == "pour_point_coords" else "BOUNDING_BOX_COORDS", None)
+        elif key in preserve_when_empty:
+            continue
         else:
             cfg.pop(key, None)
+
+    domain_value = s(values.get("domain_name")) or s(cfg.get("domain_name"))
+    if domain_value:
+        plan["config"] = apply_user_provided_domain_name(cfg, domain_value)
+        cfg = plan["config"]
+        if not s(st.session_state.domain_name):
+            st.session_state.domain_name = s(cfg.get("domain_name"))
+    elif not s(cfg.get("domain_name")):
+        cfg.pop("domain_name", None)
 
     steps = plan.get("steps", []) or []
     convo = conversation_text_for_plan_rules()
@@ -2696,6 +2816,26 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
 
     if refresh_editor:
         request_plan_editor_sync_from_run_plan()
+
+
+def _plan_cfg_with_live_ui_fields(plan_cfg: dict | None) -> dict:
+    """Merge live Input-tab values into plan config for needs_user_input checks."""
+    cfg = normalize_committed_plan_config(dict(plan_cfg or {}))
+    ui_domain = s(st.session_state.get("domain_name"))
+    if ui_domain:
+        cfg = apply_user_provided_domain_name(cfg, ui_domain)
+    ui_exp = s(st.session_state.get("experiment_id"))
+    if ui_exp:
+        cfg["experiment_id"] = ui_exp
+    ui_pour = s(st.session_state.get("selected_pour_point"))
+    if ui_pour:
+        cfg["pour_point_coords"] = ui_pour
+        cfg.pop("POUR_POINT_COORDS", None)
+    ui_bbox = s(st.session_state.get("selected_bounding_box"))
+    if ui_bbox:
+        cfg["bounding_box_coords"] = ui_bbox
+        cfg.pop("BOUNDING_BOX_COORDS", None)
+    return cfg
 
 
 def resolve_plan_missing_inputs(
@@ -2721,7 +2861,7 @@ def update_run_plan_needs_user_input() -> None:
     if not st.session_state.get("run_plan"):
         return
     plan = dict(st.session_state.run_plan)
-    cfg = dict(plan.get("config") or {})
+    cfg = _plan_cfg_with_live_ui_fields(plan.get("config") or {})
     plan["config"] = cfg
     steps = plan.get("steps", []) or []
     convo = conversation_text_for_plan_rules()
@@ -2811,8 +2951,10 @@ def set_plan_config_field(field: str, value: str) -> None:
 
     if field == "domain_name":
         st.session_state.domain_name = value
-        if value and not is_weak_domain_name(value):
-            plan["config"] = mark_domain_name_confirmed(plan["config"])
+        if value:
+            plan["config"] = apply_user_provided_domain_name(plan["config"], value)
+        else:
+            plan["config"].pop("domain_name", None)
         if value and s(st.session_state.experiment_id):
             sync_run_folder_from_session(unlock=True)
     elif field == "experiment_id":
@@ -2869,7 +3011,7 @@ def set_plan_config_field(field: str, value: str) -> None:
 
     update_run_plan_needs_user_input()
     bump_all_input_widget_versions()
-    refresh_plan_editor_from_state()
+    refresh_plan_editor_from_state(force=True)
 
 
 def render_fix_missing_inputs_section(needs: list[str]) -> None:
@@ -2903,66 +3045,64 @@ def render_fix_missing_inputs_section(needs: list[str]) -> None:
             st.caption(f"→ {meta['where']}")
 
             if field == "domain_name":
-                val = st.text_input(
+                st.text_input(
                     "Domain name",
                     value=current or s(st.session_state.domain_name),
                     key="fix_missing_domain_name",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if s(val) != current:
-                    set_plan_config_field("domain_name", val)
             elif field == "experiment_id":
-                val = st.text_input(
+                st.text_input(
                     "Experiment ID",
                     value=current or s(st.session_state.experiment_id),
                     key="fix_missing_experiment_id",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if s(val) != current:
-                    set_plan_config_field("experiment_id", val)
             elif field == "pour_point_coords":
-                val = st.text_input(
+                st.text_input(
                     "Pour point (lat/lon)",
                     value=current or s(st.session_state.selected_pour_point),
                     placeholder="51.1722/-115.5717",
                     key="fix_missing_pour_point_coords",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if st.button("Apply pour point", key="apply_fix_pour_point", width="stretch"):
-                    set_plan_config_field("pour_point_coords", val)
-                    st.rerun()
                 st.caption("Tip: switch to the **Input** tab and click the map in **Pour point** mode.")
             elif field == "bounding_box_coords":
-                val = st.text_input(
+                st.text_input(
                     "Bounding box (north/west/south/east)",
                     value=current or s(st.session_state.selected_bounding_box),
                     placeholder="51.76/-116.55/50.95/-115.5",
                     key="fix_missing_bounding_box_coords",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if st.button("Apply bounding box", key="apply_fix_bounding_box", width="stretch"):
-                    set_plan_config_field("bounding_box_coords", val)
-                    st.rerun()
             elif field == "experiment_time_start":
-                val = st.text_input(
+                st.text_input(
                     "Start time",
                     value=current or s(st.session_state.tstart),
                     placeholder="2001-01-01 01:00",
                     key="fix_missing_experiment_time_start",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if s(val) != current:
-                    set_plan_config_field("experiment_time_start", val)
             elif field == "experiment_time_end":
-                val = st.text_input(
+                st.text_input(
                     "End time",
                     value=current or s(st.session_state.tend),
                     placeholder="2001-01-10 23:00",
                     key="fix_missing_experiment_time_end",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if s(val) != current:
-                    set_plan_config_field("experiment_time_end", val)
             elif field == "hydrological_model":
                 options = [m for m in HYDROLOGICAL_MODEL_OPTIONS if m]
                 idx = options.index(current) if current in options else 0
@@ -3003,18 +3143,19 @@ def render_fix_missing_inputs_section(needs: list[str]) -> None:
                     set_plan_config_field("forcing_dataset", val)
                     st.rerun()
             else:
-                val = st.text_input(
+                st.text_input(
                     meta["label"],
                     value=current,
                     key=f"fix_missing_{field}",
                     label_visibility="collapsed",
+                    on_change=on_fix_missing_plan_field_change,
+                    args=(field,),
                 )
-                if s(val) != current:
-                    set_plan_config_field(field, val)
 
             if i < len(ordered) - 1:
                 st.divider()
 
+        update_run_plan_needs_user_input()
         remaining = (st.session_state.run_plan or {}).get("needs_user_input", []) or []
         if remaining:
             st.warning(f"Still missing: {', '.join(remaining)}")
@@ -5084,6 +5225,7 @@ def start_new_assistant_run_from_session() -> str | None:
         experiment_id,
         RUNS_DIR,
         SYMFLUENCE_DATA_DIR,
+        reuse_existing_domain_data=reuse_existing_domain_data_from_session(),
     )
     st.session_state.run_folder = run_folder
     build_real_run_files_from_state()
@@ -5298,6 +5440,53 @@ def summarize_plan_changes(before: dict, after: dict, *, user_message: str = "")
     return summarize_plan_changes_for_chat(before, after, user_message=user_message)
 
 
+def _chat_message_preserves_workflow_steps(
+    message: str,
+    *,
+    before: dict,
+    after: dict,
+) -> bool:
+    if list(after.get("steps") or []) != list(before.get("steps") or []):
+        return True
+    return bool(
+        re.search(
+            r"\b(add|added|remove|removed|drop|dropped|include|included|insert|inserted)\b",
+            message,
+            re.I,
+        )
+    )
+
+
+def reconcile_chat_reply(
+    reply: str,
+    before: dict,
+    after: dict,
+    *,
+    user_message: str = "",
+) -> str:
+    diff = summarize_plan_changes(before, after, user_message=user_message)
+    cfg = dict((after or {}).get("config") or {})
+    steps = list((after or {}).get("steps") or [])
+    if cfg:
+        needs = resolve_plan_missing_inputs(
+            cfg,
+            steps,
+            user_message or conversation_text_for_plan_rules(),
+        )
+    else:
+        needs = list((after or {}).get("needs_user_input") or [])
+    chunks: list[str] = []
+    if diff:
+        chunks.append(diff)
+    elif s(reply):
+        chunks.append(reply)
+    else:
+        chunks.append("Plan updated.")
+    if needs:
+        chunks.append("Still missing before execution: " + ", ".join(needs))
+    return "\n\n".join(chunks)
+
+
 def save_chat_messages_to_run_folder() -> None:
     run_folder = s(st.session_state.get("run_folder"))
     if not run_folder or run_folder in RUN_FOLDER_SKIP:
@@ -5348,6 +5537,7 @@ def call_llm_refine_run_plan(
     current_plan: dict,
     conversation_text: str,
     context_text: str,
+    preserve_workflow_steps: bool = False,
 ) -> tuple[str, dict, bool]:
     if provider_id == "gemini":
         return GeminiProvider(api_key=api_key).refine_run_plan(
@@ -5357,6 +5547,7 @@ def call_llm_refine_run_plan(
             conversation_text=conversation_text,
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
+            preserve_workflow_steps=preserve_workflow_steps,
         )
     if provider_id == "claude":
         return ClaudeProvider(api_key=api_key).refine_run_plan(
@@ -5366,6 +5557,7 @@ def call_llm_refine_run_plan(
             conversation_text=conversation_text,
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
+            preserve_workflow_steps=preserve_workflow_steps,
         )
     return OpenAIProvider(api_key=api_key).refine_run_plan(
         model=model,
@@ -5374,6 +5566,7 @@ def call_llm_refine_run_plan(
         conversation_text=conversation_text,
         context_text=context_text,
         data_dir=SYMFLUENCE_DATA_DIR,
+        preserve_workflow_steps=preserve_workflow_steps,
     )
 
 
@@ -5428,19 +5621,14 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             pre_patched,
             user_message=text,
             conversation_text=conversation_text,
+            emit_chat_messages=False,
         )
+        stored = st.session_state.run_plan or pre_patched
         append_chat_message(
             "assistant",
-            "Updated the plan steps from your message.",
+            reconcile_chat_reply("", current_plan, stored, user_message=text),
             kind="text",
         )
-        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
-        if missing:
-            append_chat_message(
-                "assistant",
-                "Still missing before execution: " + ", ".join(missing),
-                kind="warning",
-            )
         save_chat_messages_to_run_folder()
         return
 
@@ -5493,6 +5681,11 @@ def refine_plan_from_chat_message(user_text: str) -> None:
     working_plan = pre_patched if pre_changed else current_plan
     context_text = build_chat_refinement_context()
     model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
+    preserve_steps = _chat_message_preserves_workflow_steps(
+        text,
+        before=current_plan,
+        after=pre_patched if pre_changed else current_plan,
+    )
 
     try:
         reply, new_plan, updated = call_llm_refine_run_plan(
@@ -5503,6 +5696,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             current_plan=working_plan,
             conversation_text=conversation_text,
             context_text=context_text,
+            preserve_workflow_steps=preserve_steps,
         )
         candidate = new_plan if updated else working_plan
         final_plan, _ = apply_chat_message_to_plan(candidate, text)
@@ -5512,15 +5706,14 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 final_plan,
                 user_message=text,
                 conversation_text=conversation_text,
+                emit_chat_messages=False,
             )
-        append_chat_message("assistant", reply)
-        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
-        if missing:
-            append_chat_message(
-                "assistant",
-                "Still missing before execution: " + ", ".join(missing),
-                kind="warning",
-            )
+        stored = st.session_state.run_plan or final_plan
+        append_chat_message(
+            "assistant",
+            reconcile_chat_reply(reply, current_plan, stored, user_message=text),
+            kind="text",
+        )
         save_chat_messages_to_run_folder()
     except Exception as e:
         if pre_changed:
@@ -5971,13 +6164,15 @@ def render_workflow_assistant_panel() -> None:
                 help="Required for run_model or calibrate_model.",
             )
 
-            needs = st.session_state.run_plan.get("needs_user_input", []) or []
+            render_fix_missing_inputs_section(
+                (st.session_state.run_plan or {}).get("needs_user_input", []) or []
+            )
+            needs = (st.session_state.run_plan or {}).get("needs_user_input", []) or []
             if needs:
                 st.warning(
                     f"{len(needs)} required field(s) missing before execution. "
-                    "Use the section below or the Input tab."
+                    "Use the section above or the Input tab."
                 )
-                render_fix_missing_inputs_section(needs)
 
             assistant_shortcut_out = st.empty()
             wx.render_run_shortcuts_section(
@@ -6416,16 +6611,24 @@ def render_workflow_input_tab() -> None:
     
     ws1, ws2, ws3 = st.columns(3)
     with ws1:
-        st.session_state.domain_name = st.text_input(
+        st.text_input(
             "Domain name",
             st.session_state.domain_name,
             key=input_panel_widget_key("input_domain_name"),
+            on_change=on_input_domain_name_change,
+        )
+        st.session_state.domain_name = s(
+            st.session_state.get(input_panel_widget_key("input_domain_name"))
         )
     with ws2:
-        st.session_state.experiment_id = st.text_input(
+        st.text_input(
             "Experiment ID",
             st.session_state.experiment_id,
             key=input_panel_widget_key("input_experiment_id"),
+            on_change=on_input_experiment_id_change,
+        )
+        st.session_state.experiment_id = s(
+            st.session_state.get(input_panel_widget_key("input_experiment_id"))
         )
     with ws3:
         st.session_state.run_folder = st.text_input(
@@ -6575,6 +6778,7 @@ def render_workflow_input_tab() -> None:
             st.caption("Bounding box mode: click first corner, then opposite corner.")
 
     sync_input_panel_to_run_plan()
+    render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
         execute_bundle_fn=lambda key: execute_step_bundle(key, shortcut_output),
@@ -6968,16 +7172,22 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     else:
         cfg.pop("BOUNDING_BOX_COORDS", None)
 
-    dump_yaml(cfg, out_yaml)
-
-    write_run_metadata_files(outdir, plan, spec_dict)
-
     user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
     basin_domain = symfluence_domain_name(
         s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
         s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
     )
-    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
+    symfluence_domain = basin_domain
+    plan = ensure_skip_acquire_forcings_when_local_forcing(
+        plan,
+        user_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
+    plan = ensure_skip_model_agnostic_when_local_preprocessing(
+        plan,
+        user_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
     plan = ensure_skip_process_observed_when_local_streamflow(
         plan,
         user_request,
@@ -6985,7 +7195,22 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         symfluence_domain=symfluence_domain,
     )
     store_run_plan(plan)
+    plan_cfg = (plan or {}).get("config", {}) or {}
 
+    station_id = resolve_station_id_from_plan(plan_cfg, user_request, fallback=s(st.session_state.station_id))
+    if station_id:
+        cfg["STATION_ID"] = station_id
+    if plan_uses_local_data(plan_cfg, plan.get("steps") or [], user_request, data_dir=SYMFLUENCE_DATA_DIR) or (
+        symfluence_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, symfluence_domain)
+    ):
+        cfg["DOWNLOAD_WSC_DATA"] = False
+
+    dump_yaml(cfg, out_yaml)
+
+    # plan.json must match skip-adjusted steps (ensure_skip_* helpers run above).
+    write_run_metadata_files(outdir, plan, spec_dict)
+
+    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
     steps = plan.get("steps", []) or []
 
     pour_coords = (

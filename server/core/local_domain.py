@@ -71,8 +71,10 @@ def infer_reuse_source_domain(
 ) -> str:
     text = (user_request or "").lower()
     match = re.search(r"domain_([A-Za-z0-9_]+)", user_request or "")
-    if match and "lumped" in match.group(1).lower():
-        return match.group(1)
+    if match:
+        candidate = match.group(1)
+        if (Path(data_dir) / f"domain_{candidate}").is_dir():
+            return candidate
     if "bow_at_banff_lumped" in text:
         return "Bow_at_Banff_lumped"
     if any(
@@ -102,9 +104,15 @@ def user_request_reuses_local_domain_data(user_request: str) -> bool:
             "bow_at_banff_lumped",
             "reuse local",
             "existing local data",
+            "local data first",
+            "local-data recovery",
+            "local recovery",
+            "not a new domain",
+            "reuse existing local",
             "do not re-download",
             "do not download",
             "already on disk",
+            "before downloading",
         )
     )
 

@@ -122,6 +122,7 @@ class GeminiProvider:
         conversation_text: str = "",
         context_text: str = "",
         data_dir: Path | None = None,
+        preserve_workflow_steps: bool = False,
     ) -> tuple[str, dict[str, Any], bool]:
         refinement_prompt = PLAN_REFINEMENT_PROMPT_PATH.read_text(encoding="utf-8")
         schema = build_plan_refinement_schema()
@@ -143,6 +144,7 @@ class GeminiProvider:
             current_plan=current_plan,
             conversation_text=conversation_text or user_message,
             data_dir=data_dir,
+            preserve_workflow_steps=preserve_workflow_steps,
         )
 
     def generate_config_spec(self, *, model: str, user_request: str) -> Dict[str, Any]:
