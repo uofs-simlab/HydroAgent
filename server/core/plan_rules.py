@@ -346,6 +346,12 @@ def normalize_committed_plan_config(cfg: dict | None) -> dict:
     return out
 
 
+_DOMAIN_META_WORDS = frozenset({
+    "name", "called", "named", "the", "a", "an", "is", "for", "my", "our",
+    "this", "that", "as", "to", "of", "in", "with", "from",
+})
+
+
 def extract_explicit_domain_name_from_request(user_request: str) -> str:
     """Return domain_name only when the user explicitly names it in the prompt."""
     text = _s(user_request)
@@ -353,8 +359,14 @@ def extract_explicit_domain_name_from_request(user_request: str) -> str:
         return ""
 
     patterns = (
+        # High-specificity patterns first
         r"\buse\s+([A-Za-z0-9_\-]+)\s+as\s+(?:the\s+)?domain(?:\s+name|_name)\b",
         r"\b(?:set|change|update)\s+(?:the\s+)?domain(?:\s+name|_name)\s+(?:to\s+)?([A-Za-z0-9_\-]+)\b",
+        r"\bdomain\s+called\s+([A-Za-z0-9_\-]+)",
+        r"\b(?:called|named)\s+([A-Za-z0-9_\-]+)\s+for\s+experiment\b",
+        r"\bfor\s+domain\s+([A-Za-z0-9_\-]+)",
+        r"\bdomain\s+([A-Za-z0-9_\-]+)\s+with\s+experiment\b",
+        r"\bdomain\s+([A-Za-z0-9_\-]+)\s*,\s*experiment\b",
         r"\bdomain_name\s+to\s+([A-Za-z0-9_\-]+)",
         r"\b(?:set|change|update)\s+domain_name\s+to\s+([A-Za-z0-9_\-]+)",
         r"\bdomain_name\s*[=:]\s*[\"']?([A-Za-z0-9_\-]+)",
@@ -371,8 +383,130 @@ def extract_explicit_domain_name_from_request(user_request: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            return normalize_domain_name_token(match.group(1))
+            token = match.group(1)
+            if token.lower() in _DOMAIN_META_WORDS:
+                continue
+            return normalize_domain_name_token(token)
     return ""
+
+
+UI_DEFAULT_EXPERIMENT_START = "2001-01-01 01:00"
+UI_DEFAULT_EXPERIMENT_END = "2001-01-10 23:00"
+
+
+def extract_experiment_dates_from_request(user_request: str) -> tuple[str, str]:
+    """Parse common natural-language experiment windows from the user prompt."""
+    text = _s(user_request)
+    if not text:
+        return "", ""
+
+    year_range = re.search(r"\bfrom\s+(\d{4})\s+to\s+(\d{4})\b", text, flags=re.IGNORECASE)
+    if year_range:
+        start_year, end_year = year_range.group(1), year_range.group(2)
+        return f"{start_year}-01-01 01:00", f"{end_year}-12-31 23:00"
+
+    patterns = (
+        r"\bfrom\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
+        r"\bdates?\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
+        r"\b(?:experiment\s+window|run)\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
+        r"\b(?:calibration|evaluation)\s+period\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return f"{match.group(1)} 01:00", f"{match.group(2)} 23:00"
+    return "", ""
+
+
+def request_mentions_experiment_dates(user_request: str) -> bool:
+    text = _s(user_request)
+    if not text:
+        return False
+    if extract_experiment_dates_from_request(text) != ("", ""):
+        return True
+    return bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", text))
+
+
+def sanitize_planner_experiment_dates(cfg: dict, user_request: str) -> dict:
+    """Apply prompt dates and drop UI placeholder windows not mentioned by the user."""
+    out = dict(cfg or {})
+    start, end = extract_experiment_dates_from_request(user_request)
+    if start:
+        out["experiment_time_start"] = start
+    if end:
+        out["experiment_time_end"] = end
+
+    prompt_has_dates = request_mentions_experiment_dates(user_request)
+    prompt_mentions_2001 = bool(re.search(r"\b2001\b", _s(user_request)))
+
+    for key in ("experiment_time_start", "experiment_time_end"):
+        value = _s(out.get(key))
+        if not value:
+            continue
+        is_ui_default = value in {
+            UI_DEFAULT_EXPERIMENT_START,
+            UI_DEFAULT_EXPERIMENT_END,
+            UI_DEFAULT_EXPERIMENT_START[:10],
+            UI_DEFAULT_EXPERIMENT_END[:10],
+        }
+        is_2001 = value.startswith("2001-")
+        if is_ui_default and not prompt_has_dates:
+            out.pop(key, None)
+        elif is_2001 and not prompt_mentions_2001:
+            out.pop(key, None)
+    return out
+
+
+def apply_workflow_config_policies(cfg: dict, user_request: str = "") -> dict:
+    """Normalize discretization, lumped routing, and elevation extras from the prompt."""
+    from server.core.ui_config_fields import (
+        is_lumped_workflow,
+        normalize_discretization_value,
+        symfluence_discretization_from_plan,
+    )
+
+    out = dict(cfg or {})
+    disc = normalize_discretization_value(_s(out.get("discretization")))
+    if disc:
+        out["discretization"] = disc
+
+    if re.search(r"\b(?:do\s+not\s+use|without|no)\s+mizu\s*route\b", user_request, flags=re.IGNORECASE):
+        out.pop("routing_model", None)
+
+    if is_lumped_workflow(out, user_request):
+        extra = dict(out.get("extra_config") or {}) if isinstance(out.get("extra_config"), dict) else {}
+        extra.setdefault("ROUTING_DELINEATION", "lumped")
+        extra.setdefault("PARAMETER_REGIONALIZATION", "lumped")
+        out["extra_config"] = extra
+        out["discretization"] = symfluence_discretization_from_plan(out, user_request)
+
+    band_match = re.search(r"\belevation\s+band\s+size\s+(\d+)", user_request, flags=re.IGNORECASE)
+    if band_match:
+        extra = dict(out.get("extra_config") or {}) if isinstance(out.get("extra_config"), dict) else {}
+        extra["ELEVATION_BAND_SIZE"] = int(band_match.group(1))
+        out["extra_config"] = extra
+
+    if re.search(r"\bGRUs?\b", user_request, flags=re.IGNORECASE):
+        out["discretization"] = "GRUs"
+
+    return out
+
+
+def domain_name_literal_in_request(domain_name: str, user_request: str) -> bool:
+    """True when the prompt names this basin in a domain context (not weak inference)."""
+    token = normalize_domain_name_token(domain_name)
+    text = _s(user_request)
+    if not token or not text:
+        return False
+    if extract_explicit_domain_name_from_request(text).lower() == token.lower():
+        return True
+    patterns = (
+        rf"\bfor\s+domain\s+{re.escape(token)}\b",
+        rf"\bdomain\s+{re.escape(token)}\b",
+        rf"\bcalled\s+{re.escape(token)}\b",
+        rf"\bdomain\s+called\s+{re.escape(token)}\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def domain_name_needs_user_input(
@@ -397,6 +531,9 @@ def domain_name_needs_user_input(
 
     explicit = extract_explicit_domain_name_from_request(user_request)
     if explicit and explicit.lower() == name.lower():
+        return False
+
+    if domain_name_literal_in_request(name, user_request):
         return False
 
     if is_weak_domain_name(name):
@@ -441,13 +578,15 @@ def ensure_domain_name_user_input(
         cfg = mark_domain_name_confirmed(cfg)
     elif _s(cfg.get("domain_name")) and domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
         weak = is_weak_domain_name(_s(cfg.get("domain_name")))
-        cfg.pop("domain_name", None)
-        if weak:
+        if weak and not domain_name_literal_in_request(_s(cfg.get("domain_name")), user_request):
+            cfg.pop("domain_name", None)
             _append_plan_note(
                 out,
                 "Removed weak inferred domain_name; provide a filesystem-safe basin name "
                 "(e.g. Bow_at_Banff_semi_distributed).",
             )
+        elif weak and domain_name_literal_in_request(_s(cfg.get("domain_name")), user_request):
+            cfg = apply_user_provided_domain_name(cfg, _s(cfg.get("domain_name")))
 
     out["config"] = cfg
     if not domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
@@ -1141,7 +1280,7 @@ def _plan_steps_are_gated(steps: list[str] | None) -> bool:
 
 def _plan_ready_for_step_inference(plan: dict) -> bool:
     needs = set(plan.get("needs_user_input") or [])
-    return not (needs - {"bounding_box_coords"})
+    return not (needs - {"bounding_box_coords", "pour_point_coords"})
 
 
 def infer_gated_plan_steps(
@@ -1693,6 +1832,13 @@ def normalize_local_workflow_plan(
     out["config"] = cfg
     steps = list(out.get("steps") or [])
 
+    # Honor exclusive validate/dry-run requests before any step expansion.
+    if request_requests_validation_dry_run_only(user_request):
+        out["steps"] = ["validate_config", "dry_run"]
+        out = ensure_domain_name_user_input(out, user_request, data_dir=data_dir)
+        out = apply_explicit_step_constraints(out, user_request)
+        return _drop_satisfied_needs_user_input(out)
+
     out = try_restore_local_recovery_plan(out, user_request, data_dir=data_dir)
     cfg = dict(out.get("config") or {})
     out["config"] = cfg
@@ -1710,6 +1856,7 @@ def normalize_local_workflow_plan(
         out = ensure_local_data_access_in_plan(out)
     out = ensure_online_data_when_missing(out, user_request, data_dir=data_dir)
     cfg = dict(out.get("config") or {})
+    cfg = apply_workflow_config_policies(cfg, user_request)
     out["config"] = cfg
     steps = list(out.get("steps") or [])
 
@@ -1723,6 +1870,10 @@ def normalize_local_workflow_plan(
         if _plan_steps_are_gated(steps):
             out = infer_gated_plan_steps(out, user_request, data_dir=data_dir)
             steps = list(out.get("steps") or [])
+
+    out = apply_explicit_step_constraints(out, user_request)
+    steps = list(out.get("steps") or [])
+    cfg = dict(out.get("config") or {})
 
     if not plan_uses_local_data(cfg, steps, user_request, data_dir=data_dir):
         return _drop_satisfied_needs_user_input(out)
@@ -1754,11 +1905,96 @@ def extract_steps_from_request(user_request: str, allowed_steps: list[str]) -> l
     return found
 
 
+def _user_forbids_step_inference(user_request: str, step_keyword: str) -> bool:
+    """True when the prompt explicitly forbids a step (e.g. 'do not run the model')."""
+    text = _s(user_request).lower()
+    kw = step_keyword.lower()
+    neg = (
+        rf"\b(?:do\s+not|don'?t|without|skip|omit|exclude|no)\s+(?:\w+\s+){{0,3}}{re.escape(kw)}\b",
+        rf"\b(?:do\s+not|don'?t)\s+{re.escape(kw)}\b",
+    )
+    return any(re.search(p, text) for p in neg)
+
+
+def request_forbids_run_model(user_request: str) -> bool:
+    return (
+        _user_forbids_step_inference(user_request, "run the model")
+        or _user_forbids_step_inference(user_request, "run model")
+        or _user_forbids_step_inference(user_request, "run_model")
+        or _user_forbids_step_inference(user_request, "model run")
+    )
+
+
+def request_forbids_calibrate(user_request: str) -> bool:
+    return (
+        _user_forbids_step_inference(user_request, "calibrat")
+        or _user_forbids_step_inference(user_request, "calibration")
+    )
+
+
+def request_forbids_postprocess(user_request: str) -> bool:
+    return (
+        _user_forbids_step_inference(user_request, "postprocess")
+        or _user_forbids_step_inference(user_request, "postprocessing")
+        or _user_forbids_step_inference(user_request, "post-process")
+    )
+
+
+def request_requests_validation_dry_run_only(user_request: str) -> bool:
+    """True when the user asks only for validate_config / dry_run."""
+    text = _s(user_request).lower()
+    if not text:
+        return False
+    patterns = (
+        r"\bonly\s+validate_config\s+and\s+dry_run\b",
+        r"\bonly\s+validate(?:_config)?\s+and\s+dry[_\s-]?run\b",
+        r"\bvalidate_config\s+and\s+dry_run\s+only\b",
+        r"\bonly\s+(?:do\s+)?validate(?:_config)?\s+and\s+(?:a\s+)?dry[_\s-]?run\b",
+        r"\bvalidate(?:_config)?\s+and\s+(?:run\s+a\s+)?dry[_\s-]?run\b.*\b(?:skip|do\s+not|don'?t|without)\b",
+    )
+    return any(re.search(p, text) for p in patterns)
+
+
+def apply_explicit_step_constraints(plan: dict, user_request: str = "") -> dict:
+    """Honor exclusive validate/dry-run requests and negative step constraints."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    text = _s(user_request)
+    if request_requests_validation_dry_run_only(text):
+        out["steps"] = ["validate_config", "dry_run"]
+        _append_plan_note(out, "Restricted steps to validate_config and dry_run per user request.")
+        return out
+
+    steps = list(out.get("steps") or [])
+    if not steps:
+        return out
+
+    remove: set[str] = set()
+    if request_forbids_run_model(text):
+        remove.update({"run_model", "calibrate_model"})
+    if request_forbids_calibrate(text) or not re.search(r"\bcalibrat", text.lower()):
+        remove.add("calibrate_model")
+    if request_forbids_postprocess(text):
+        remove.add("postprocess_results")
+
+    if remove:
+        out["steps"] = [step for step in steps if step not in remove]
+    return out
+
+
 def infer_goal_steps_from_request(user_request: str) -> list[str]:
     """Infer high-level workflow goals from natural-language hydrology prompts."""
     text = _s(user_request).lower()
     if not text:
         return []
+
+    if request_requests_validation_dry_run_only(user_request):
+        return ["validate_config", "dry_run"]
+
+    forbids_model = request_forbids_run_model(user_request)
+    forbids_calibrate = request_forbids_calibrate(user_request)
+    forbids_postprocess = request_forbids_postprocess(user_request)
 
     goals: list[str] = []
 
@@ -1769,14 +2005,34 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if re.search(r"\bprocess_observed\b", text) or re.search(r"\bobserved\s+streamflow\b", text):
         add("process_observed_data")
 
-    if (
+    if not forbids_model and (
         re.search(r"\bfrom\s+scratch\b", text)
         or re.search(r"\brun\s+(?:the\s+)?model\b", text)
+        or re.search(r"\b(?:and|then)\s+(?:the\s+)?model\b", text)
         or re.search(r"\brun\s+summa\b", text)
         or re.search(r"\bsumma\s+workflow\b", text)
         or (re.search(r"\bworkflow\b", text) and re.search(r"\bsumma\b", text))
     ):
         add("run_model")
+
+    if not forbids_calibrate and re.search(r"\bcalibrat(?:e|ion)\s+(?:the\s+)?model\b", text):
+        add("calibrate_model")
+
+    # Require an affirmative postprocess mention, not "skip postprocessing".
+    if not forbids_postprocess and re.search(
+        r"\b(?:include\s+)?postprocess(?:ing|_results)?\b", text
+    ) and not re.search(
+        r"\b(?:do\s+not|don'?t|without|skip|omit|exclude|no)\b.{0,20}\bpostprocess",
+        text,
+    ):
+        add("postprocess_results")
+
+    if re.search(r"\bpreprocess", text):
+        add("model_agnostic_preprocessing")
+        add("model_specific_preprocessing")
+
+    if re.search(r"\bsetup\b", text):
+        add("setup_project")
 
     if re.search(r"\bsemi[- ]?distributed\b", text):
         add("define_domain")
@@ -1785,10 +2041,14 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if re.search(r"\bprepare\s+.*\binput\b", text) or re.search(r"\bsumma\s+input\b", text):
         add("model_specific_preprocessing")
 
-    if re.search(r"\bforcing\b", text):
+    if re.search(r"\bforcings?\b", text) or re.search(r"\bdownload\b.*\bforcings?\b", text):
         add("acquire_forcings")
 
-    if re.search(r"\bacquire\s+attribute", text) or re.search(r"\battributes\s+and\b", text):
+    if (
+        re.search(r"\bacquire\s+attribute", text)
+        or re.search(r"\bdownload\s+attribute", text)
+        or re.search(r"\battributes\s+and\b", text)
+    ):
         add("acquire_attributes")
 
     if (
@@ -1799,6 +2059,22 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
         add("define_domain")
 
     for step in extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES):
+        if step == "run_model" and forbids_model:
+            continue
+        if step == "calibrate_model" and forbids_calibrate:
+            continue
+        if step == "postprocess_results" and forbids_postprocess:
+            continue
+        if step == "dry_run":
+            add(step)
+            continue
         add(step)
+
+    if forbids_model:
+        goals = [g for g in goals if g not in ("run_model", "calibrate_model")]
+    if forbids_calibrate:
+        goals = [g for g in goals if g != "calibrate_model"]
+    if forbids_postprocess:
+        goals = [g for g in goals if g != "postprocess_results"]
 
     return goals

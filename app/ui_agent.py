@@ -282,6 +282,54 @@ def format_datetime_value(date_value, time_value) -> str:
     return f"{date_value:%Y-%m-%d} {time_value:%H:%M}"
 
 
+def _is_ui_placeholder_experiment_date(value: str, *, which: str) -> bool:
+    from server.core.plan_rules import UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_START
+
+    value = s(value)
+    if which == "start":
+        return value in {UI_DEFAULT_EXPERIMENT_START, UI_DEFAULT_EXPERIMENT_START[:10]}
+    return value in {UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_END[:10]}
+
+
+def commit_experiment_datetime_from_widgets(
+    *,
+    prev_value: str,
+    widget_value: str,
+    which: str,
+) -> str:
+    """Keep Input-tab placeholder dates out of session/plan until the user or plan sets them."""
+    prev_value = s(prev_value)
+    widget_value = s(widget_value)
+    if prev_value:
+        return widget_value
+    if widget_value and not _is_ui_placeholder_experiment_date(widget_value, which=which):
+        return widget_value
+    return ""
+
+
+def ui_experiment_dates_for_plan() -> tuple[str, str]:
+    """Return dates to write into the plan, omitting uncommitted UI placeholders."""
+    from server.core.plan_rules import request_mentions_experiment_dates
+
+    tstart = s(st.session_state.tstart)
+    tend = s(st.session_state.tend)
+    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    prompt_has_dates = request_mentions_experiment_dates(prompt)
+    if tstart and (
+        prompt_has_dates or not _is_ui_placeholder_experiment_date(tstart, which="start")
+    ):
+        pass
+    else:
+        tstart = ""
+    if tend and (
+        prompt_has_dates or not _is_ui_placeholder_experiment_date(tend, which="end")
+    ):
+        pass
+    else:
+        tend = ""
+    return tstart, tend
+
+
 def bump_input_panel_widget_versions() -> None:
     """Refresh Input-tab widgets that cache values by Streamlit widget key."""
     bump_all_input_widget_versions()
@@ -2764,9 +2812,10 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
         "domain_def": s(st.session_state.domain_def),
         "hydrological_model": current_hydrological_model(),
         "forcing_dataset": s(st.session_state.forcing_dataset),
-        "experiment_time_start": s(st.session_state.tstart),
-        "experiment_time_end": s(st.session_state.tend),
     }
+    plan_tstart, plan_tend = ui_experiment_dates_for_plan()
+    values["experiment_time_start"] = plan_tstart
+    values["experiment_time_end"] = plan_tend
 
     st.session_state.selected_pour_point = values["pour_point_coords"]
     st.session_state.selected_bounding_box = values["bounding_box_coords"]
@@ -4384,6 +4433,8 @@ def run_cmd_stream(cmd: list[str], cwd: Path, output_box, log_path: Path | None 
 
 
 def augment_request_with_ui(nl: str) -> str:
+    from server.core.plan_rules import UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_START
+
     lines = [s(nl), "", "Optional UI inputs (use ONLY if non-empty):"]
 
     if s(st.session_state.domain_name):
@@ -4403,10 +4454,12 @@ def augment_request_with_ui(nl: str) -> str:
 
     if s(st.session_state.domain_def):
         lines.append(f"- domain_def: {s(st.session_state.domain_def)}")
-    if s(st.session_state.tstart):
-        lines.append(f"- experiment_time_start: {s(st.session_state.tstart)}")
-    if s(st.session_state.tend):
-        lines.append(f"- experiment_time_end: {s(st.session_state.tend)}")
+    tstart = s(st.session_state.tstart)
+    tend = s(st.session_state.tend)
+    if tstart and tstart != UI_DEFAULT_EXPERIMENT_START:
+        lines.append(f"- experiment_time_start: {tstart}")
+    if tend and tend != UI_DEFAULT_EXPERIMENT_END:
+        lines.append(f"- experiment_time_end: {tend}")
 
     lines = wx.augment_request_with_advanced(lines)
     lines = wx.augment_request_with_calibration(lines)
@@ -4643,22 +4696,51 @@ def apply_plan_config_to_ui(plan: dict):
     if forcing_dataset:
         st.session_state.forcing_dataset = forcing_dataset
 
+    dates_changed = False
     if tstart:
         st.session_state.tstart = tstart
+        dates_changed = True
+    elif _is_ui_placeholder_experiment_date(s(st.session_state.tstart), which="start") or not s(
+        st.session_state.tstart
+    ):
+        # Planner omitted dates — do not keep Input-tab placeholder defaults.
+        if s(st.session_state.tstart):
+            dates_changed = True
+        st.session_state.tstart = ""
 
     if tend:
         st.session_state.tend = tend
+        dates_changed = True
+    elif _is_ui_placeholder_experiment_date(s(st.session_state.tend), which="end") or not s(
+        st.session_state.tend
+    ):
+        if s(st.session_state.tend):
+            dates_changed = True
+        st.session_state.tend = ""
 
     mpi_val = resolve_num_processes_from_plan_cfg(cfgp)
     if mpi_val is not None:
         st.session_state.mpi = mpi_val
 
     bump_input_panel_widget_versions()
+    if dates_changed:
+        from widget_keys import bump_experiment_datetime_widget_version
+
+        bump_experiment_datetime_widget_version()
     mark_spatial_inputs_stale()
 
     sync_run_folder_from_session()
 
     wx.apply_advanced_config_from_plan(cfgp)
+    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    if user_forbids_mizuroute(prompt):
+        st.session_state.routing_model = ""
+        cfgp.pop("routing_model", None)
+        cfgp.pop("ROUTING_MODEL", None)
+        extra = cfgp.get("extra_config")
+        if isinstance(extra, dict):
+            extra.pop("routing_model", None)
+            extra.pop("ROUTING_MODEL", None)
     st.session_state.refresh_spatial_inputs = True
 
 
@@ -6606,8 +6688,10 @@ def render_workflow_input_tab() -> None:
 
     render_start_load_run_section()
     
-    start_dt = parse_datetime_value(st.session_state.tstart, dt.datetime(2001, 1, 1, 1, 0))
-    end_dt = parse_datetime_value(st.session_state.tend, dt.datetime(2001, 1, 10, 23, 0))
+    prev_tstart = s(st.session_state.tstart)
+    prev_tend = s(st.session_state.tend)
+    start_dt = parse_datetime_value(prev_tstart, dt.datetime(2001, 1, 1, 1, 0))
+    end_dt = parse_datetime_value(prev_tend, dt.datetime(2001, 1, 10, 23, 0))
     
     ws1, ws2, ws3 = st.columns(3)
     with ws1:
@@ -6697,7 +6781,11 @@ def render_workflow_input_tab() -> None:
             value=start_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_start_time"),
         )
-        st.session_state.tstart = format_datetime_value(start_date, start_time)
+        st.session_state.tstart = commit_experiment_datetime_from_widgets(
+            prev_value=prev_tstart,
+            widget_value=format_datetime_value(start_date, start_time),
+            which="start",
+        )
     with ws9:
         end_date = st.date_input(
             "End date",
@@ -6709,9 +6797,19 @@ def render_workflow_input_tab() -> None:
             value=end_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_end_time"),
         )
-        st.session_state.tend = format_datetime_value(end_date, end_time)
-    
-    st.caption(f"Experiment time window: `{st.session_state.tstart}` → `{st.session_state.tend}`")
+        st.session_state.tend = commit_experiment_datetime_from_widgets(
+            prev_value=prev_tend,
+            widget_value=format_datetime_value(end_date, end_time),
+            which="end",
+        )
+
+    if s(st.session_state.tstart) or s(st.session_state.tend):
+        st.caption(
+            f"Experiment time window: `{st.session_state.tstart or '—'}` → "
+            f"`{st.session_state.tend or '—'}`"
+        )
+    else:
+        st.caption("Experiment time window: not set (placeholder dates are display-only).")
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown(
@@ -6868,10 +6966,23 @@ def sync_preview_artifacts() -> None:
         plan_to_save["config"]["domain_def"] = s(st.session_state.domain_def)
     if s(st.session_state.forcing_dataset):
         plan_to_save["config"]["forcing_dataset"] = s(st.session_state.forcing_dataset)
-    if s(st.session_state.tstart):
-        plan_to_save["config"]["experiment_time_start"] = s(st.session_state.tstart)
-    if s(st.session_state.tend):
-        plan_to_save["config"]["experiment_time_end"] = s(st.session_state.tend)
+    plan_tstart, plan_tend = ui_experiment_dates_for_plan()
+    if plan_tstart:
+        plan_to_save["config"]["experiment_time_start"] = plan_tstart
+    else:
+        plan_to_save["config"].pop("experiment_time_start", None)
+    if plan_tend:
+        plan_to_save["config"]["experiment_time_end"] = plan_tend
+    else:
+        plan_to_save["config"].pop("experiment_time_end", None)
+    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    if user_forbids_mizuroute(prompt):
+        plan_to_save["config"].pop("routing_model", None)
+        plan_to_save["config"].pop("ROUTING_MODEL", None)
+        extra = plan_to_save["config"].get("extra_config")
+        if isinstance(extra, dict):
+            extra.pop("routing_model", None)
+            extra.pop("ROUTING_MODEL", None)
 
     mpi_val = resolve_num_processes_from_plan_cfg(plan_to_save.get("config") or {}) or int(
         st.session_state.mpi

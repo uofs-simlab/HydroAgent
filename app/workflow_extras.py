@@ -392,11 +392,15 @@ def get_advanced_config_values(plan_cfg: dict | None = None) -> dict[str, str]:
 
 
 def apply_advanced_config_from_plan(cfg: dict) -> None:
+    from server.core.ui_config_fields import user_forbids_mizuroute
+
     extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
     for session_key, yaml_key, _ in ADVANCED_SESSION_FIELDS:
         val = s(cfg.get(session_key)) or s(cfg.get(yaml_key)) or s(extra.get(session_key)) or s(extra.get(yaml_key))
         if val:
             st.session_state[session_key] = val
+    if user_forbids_mizuroute(_user_request_for_advanced_sync()):
+        st.session_state.routing_model = ""
     apply_calibration_config_from_plan(cfg)
 
 
@@ -416,17 +420,42 @@ def merge_advanced_into_spec(spec: dict, plan_cfg: dict | None = None) -> dict:
     return merge_calibration_into_spec(spec, plan_cfg)
 
 
+def _user_request_for_advanced_sync() -> str:
+    return s(st.session_state.get("user_prompt")) or s(st.session_state.get("nl_request"))
+
+
 def sync_advanced_config_to_plan() -> None:
+    from server.core.ui_config_fields import user_forbids_mizuroute
+
     if not st.session_state.get("run_plan"):
         return
     plan = st.session_state.run_plan
     plan.setdefault("config", {})
     values = get_advanced_config_values()
+    user_request = _user_request_for_advanced_sync()
+    if user_forbids_mizuroute(user_request):
+        values.pop("routing_model", None)
+        st.session_state.routing_model = ""
+        plan["config"].pop("routing_model", None)
+        plan["config"].pop("ROUTING_MODEL", None)
     extra = {k: v for k, v in values.items() if v}
+    existing_extra = plan["config"].get("extra_config")
+    if isinstance(existing_extra, dict):
+        merged_extra = dict(existing_extra)
+        merged_extra.update(extra)
+        if user_forbids_mizuroute(user_request):
+            merged_extra.pop("routing_model", None)
+            merged_extra.pop("ROUTING_MODEL", None)
+        extra = {k: v for k, v in merged_extra.items() if v}
     if extra:
         plan["config"]["extra_config"] = extra
         for k, v in extra.items():
             plan["config"][k] = v
+    elif "extra_config" in plan["config"] and user_forbids_mizuroute(user_request):
+        extra_cfg = plan["config"].get("extra_config")
+        if isinstance(extra_cfg, dict):
+            extra_cfg.pop("routing_model", None)
+            extra_cfg.pop("ROUTING_MODEL", None)
     st.session_state.run_plan = plan
 
 
@@ -457,9 +486,16 @@ def render_advanced_config_section() -> None:
                 value=s(st.session_state.get("station_id")),
                 key=input_panel_widget_key("adv_station_id"),
             )
+            from server.core.ui_config_fields import user_forbids_mizuroute
+
+            routing_default = (
+                ""
+                if user_forbids_mizuroute(_user_request_for_advanced_sync())
+                else "mizuRoute"
+            )
             st.session_state.routing_model = st.text_input(
                 "Routing model",
-                value=s(st.session_state.get("routing_model")) or "mizuRoute",
+                value=s(st.session_state.get("routing_model")) or routing_default,
                 key=input_panel_widget_key("adv_routing_model"),
             )
         with c2:
@@ -494,7 +530,13 @@ def render_advanced_config_section() -> None:
 
 
 def augment_request_with_advanced(lines: list[str]) -> list[str]:
+    from server.core.ui_config_fields import user_forbids_mizuroute
+
+    user_request = _user_request_for_advanced_sync()
+    forbid_mizu = user_forbids_mizuroute(user_request)
     for session_key, _, label in ADVANCED_SESSION_FIELDS:
+        if session_key == "routing_model" and forbid_mizu:
+            continue
         val = s(st.session_state.get(session_key))
         if val:
             lines.append(f"- {session_key}: {val}")
