@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from server.core.safe_subprocess import launch_detached
+
 from server.core.local_domain import (
     copy_reusable_domain_artifacts,
     infer_reuse_source_domain,
@@ -470,15 +472,9 @@ def launch_background_workflow(run_dir: Path, job: dict[str, Any]) -> int:
     workflow_job_path(run_dir).write_text(json.dumps(job, indent=2), encoding="utf-8")
     runner = Path(__file__).resolve().parents[2] / "tools" / "run_workflow_plan.py"
     cmd = [sys.executable, str(runner), "--run-dir", str(run_dir)]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(runner.parents[1]),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    workflow_pid_path(run_dir).write_text(str(proc.pid), encoding="utf-8")
-    return proc.pid
+    pid = launch_detached(cmd, cwd=runner.parents[1])
+    workflow_pid_path(run_dir).write_text(str(pid), encoding="utf-8")
+    return pid
 
 
 def sync_workflow_execution_state(run_dir: Path, session_state: Any) -> bool:

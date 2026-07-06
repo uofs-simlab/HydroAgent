@@ -5,6 +5,7 @@ streamlit>=1.40,<2
 streamlit-folium>=0.18
 folium>=0.15
 geopandas>=0.14
+matplotlib>=3.8
 pandas>=2.0
 PyYAML>=6.0
 openai>=1.40
@@ -13,3 +14,8 @@ anthropic>=0.40
 
 # Optional helpers (Results tab: mizuRoute CSV tools)
 netCDF4>=1.6
+
+# LangPrompt integration (prompt library / embeddings)
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+numpy>=1.24

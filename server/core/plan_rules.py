@@ -117,7 +117,8 @@ def request_indicates_local_data_reuse(
         return True
 
     cfg = cfg or {}
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     if any(_s(cfg.get(key)).upper() == "LOCAL" for key in ("DATA_ACCESS", "data_access")):
         return True
     if any(_s(extra.get(key)).upper() == "LOCAL" for key in ("DATA_ACCESS", "data_access")):
@@ -312,7 +313,8 @@ def is_weak_domain_name(name: str) -> bool:
 
 
 def domain_name_confirmed_in_plan(cfg: dict) -> bool:
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     return bool(extra.get("domain_name_confirmed") or extra.get("DOMAIN_NAME_CONFIRMED"))
 
 
@@ -521,7 +523,7 @@ def domain_catchment_hru_count(data_dir: str | Path, domain_name: str, experimen
             gdf = gpd.read_file(path)
             for col in ("HRU_ID", "hru_id", "hruId"):
                 if col in gdf.columns:
-                    count = int(gdf[col].nunique())
+                    count = len(gdf[col].unique())
                     break
             if count == 0 and len(gdf) > 0:
                 count = len(gdf)
@@ -548,6 +550,26 @@ def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str
         return False
     forcing_dir = domain_root(data_dir, domain_name) / "data" / "forcing" / "SUMMA_input"
     return any(forcing_dir.glob("*.nc"))
+
+
+def domain_has_forcing_intersection(
+    data_dir: str | Path | None,
+    domain_name: str,
+    *,
+    forcing_dataset: str = "ERA5",
+) -> bool:
+    """True when model_agnostic_preprocessing intersect output exists."""
+    if not data_dir or not _s(domain_name):
+        return False
+    name = _s(domain_name)
+    base = (
+        domain_root(data_dir, name)
+        / "shapefiles"
+        / "catchment_intersection"
+        / "with_forcing"
+        / f"{name}_{_s(forcing_dataset) or 'ERA5'}_intersected_shapefile"
+    )
+    return base.with_suffix(".shp").is_file() or base.with_suffix(".csv").is_file()
 
 
 def domain_forcing_raw_data_dir(data_dir: str | Path, domain_name: str) -> Path:
@@ -804,9 +826,11 @@ def ensure_skip_process_observed_when_local_streamflow(
 
 def domain_has_local_attributes(data_dir: str | Path | None, domain_name: str) -> bool:
     """True when DEM plus at least one land/soil raster already exists on disk."""
+    if not data_dir or not _s(domain_name):
+        return False
     if not domain_has_local_dem(data_dir, domain_name):
         return False
-    root = domain_attributes_root(Path(data_dir), domain_name)
+    root = domain_attributes_root(data_dir, domain_name)
     patterns = (
         "elevation/dem/*.tif",
         "landclass/**/*.tif",
@@ -889,7 +913,8 @@ def user_requires_fresh_cloud_workflow(user_request: str, cfg: dict | None = Non
     if any(phrase in text for phrase in _FRESH_CLOUD_WORKFLOW_PHRASES):
         return True
     cfg = cfg or {}
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     data_access = ""
     for key in ("data_access", "DATA_ACCESS"):
         data_access = _s(cfg.get(key) or extra.get(key)).upper()
@@ -1017,7 +1042,8 @@ def plan_uses_local_data(
     if any(p in text for p in _LOCAL_DATA_REUSE_PHRASES):
         return True
 
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     data_access_local = any(
         _s(cfg.get(key)).upper() == "LOCAL" or _s(extra.get(key)).upper() == "LOCAL"
         for key in ("DATA_ACCESS", "data_access")
