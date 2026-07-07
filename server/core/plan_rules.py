@@ -598,7 +598,11 @@ def domain_has_local_era5_raw_forcing(data_dir: str | Path | None, domain_name: 
 
 
 def ensure_local_data_access_in_plan(plan: dict) -> dict:
-    """Set plan config to LOCAL data access (no cloud MAF/gistool fetch)."""
+    """Set plan config to LOCAL data access (reuse on-disk data, no MAF/gistool).
+
+    SYMFLUENCE treats ``LOCAL`` like ``CLOUD`` for ``acquire_*`` steps, skipping
+    files that already exist and downloading only missing artifacts.
+    """
     if not isinstance(plan, dict):
         return plan
     out = dict(plan)

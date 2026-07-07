@@ -2259,6 +2259,11 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
             needs_cloud = True
         if needs_cloud:
             data_access = "cloud"
+        elif "acquire_attributes" in run_steps and domain_name and domain_has_local_dem(
+            SYMFLUENCE_DATA_DIR, domain_name
+        ):
+            # SYMFLUENCE LOCAL mode reuses existing rasters and fills gaps via cloud.
+            data_access = "local"
     elif domain_name and not domain_has_local_dem(SYMFLUENCE_DATA_DIR, domain_name):
         if {"define_domain", "discretize_domain", "acquire_attributes"} & set(run_steps):
             data_access = "cloud"
