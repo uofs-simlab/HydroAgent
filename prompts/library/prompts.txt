@@ -362,3 +362,11 @@ EVALUATION_PERIOD: 2016-01-01, 2020-12-31
 20:
 Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
 2004-01-10 23:00 with experiment id exp_001.
+
+21:
+Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00
+
+22:
+Run Fuse for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00

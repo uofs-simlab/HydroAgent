@@ -112,6 +112,7 @@ from server.core.local_domain import (
     legacy_catchment_path,
     local_catchment_needs_restore,
     pour_point_inside_bounding_box,
+    ensure_bounding_box_contains_pour_point,
     restore_local_domain_artifacts,
     seed_mac_duplicate_domain_from_basin,
     summa_preprocessing_hru_mismatch,
@@ -135,12 +136,14 @@ from server.core.plan_rules import (
     apply_chat_step_edits,
     apply_chat_step_order_edits,
     domain_catchment_shapefile_candidates,
+    domain_catchment_hru_count,
     domain_has_local_dem,
     domain_has_local_era5_raw_forcing,
     domain_has_local_streamflow,
     domain_has_local_summa_forcing,
     domain_has_forcing_intersection,
     domain_has_local_discretization,
+    domain_has_local_river_basins,
     domain_has_complete_local_workflow,
     domain_name_needs_user_input,
     ensure_skip_acquire_forcings_when_local_forcing,
@@ -6616,6 +6619,22 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
     else:
         real_spec_dict.pop("pour_point_coords", None)
 
+    if current_pour_local and current_bbox_local:
+        fixed_bbox, bbox_changed, bbox_note = ensure_bounding_box_contains_pour_point(
+            current_pour_local,
+            current_bbox_local,
+        )
+        if bbox_changed:
+            current_bbox_local = fixed_bbox
+            real_spec_dict["bounding_box_coords"] = fixed_bbox
+            st.session_state.selected_bounding_box = fixed_bbox
+            plan = dict(st.session_state.run_plan or {})
+            plan_cfg = dict(plan.get("config") or {})
+            plan_cfg["bounding_box_coords"] = fixed_bbox
+            plan["config"] = plan_cfg
+            st.session_state.run_plan = plan
+            append_session_execution_log(f"\n[Assistant] {bbox_note}\n")
+
     if current_bbox_local:
         real_spec_dict["bounding_box_coords"] = current_bbox_local
     else:
@@ -6750,12 +6769,47 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
             "(north/west/south/east)."
         )
 
+    if step == "define_domain":
+        pour = s(cfg.get("POUR_POINT_COORDS"))
+        bbox = s(cfg.get("BOUNDING_BOX_COORDS"))
+        ok, msg = pour_point_inside_bounding_box(pour, bbox)
+        if not ok:
+            return (
+                f"define_domain cannot delineate a watershed when the pour point is outside "
+                f"the bounding box. {msg}"
+            )
+
+    if step == "discretize_domain" and domain_name:
+        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+            return (
+                "discretize_domain needs river basin shapefiles from define_domain first. "
+                f"No {domain_name}_riverBasins_*.shp under "
+                f"SYMFLUENCE_data/domain_{domain_name}/shapefiles/river_basins/. "
+                "Re-run define_domain and confirm that shapefile exists before HRU. "
+                "If define_domain reported success but the file is missing, check the pour "
+                "point lies inside the bounding box (north/west/south/east)."
+            )
+
     if step == "model_agnostic_preprocessing" and domain_name:
         missing: list[str] = []
-        if not domain_has_local_discretization(
+        hru_count = domain_catchment_hru_count(
             SYMFLUENCE_DATA_DIR, domain_name, experiment_id
-        ):
-            missing.extend(["define_domain", "discretize_domain"])
+        )
+        has_catchment_shp = any(
+            path.is_file()
+            for path in domain_catchment_shapefile_candidates(
+                SYMFLUENCE_DATA_DIR, domain_name, experiment_id
+            )
+        )
+        if hru_count < 1:
+            if has_catchment_shp:
+                missing.append(
+                    "discretize_domain (catchment shapefile is empty — widen the bounding box and re-run HRU)"
+                )
+            elif not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+                missing.append("define_domain")
+            else:
+                missing.append("discretize_domain")
         if not (
             domain_has_local_era5_raw_forcing(SYMFLUENCE_DATA_DIR, domain_name)
             or domain_has_local_summa_forcing(SYMFLUENCE_DATA_DIR, domain_name)
@@ -6764,7 +6818,7 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
         if missing:
             return (
                 "model_agnostic_preprocessing needs catchment HRUs and forcing data first. "
-                f"Run these steps before MSP: {', '.join(dict.fromkeys(missing))}."
+                f"Run these steps before MAP: {', '.join(dict.fromkeys(missing))}."
             )
 
     if step == "model_specific_preprocessing" and domain_name:
@@ -7584,11 +7638,27 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         or s(st.session_state.selected_bounding_box)
         or bounding_box_input_value()
     )
-    bbox_ok, bbox_msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
-    if pour_coords and bbox_coords and not bbox_ok:
-        st.error(bbox_msg)
-        st.session_state.workflow_executing = False
-        st.stop()
+    if pour_coords and bbox_coords:
+        fixed_bbox, bbox_changed, bbox_note = ensure_bounding_box_contains_pour_point(
+            pour_coords,
+            bbox_coords,
+        )
+        if bbox_changed:
+            bbox_coords = fixed_bbox
+            st.session_state.selected_bounding_box = fixed_bbox
+            plan_cfg = dict(plan.get("config") or {})
+            plan_cfg["bounding_box_coords"] = fixed_bbox
+            plan["config"] = plan_cfg
+            store_run_plan(plan)
+            cfg["BOUNDING_BOX_COORDS"] = fixed_bbox
+            dump_yaml(cfg, out_yaml)
+            st.warning(bbox_note)
+        else:
+            bbox_ok, bbox_msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
+            if not bbox_ok:
+                st.error(bbox_msg)
+                st.session_state.workflow_executing = False
+                st.stop()
 
     danger_confirmed = s(st.session_state.get("danger_phrase", "")) == "RUN"
     danger_found = [step for step in steps if step in DANGER_STEPS]

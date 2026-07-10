@@ -538,11 +538,25 @@ def domain_has_local_discretization(
     domain_name: str,
     experiment_id: str = "run_1",
     *,
-    min_hrus: int = 2,
+    min_hrus: int = 1,
 ) -> bool:
     if not data_dir or not _s(domain_name):
         return False
     return domain_catchment_hru_count(data_dir, domain_name, experiment_id) >= min_hrus
+
+
+def domain_has_local_river_basins(
+    data_dir: str | Path | None,
+    domain_name: str,
+) -> bool:
+    """True when define_domain produced at least one river_basins shapefile."""
+    if not data_dir or not _s(domain_name):
+        return False
+    basins_dir = domain_root(data_dir, domain_name) / "shapefiles" / "river_basins"
+    if not basins_dir.is_dir():
+        return False
+    name = _s(domain_name)
+    return any(basins_dir.glob(f"{name}_riverBasins_*.shp"))
 
 
 def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str) -> bool:
