@@ -90,4 +90,6 @@ def test_resolve_plan_step_dependencies_expands_minimal_cloud_plan(
     assert "validate_config" in steps
     assert "setup_project" in steps
     assert "run_model" in steps
+    assert "create_pour_point" in steps
+    assert steps.index("create_pour_point") < steps.index("define_domain")
     assert len(steps) > 3

@@ -122,7 +122,7 @@ def seed_mac_duplicate_domain_from_basin(
     basin_domain: str,
     symfluence_domain: str,
 ) -> list[str]:
-    """When DOMAIN_NAME has a Mac-style (n) suffix, seed artifacts from the base basin domain."""
+    """When DOMAIN_NAME is a duplicate (``Basin (2)`` or ``Basin_2``), seed from the base basin."""
     if not basin_domain or not symfluence_domain or basin_domain == symfluence_domain:
         return []
     from server.core.plan_rules import domain_has_complete_local_workflow, domain_has_local_summa_forcing

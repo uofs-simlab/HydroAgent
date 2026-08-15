@@ -119,6 +119,7 @@ from server.core.plan_rules import (
     ensure_skip_acquire_forcings_when_local_forcing,
     ensure_skip_model_agnostic_when_local_preprocessing,
     ensure_skip_process_observed_when_local_streamflow,
+    ensure_create_pour_point_before_define_domain,
     extract_explicit_domain_name_from_request,
     extract_station_id_from_request,
     resolve_station_id_from_plan,
@@ -1424,24 +1425,33 @@ GEMINI_MODELS = {
 ALL_GEMINI_MODELS = [m for group in GEMINI_MODELS.values() for m in group]
 
 CLAUDE_MODELS = {
-    "Claude 4.x (Recommended)": [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
+    "Claude 5 (Recommended)": ["claude-sonnet-5"],
+    "Claude 4.x": [
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
     ],
-    "Claude 3.7": ["claude-3-7-sonnet-latest"],
-    "Claude 3.5 (Legacy)": [
+    "Claude 3.x (Legacy)": [
+        "claude-3-7-sonnet-latest",
         "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku-latest",
+        "claude-haiku-4-5",
     ],
 }
 ALL_CLAUDE_MODELS = [m for group in CLAUDE_MODELS.values() for m in group]
 
 CLAUDE_MODEL_LABELS = {
-    "claude-sonnet-4-20250514": "Sonnet 4",
-    "claude-opus-4-20250514": "Opus 4",
+    "claude-sonnet-5": "Sonnet 5",
+    "claude-opus-4-8": "Opus 4.8",
+    "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-sonnet-4-5": "Sonnet 4.5",
     "claude-3-7-sonnet-latest": "Sonnet 3.7",
     "claude-3-5-sonnet-latest": "Sonnet 3.5",
-    "claude-3-5-haiku-latest": "Haiku 3.5",
+    "claude-haiku-4-5": "Haiku 4.5",
+}
+
+RETIRED_CLAUDE_MODEL_ALIASES = {
+    "claude-sonnet-4-20250514": "claude-sonnet-5",
+    "claude-opus-4-20250514": "claude-opus-4-8",
 }
 
 
@@ -1470,8 +1480,18 @@ LLM_PROVIDER_PACKAGES = {
 DEFAULT_LLM_MODEL = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-2.5-flash",
-    "claude": "claude-sonnet-4-20250514",
+    "claude": "claude-sonnet-5",
 }
+
+
+def resolve_llm_model(model_id: str, provider: str) -> str:
+    model_id = s(model_id) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
+    if provider == "claude":
+        model_id = RETIRED_CLAUDE_MODEL_ALIASES.get(model_id, model_id)
+        available = llm_models_for_provider("claude")
+        if model_id not in available:
+            model_id = DEFAULT_LLM_MODEL.get("claude", available[0])
+    return model_id
 
 
 def llm_models_for_provider(provider: str) -> list[str]:
@@ -3555,7 +3575,50 @@ MAP_LAYER_LEGEND_TITLES: dict[str, str] = {
 # Scrollable swatch list up to this many classes; above that use compact gradient summary.
 MAP_LEGEND_MAX_SWATCHES = 120
 MAP_LEGEND_TWO_COLUMN_MIN = 10
-MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 240
+MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 140
+MAP_LEGEND_MIN_WIDTH_PX = 150
+MAP_LEGEND_MAX_WIDTH_PX = 190
+
+
+def _add_workflow_map_css(m: folium.Map) -> None:
+    """Keep map controls legible and compact inside narrow Streamlit columns."""
+    from branca.element import Element
+
+    m.get_root().header.add_child(
+        Element(
+            f"""
+            <style>
+              .leaflet-control-zoom {{
+                display: block !important;
+                visibility: visible !important;
+              }}
+              .leaflet-control-zoom a {{
+                display: block !important;
+                width: 28px !important;
+                height: 28px !important;
+                line-height: 26px !important;
+                color: #111827 !important;
+                background: #ffffff !important;
+                font-family: Arial, sans-serif !important;
+                font-size: 20px !important;
+                font-weight: 600 !important;
+                text-align: center !important;
+                text-decoration: none !important;
+                opacity: 1 !important;
+              }}
+              .leaflet-control-zoom a:hover {{
+                color: #111827 !important;
+                background: #f3f4f6 !important;
+              }}
+              .hydroagent-map-legend {{
+                min-width: {MAP_LEGEND_MIN_WIDTH_PX}px;
+                max-width: {MAP_LEGEND_MAX_WIDTH_PX}px;
+                box-sizing: border-box;
+              }}
+            </style>
+            """
+        )
+    )
 
 
 def _pour_point_legend_icon_html() -> str:
@@ -3888,10 +3951,9 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
-                min-width:196px;max-width:280px;
+            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
               <div style="font-weight:600;font-size:12px;color:#1f2937;margin-bottom:4px;">{{ this.title }}</div>
             """
@@ -3922,28 +3984,27 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
-                min-width:196px;max-width:280px;
+            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
-              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
-                <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:6px;margin-bottom:5px;">
+                <span style="font-weight:600;font-size:11px;color:#1f2937;">{{ this.title }}</span>
                 <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
               </div>
-              <div style="height:10px;border-radius:5px;border:1px solid #cbd5e1;margin-bottom:8px;
+              <div style="height:7px;border-radius:4px;border:1px solid #cbd5e1;margin-bottom:5px;
                 background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
               {% if this.value_header %}
-              <div style="display:grid;grid-template-columns:18px 1fr 18px 1fr;gap:4px 10px;
+              <div style="display:grid;grid-template-columns:12px 1fr 12px 1fr;gap:3px 6px;
                 font-size:10px;color:#6b7280;margin-bottom:4px;">
                 <span></span><span>{{ this.value_header }}</span><span></span><span>{{ this.value_header }}</span>
               </div>
               {% endif %}
               <div style="max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
-                {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:12px;{% endif %}">
+                {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:7px;{% endif %}">
               {% for entry in this.entries %}
-                <div style="display:flex;align-items:center;gap:6px;margin:2px 0;min-width:0;">
-                  <span style="width:14px;height:14px;background:{{ entry.color }};
+                <div style="display:flex;align-items:center;gap:4px;margin:1px 0;min-width:0;">
+                  <span style="width:10px;height:10px;background:{{ entry.color }};
                     border:1px solid rgba(0,0,0,0.35);border-radius:2px;flex-shrink:0;"></span>
                   <span style="color:#374151;{% if this.value_header %}font-variant-numeric:tabular-nums;{% endif %}
                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ entry.label }}</span>
@@ -3964,10 +4025,9 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
-                min-width:196px;max-width:280px;
+            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
               <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px;">
                 <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
@@ -4214,7 +4274,12 @@ def build_pour_point_map(
     center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
     center_lat, center_lon = center[0], center[1]
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=zoom,
+        zoom_control=True,
+    )
+    _add_workflow_map_css(m)
 
     if (
         _bbox_visible_on_map()
@@ -4483,7 +4548,7 @@ def run_generate_plan_from_nl_request() -> None:
     try:
         capture_user_prompt_from_session()
         planner_request = augment_request_with_ui(st.session_state.nl_request)
-        model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
+        model = resolve_llm_model(st.session_state.get("llm_model"), provider)
         if provider == "gemini":
             plan = GeminiProvider(api_key=key).generate_run_plan(
                 model=model,
@@ -4506,6 +4571,7 @@ def run_generate_plan_from_nl_request() -> None:
             convo,
             data_dir=SYMFLUENCE_DATA_DIR,
         )
+        plan = resolve_requested_plan_dependencies(plan, convo)
 
         if not isinstance(plan, dict):
             raise RuntimeError(f"Planner returned non-dict: {type(plan)}")
@@ -4783,7 +4849,8 @@ def force_steps(plan: dict, want_create_pour_point: bool) -> dict:
         ordered.insert(i, "setup_project")
         seen.add("setup_project")
 
-    if want_create_pour_point and "create_pour_point" not in seen:
+    need_pour_point = want_create_pour_point or "define_domain" in seen
+    if need_pour_point and "create_pour_point" not in seen:
         i = ordered.index("setup_project") + 1
         ordered.insert(i, "create_pour_point")
         seen.add("create_pour_point")
@@ -4796,7 +4863,7 @@ def force_steps(plan: dict, want_create_pour_point: bool) -> dict:
     return plan
 
 
-st.set_page_config(page_title="HydroAgent: SYMFLUENCE Workflow Assistant Agent", layout="wide")
+st.set_page_config(page_title="HydroAgent: Hydrological Workflow Assistant", layout="wide")
 
 st.markdown(
     """
@@ -4955,7 +5022,7 @@ st.markdown(
 <div class="sym-header">
   <div class="sym-title-wrap">
     <div class="sym-title">HydroAgent</div>
-    <div class="sym-subtitle">SYMFLUENCE Workflow Assistant Agent</div>
+    <div class="sym-subtitle">Hydrological Workflow Assistant</div>
   </div>
   <div class="sym-status">✓ System status</div>
 </div>
@@ -5705,12 +5772,18 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             conversation_text=conversation_text,
             emit_chat_messages=False,
         )
-        stored = st.session_state.run_plan or pre_patched
         append_chat_message(
             "assistant",
-            reconcile_chat_reply("", current_plan, stored, user_message=text),
+            "Updated the plan steps from your message.",
             kind="text",
         )
+        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
+        if missing:
+            append_chat_message(
+                "assistant",
+                "Still missing before execution: " + ", ".join(missing),
+                kind="warning",
+            )
         save_chat_messages_to_run_folder()
         return
 
@@ -5763,11 +5836,6 @@ def refine_plan_from_chat_message(user_text: str) -> None:
     working_plan = pre_patched if pre_changed else current_plan
     context_text = build_chat_refinement_context()
     model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
-    preserve_steps = _chat_message_preserves_workflow_steps(
-        text,
-        before=current_plan,
-        after=pre_patched if pre_changed else current_plan,
-    )
 
     try:
         reply, new_plan, updated = call_llm_refine_run_plan(
@@ -5778,7 +5846,6 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             current_plan=working_plan,
             conversation_text=conversation_text,
             context_text=context_text,
-            preserve_workflow_steps=preserve_steps,
         )
         candidate = new_plan if updated else working_plan
         final_plan, _ = apply_chat_message_to_plan(candidate, text)
@@ -5788,14 +5855,15 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 final_plan,
                 user_message=text,
                 conversation_text=conversation_text,
-                emit_chat_messages=False,
             )
-        stored = st.session_state.run_plan or final_plan
-        append_chat_message(
-            "assistant",
-            reconcile_chat_reply(reply, current_plan, stored, user_message=text),
-            kind="text",
-        )
+        append_chat_message("assistant", reply)
+        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
+        if missing:
+            append_chat_message(
+                "assistant",
+                "Still missing before execution: " + ", ".join(missing),
+                kind="warning",
+            )
         save_chat_messages_to_run_folder()
     except Exception as e:
         if pre_changed:
@@ -6235,6 +6303,10 @@ def render_workflow_assistant_panel() -> None:
             st.session_state.want_create_pour_point = st.checkbox(
                 "Also run create_pour_point",
                 value=st.session_state.want_create_pour_point,
+                help=(
+                    "Creates the pour-point shapefile from coordinates. "
+                    "Always inserted before define_domain when that shapefile is missing."
+                ),
             )
             st.session_state.allow_run = st.checkbox(
                 "Allow dangerous run steps",
@@ -6246,15 +6318,13 @@ def render_workflow_assistant_panel() -> None:
                 help="Required for run_model or calibrate_model.",
             )
 
-            render_fix_missing_inputs_section(
-                (st.session_state.run_plan or {}).get("needs_user_input", []) or []
-            )
-            needs = (st.session_state.run_plan or {}).get("needs_user_input", []) or []
+            needs = st.session_state.run_plan.get("needs_user_input", []) or []
             if needs:
                 st.warning(
                     f"{len(needs)} required field(s) missing before execution. "
-                    "Use the section above or the Input tab."
+                    "Use the section below or the Input tab."
                 )
+                render_fix_missing_inputs_section(needs)
 
             assistant_shortcut_out = st.empty()
             wx.render_run_shortcuts_section(
@@ -6688,31 +6758,21 @@ def render_workflow_input_tab() -> None:
 
     render_start_load_run_section()
     
-    prev_tstart = s(st.session_state.tstart)
-    prev_tend = s(st.session_state.tend)
-    start_dt = parse_datetime_value(prev_tstart, dt.datetime(2001, 1, 1, 1, 0))
-    end_dt = parse_datetime_value(prev_tend, dt.datetime(2001, 1, 10, 23, 0))
+    start_dt = parse_datetime_value(st.session_state.tstart, dt.datetime(2001, 1, 1, 1, 0))
+    end_dt = parse_datetime_value(st.session_state.tend, dt.datetime(2001, 1, 10, 23, 0))
     
     ws1, ws2, ws3 = st.columns(3)
     with ws1:
-        st.text_input(
+        st.session_state.domain_name = st.text_input(
             "Domain name",
             st.session_state.domain_name,
             key=input_panel_widget_key("input_domain_name"),
-            on_change=on_input_domain_name_change,
-        )
-        st.session_state.domain_name = s(
-            st.session_state.get(input_panel_widget_key("input_domain_name"))
         )
     with ws2:
-        st.text_input(
+        st.session_state.experiment_id = st.text_input(
             "Experiment ID",
             st.session_state.experiment_id,
             key=input_panel_widget_key("input_experiment_id"),
-            on_change=on_input_experiment_id_change,
-        )
-        st.session_state.experiment_id = s(
-            st.session_state.get(input_panel_widget_key("input_experiment_id"))
         )
     with ws3:
         st.session_state.run_folder = st.text_input(
@@ -6781,11 +6841,7 @@ def render_workflow_input_tab() -> None:
             value=start_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_start_time"),
         )
-        st.session_state.tstart = commit_experiment_datetime_from_widgets(
-            prev_value=prev_tstart,
-            widget_value=format_datetime_value(start_date, start_time),
-            which="start",
-        )
+        st.session_state.tstart = format_datetime_value(start_date, start_time)
     with ws9:
         end_date = st.date_input(
             "End date",
@@ -6797,19 +6853,9 @@ def render_workflow_input_tab() -> None:
             value=end_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_end_time"),
         )
-        st.session_state.tend = commit_experiment_datetime_from_widgets(
-            prev_value=prev_tend,
-            widget_value=format_datetime_value(end_date, end_time),
-            which="end",
-        )
-
-    if s(st.session_state.tstart) or s(st.session_state.tend):
-        st.caption(
-            f"Experiment time window: `{st.session_state.tstart or '—'}` → "
-            f"`{st.session_state.tend or '—'}`"
-        )
-    else:
-        st.caption("Experiment time window: not set (placeholder dates are display-only).")
+        st.session_state.tend = format_datetime_value(end_date, end_time)
+    
+    st.caption(f"Experiment time window: `{st.session_state.tstart}` → `{st.session_state.tend}`")
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown(
@@ -6876,7 +6922,6 @@ def render_workflow_input_tab() -> None:
             st.caption("Bounding box mode: click first corner, then opposite corner.")
 
     sync_input_panel_to_run_plan()
-    render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
         execute_bundle_fn=lambda key: execute_step_bundle(key, shortcut_output),
@@ -6966,23 +7011,10 @@ def sync_preview_artifacts() -> None:
         plan_to_save["config"]["domain_def"] = s(st.session_state.domain_def)
     if s(st.session_state.forcing_dataset):
         plan_to_save["config"]["forcing_dataset"] = s(st.session_state.forcing_dataset)
-    plan_tstart, plan_tend = ui_experiment_dates_for_plan()
-    if plan_tstart:
-        plan_to_save["config"]["experiment_time_start"] = plan_tstart
-    else:
-        plan_to_save["config"].pop("experiment_time_start", None)
-    if plan_tend:
-        plan_to_save["config"]["experiment_time_end"] = plan_tend
-    else:
-        plan_to_save["config"].pop("experiment_time_end", None)
-    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
-    if user_forbids_mizuroute(prompt):
-        plan_to_save["config"].pop("routing_model", None)
-        plan_to_save["config"].pop("ROUTING_MODEL", None)
-        extra = plan_to_save["config"].get("extra_config")
-        if isinstance(extra, dict):
-            extra.pop("routing_model", None)
-            extra.pop("ROUTING_MODEL", None)
+    if s(st.session_state.tstart):
+        plan_to_save["config"]["experiment_time_start"] = s(st.session_state.tstart)
+    if s(st.session_state.tend):
+        plan_to_save["config"]["experiment_time_end"] = s(st.session_state.tend)
 
     mpi_val = resolve_num_processes_from_plan_cfg(plan_to_save.get("config") or {}) or int(
         st.session_state.mpi
@@ -7217,6 +7249,21 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     )
     if isinstance(committed_steps, list) and committed_steps:
         plan["steps"] = list(committed_steps)
+    plan = force_steps(
+        plan,
+        want_create_pour_point=st.session_state.want_create_pour_point,
+    )
+    plan = ensure_create_pour_point_before_define_domain(
+        plan,
+        conversation_text_for_plan_rules()
+        or user_prompt_for_metadata()
+        or s(st.session_state.get("nl_request", "")),
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
+    sorted_exec_steps = sort_plan_steps_by_workflow_order(list(plan.get("steps") or []))
+    if sorted_exec_steps:
+        plan["steps"] = sorted_exec_steps
+    st.session_state["_committed_plan_steps"] = list(plan.get("steps") or [])
     store_run_plan(plan)
     plan_cfg = (plan or {}).get("config", {}) or {}
     spec_dict = build_spec_dict(plan_cfg)
@@ -7283,22 +7330,16 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     else:
         cfg.pop("BOUNDING_BOX_COORDS", None)
 
+    dump_yaml(cfg, out_yaml)
+
+    write_run_metadata_files(outdir, plan, spec_dict)
+
     user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
     basin_domain = symfluence_domain_name(
         s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
         s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
     )
-    symfluence_domain = basin_domain
-    plan = ensure_skip_acquire_forcings_when_local_forcing(
-        plan,
-        user_request,
-        data_dir=SYMFLUENCE_DATA_DIR,
-    )
-    plan = ensure_skip_model_agnostic_when_local_preprocessing(
-        plan,
-        user_request,
-        data_dir=SYMFLUENCE_DATA_DIR,
-    )
+    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
     plan = ensure_skip_process_observed_when_local_streamflow(
         plan,
         user_request,
@@ -7306,22 +7347,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         symfluence_domain=symfluence_domain,
     )
     store_run_plan(plan)
-    plan_cfg = (plan or {}).get("config", {}) or {}
 
-    station_id = resolve_station_id_from_plan(plan_cfg, user_request, fallback=s(st.session_state.station_id))
-    if station_id:
-        cfg["STATION_ID"] = station_id
-    if plan_uses_local_data(plan_cfg, plan.get("steps") or [], user_request, data_dir=SYMFLUENCE_DATA_DIR) or (
-        symfluence_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, symfluence_domain)
-    ):
-        cfg["DOWNLOAD_WSC_DATA"] = False
-
-    dump_yaml(cfg, out_yaml)
-
-    # plan.json must match skip-adjusted steps (ensure_skip_* helpers run above).
-    write_run_metadata_files(outdir, plan, spec_dict)
-
-    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
     steps = plan.get("steps", []) or []
 
     pour_coords = (

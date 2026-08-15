@@ -263,6 +263,23 @@ def domain_has_local_dem(data_dir: str | Path | None, domain_name: str) -> bool:
     return domain_dem_path(data_dir, domain_name).is_file()
 
 
+def domain_pour_point_shapefile_path(data_dir: str | Path, domain_name: str) -> Path:
+    name = _s(domain_name)
+    return (
+        Path(data_dir)
+        / f"domain_{name}"
+        / "shapefiles"
+        / "pour_point"
+        / f"{name}_pourPoint.shp"
+    )
+
+
+def domain_has_local_pour_point(data_dir: str | Path | None, domain_name: str) -> bool:
+    if not data_dir or not _s(domain_name):
+        return False
+    return domain_pour_point_shapefile_path(data_dir, domain_name).is_file()
+
+
 def domain_attributes_root(data_dir: str | Path, domain_name: str) -> Path:
     return Path(data_dir) / f"domain_{_s(domain_name)}" / "data" / "attributes"
 
@@ -1457,6 +1474,37 @@ _SKIP_ACQUIRE_ATTRIBUTES_PHRASES = (
 )
 
 
+def ensure_create_pour_point_before_define_domain(
+    plan: dict,
+    user_request: str = "",
+    *,
+    data_dir: str | Path | None = None,
+) -> dict:
+    """define_domain needs a pour-point shapefile; insert create_pour_point when omitted."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    steps = list(out.get("steps") or [])
+    if "define_domain" not in steps or "create_pour_point" in steps:
+        return out
+    if _user_forbids_step_inference(user_request, "create_pour_point"):
+        return out
+
+    cfg = dict(out.get("config") or {})
+    domain_name = _s(cfg.get("domain_name"))
+    if domain_name and data_dir and domain_has_local_pour_point(data_dir, domain_name):
+        return out
+
+    idx = steps.index("define_domain")
+    steps.insert(idx, "create_pour_point")
+    out["steps"] = steps
+    _append_plan_note(
+        out,
+        "Inserted create_pour_point before define_domain (pour-point shapefile required for delineation).",
+    )
+    return out
+
+
 def ensure_acquire_attributes_before_define_domain(
     plan: dict,
     user_request: str = "",
@@ -1490,6 +1538,56 @@ def ensure_acquire_attributes_before_define_domain(
     _append_plan_note(
         out,
         "Inserted acquire_attributes before define_domain (DEM/attributes required for delineation).",
+    )
+    return out
+
+
+def ensure_discretize_domain_before_preprocessing(
+    plan: dict,
+    user_request: str = "",
+    *,
+    data_dir: str | Path | None = None,
+) -> dict:
+    """model_agnostic_preprocessing needs HRU/GRU shapefiles from discretize_domain."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    steps = list(out.get("steps") or [])
+    if "discretize_domain" in steps:
+        return out
+    if _user_forbids_step_inference(user_request, "discretize_domain"):
+        return out
+
+    needs_hrus = bool(
+        {
+            "model_agnostic_preprocessing",
+            "model_specific_preprocessing",
+            "run_model",
+        }
+        & set(steps)
+    )
+    cfg = dict(out.get("config") or {})
+    delineated = "define_domain" in steps or _s(cfg.get("domain_def")).lower() == "delineate"
+    if not needs_hrus or not delineated:
+        return out
+
+    domain_name = _s(cfg.get("domain_name"))
+    experiment_id = _s(cfg.get("experiment_id")) or "run_1"
+    if domain_name and data_dir and domain_has_local_discretization(
+        data_dir, domain_name, experiment_id
+    ):
+        return out
+
+    if "define_domain" in steps:
+        steps.insert(steps.index("define_domain") + 1, "discretize_domain")
+    elif "model_agnostic_preprocessing" in steps:
+        steps.insert(steps.index("model_agnostic_preprocessing"), "discretize_domain")
+    else:
+        steps.append("discretize_domain")
+    out["steps"] = sort_plan_steps_by_workflow_order(steps)
+    _append_plan_note(
+        out,
+        "Inserted discretize_domain before preprocessing (HRU/GRU shapefiles required).",
     )
     return out
 
@@ -1556,6 +1654,7 @@ def ensure_online_data_when_missing(
     if user_forbids_download_step(user_request, "acquire_attributes"):
         return out
 
+    out = ensure_create_pour_point_before_define_domain(out, user_request, data_dir=data_dir)
     out = ensure_acquire_attributes_before_define_domain(out, user_request, data_dir=data_dir)
     steps = list(out.get("steps") or [])
 
@@ -1872,6 +1971,9 @@ def normalize_local_workflow_plan(
             steps = list(out.get("steps") or [])
 
     out = apply_explicit_step_constraints(out, user_request)
+    out = ensure_create_pour_point_before_define_domain(out, user_request, data_dir=data_dir)
+    out = ensure_acquire_attributes_before_define_domain(out, user_request, data_dir=data_dir)
+    out = ensure_discretize_domain_before_preprocessing(out, user_request, data_dir=data_dir)
     steps = list(out.get("steps") or [])
     cfg = dict(out.get("config") or {})
 
@@ -2008,10 +2110,14 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if not forbids_model and (
         re.search(r"\bfrom\s+scratch\b", text)
         or re.search(r"\brun\s+(?:the\s+)?model\b", text)
+        or re.search(r"\bmodel\s+run\b", text)
         or re.search(r"\b(?:and|then)\s+(?:the\s+)?model\b", text)
         or re.search(r"\brun\s+summa\b", text)
         or re.search(r"\bsumma\s+workflow\b", text)
-        or (re.search(r"\bworkflow\b", text) and re.search(r"\bsumma\b", text))
+        or (
+            re.search(r"\bworkflow\b", text)
+            and re.search(r"\b(?:fuse|summa|hbv|gr|mesh|hype|ngen|topmodel)\b", text)
+        )
     ):
         add("run_model")
 
@@ -2030,6 +2136,7 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if re.search(r"\bpreprocess", text):
         add("model_agnostic_preprocessing")
         add("model_specific_preprocessing")
+        add("discretize_domain")
 
     if re.search(r"\bsetup\b", text):
         add("setup_project")
@@ -2057,6 +2164,16 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
         or re.search(r"\bdelineat", text)
     ):
         add("define_domain")
+
+    if "define_domain" in goals and not _user_forbids_step_inference(
+        user_request, "create_pour_point"
+    ):
+        add("create_pour_point")
+
+    if "define_domain" in goals and (
+        "model_agnostic_preprocessing" in goals or "run_model" in goals
+    ):
+        add("discretize_domain")
 
     for step in extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES):
         if step == "run_model" and forbids_model:

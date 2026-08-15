@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -19,6 +20,58 @@ from server.llm.plan_shared import (
     _extract_bounding_box,
     _extract_hydrological_model,
 )
+
+
+def _model_supports_temperature(model: str) -> bool:
+    """Newer Claude models reject non-default sampling parameters."""
+    model_id = (model or "").lower()
+    deprecated_sampling_markers = (
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+    )
+    return not any(marker in model_id for marker in deprecated_sampling_markers)
+
+
+def _model_prefers_thinking_disabled(model: str) -> bool:
+    """Adaptive thinking is on by default on newer models and can exhaust output budget."""
+    model_id = (model or "").lower()
+    adaptive_thinking_markers = (
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+    )
+    return any(marker in model_id for marker in adaptive_thinking_markers)
+
+
+def _sanitize_json_schema(node: Any) -> Any:
+    """Adapt JSON Schema for Anthropic structured output (union types → anyOf)."""
+    if isinstance(node, list):
+        return [_sanitize_json_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: Dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "type" and isinstance(value, list):
+            non_null = [item for item in value if item != "null"]
+            if "null" in value:
+                if len(non_null) == 1:
+                    out["anyOf"] = [{"type": non_null[0]}, {"type": "null"}]
+                elif non_null:
+                    out["anyOf"] = [{"type": item} for item in non_null] + [{"type": "null"}]
+                else:
+                    out["type"] = "null"
+            else:
+                out["type"] = value
+            continue
+        if key == "enum" and isinstance(value, list):
+            out[key] = [item if item is not None else None for item in value]
+            continue
+        out[key] = _sanitize_json_schema(value)
+    return out
 
 
 class ClaudeProvider:
@@ -46,12 +99,72 @@ class ClaudeProvider:
         except Exception:
             return None
 
-    def _response_text(self, response) -> str:
+    def _response_text_chunks(self, response) -> list[str]:
         chunks: list[str] = []
         for block in getattr(response, "content", []) or []:
             if getattr(block, "type", None) == "text":
-                chunks.append(getattr(block, "text", "") or "")
-        return "".join(chunks).strip()
+                text = getattr(block, "text", "") or ""
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text)
+        return chunks
+
+    def _extract_json_from_response(self, response) -> Dict[str, Any] | None:
+        parsed_output = getattr(response, "parsed_output", None)
+        if isinstance(parsed_output, dict):
+            return parsed_output
+
+        for block in getattr(response, "content", []) or []:
+            block_parsed = getattr(block, "parsed_output", None)
+            if isinstance(block_parsed, dict):
+                return block_parsed
+
+        for chunk in self._response_text_chunks(response):
+            loaded = self._loads_json_from_text(chunk)
+            if loaded is not None:
+                return loaded
+        return None
+
+    def _describe_response_failure(self, response) -> str:
+        details: list[str] = []
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason:
+            details.append(f"stop_reason={stop_reason}")
+
+        blocks = getattr(response, "content", []) or []
+        if not blocks:
+            details.append("no content blocks")
+        else:
+            block_types = [getattr(block, "type", "?") for block in blocks]
+            details.append(f"content_types={','.join(block_types)}")
+
+        text_preview = " ".join(self._response_text_chunks(response))
+        if text_preview:
+            preview = text_preview[:240].replace("\n", " ")
+            details.append(f"text preview: {preview!r}")
+        else:
+            details.append("empty response text")
+
+        return "; ".join(details)
+
+    def _base_message_kwargs(
+        self,
+        *,
+        model: str,
+        max_output_tokens: int,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_output_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        if _model_supports_temperature(model):
+            kwargs["temperature"] = 0.2
+        if _model_prefers_thinking_disabled(model):
+            kwargs["thinking"] = {"type": "disabled"}
+        return kwargs
 
     def _call_json_schema(
         self,
@@ -62,49 +175,65 @@ class ClaudeProvider:
         user_prompt: str,
         max_output_tokens: int,
     ) -> Dict[str, Any]:
-        create_kwargs: Dict[str, Any] = {
-            "model": model,
-            "max_tokens": max_output_tokens,
-            "temperature": 0.2,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
+        claude_schema = _sanitize_json_schema(deepcopy(schema))
+        token_budgets = [max_output_tokens]
+        if max_output_tokens < 8192:
+            token_budgets.append(8192)
 
-        try:
-            response = self.client.messages.create(
-                **create_kwargs,
-                output_config={
-                    "format": {
-                        "type": "json_schema",
-                        "schema": schema,
-                    }
-                },
-            )
-            parsed = self._loads_json_from_text(self._response_text(response))
-            if parsed is not None:
-                return parsed
-        except TypeError:
-            pass
-        except Exception:
-            pass
-
+        last_failure = "unknown error"
         fallback_system = (
             system_prompt
             + "\n\nIMPORTANT: Return ONLY a single valid JSON object. "
             "No numbering, no comments, no markdown, no trailing commas."
         )
-        response2 = self.client.messages.create(
-            model=model,
-            max_tokens=max_output_tokens,
-            temperature=0.2,
-            system=fallback_system,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        parsed2 = self._loads_json_from_text(self._response_text(response2))
-        if parsed2 is not None:
-            return parsed2
 
-        raise RuntimeError("No JSON returned from Claude after schema + fallback attempt.")
+        for attempt_idx, token_budget in enumerate(token_budgets):
+            create_kwargs = self._base_message_kwargs(
+                model=model,
+                max_output_tokens=token_budget,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+            try:
+                response = self.client.messages.create(
+                    **create_kwargs,
+                    output_config={
+                        "format": {
+                            "type": "json_schema",
+                            "schema": claude_schema,
+                        }
+                    },
+                )
+                parsed = self._extract_json_from_response(response)
+                if parsed is not None:
+                    return parsed
+                last_failure = self._describe_response_failure(response)
+            except TypeError as exc:
+                last_failure = f"structured output unsupported: {exc}"
+            except Exception as exc:
+                last_failure = f"structured output error: {type(exc).__name__}: {exc}"
+
+            response2 = self.client.messages.create(
+                **self._base_message_kwargs(
+                    model=model,
+                    max_output_tokens=token_budget,
+                    system_prompt=fallback_system,
+                    user_prompt=user_prompt,
+                ),
+            )
+            parsed2 = self._extract_json_from_response(response2)
+            if parsed2 is not None:
+                return parsed2
+            last_failure = self._describe_response_failure(response2)
+
+            if attempt_idx + 1 < len(token_budgets):
+                continue
+
+        raise RuntimeError(
+            "No JSON returned from Claude after schema + fallback attempt "
+            f"({last_failure})."
+        )
 
     def generate_run_plan(self, *, model: str, user_request: str) -> Dict[str, Any]:
         planner_prompt = PLANNER_PROMPT_PATH.read_text(encoding="utf-8")
@@ -115,7 +244,7 @@ class ClaudeProvider:
             schema=schema,
             system_prompt=planner_prompt,
             user_prompt=user_request,
-            max_output_tokens=4096,
+            max_output_tokens=8192,
         )
         return finalize_run_plan(plan, user_request)
 
@@ -143,7 +272,7 @@ class ClaudeProvider:
             schema=schema,
             system_prompt=refinement_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=4096,
+            max_output_tokens=8192,
         )
         return finalize_plan_refinement(
             result,

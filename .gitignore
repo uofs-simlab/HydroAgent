@@ -4,6 +4,8 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
 runs/*
 !runs/.gitkeep
 .streamlit/secrets.toml
+figures/
