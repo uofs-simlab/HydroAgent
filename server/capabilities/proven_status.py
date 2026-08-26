@@ -7,7 +7,7 @@ PROVEN_STATUS = {
     "define_domain": True,
     "discretize_domain": True,
     "process_observed_data": False,
-    "acquire_forcings": False,
+    "acquire_forcings": True,
     "model_agnostic_preprocessing": True,
     "model_specific_preprocessing": True,
     "run_model": False,

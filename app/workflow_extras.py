@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -783,9 +782,10 @@ def render_results_page(*, symfluence_data_dir: Path, runs_dir: Path) -> None:
 
 
 def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+    from server.core.safe_subprocess import run_command
+
     cmd = [sys.executable, script_path] + args
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd) if cwd else None)
-    return p.returncode, p.stdout, p.stderr
+    return run_command(cmd, cwd=cwd)
 
 
 def render_run_results_section(

@@ -5,7 +5,11 @@ from pathlib import Path
 import re
 import sys
 import os
-import subprocess
+
+# PROJ/pyproj SQLite cache + fork() in multi-threaded Streamlit → SIGSEGV on macOS.
+# Set before geopandas loads; subprocesses run via spawn workers (safe_subprocess).
+os.environ["PROJ_DISABLE_CACHE"] = "ON"
+
 import yaml
 import streamlit as st
 import traceback
@@ -17,7 +21,26 @@ import pandas as pd
 import folium
 import streamlit.components.v1 as components
 from streamlit_folium import st_folium
-import geopandas as gpd
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import geopandas as gpd
+else:
+
+    class _LazyGeoPandas:
+        _module = None
+
+        def _load(self):
+            if self._module is None:
+                import geopandas
+
+                self._module = geopandas
+            return self._module
+
+        def __getattr__(self, name: str):
+            return getattr(self._load(), name)
+
+    gpd = _LazyGeoPandas()  # type: ignore[misc,assignment]
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = Path(__file__).resolve().parent
@@ -64,6 +87,7 @@ from server.core.template import (
     spec_key_to_yaml_key,
 )
 from server.core.validate import validate_spec  # noqa: E402
+from server.core.safe_subprocess import run_command, run_command_stream  # noqa: E402
 from server.core.workflow_executor import (  # noqa: E402
     completed_steps_from_log,
     execution_log_path,
@@ -88,6 +112,7 @@ from server.core.local_domain import (
     legacy_catchment_path,
     local_catchment_needs_restore,
     pour_point_inside_bounding_box,
+    ensure_bounding_box_contains_pour_point,
     restore_local_domain_artifacts,
     seed_mac_duplicate_domain_from_basin,
     summa_preprocessing_hru_mismatch,
@@ -111,9 +136,14 @@ from server.core.plan_rules import (
     apply_chat_step_edits,
     apply_chat_step_order_edits,
     domain_catchment_shapefile_candidates,
+    domain_catchment_hru_count,
     domain_has_local_dem,
     domain_has_local_era5_raw_forcing,
     domain_has_local_streamflow,
+    domain_has_local_summa_forcing,
+    domain_has_forcing_intersection,
+    domain_has_local_discretization,
+    domain_has_local_river_basins,
     domain_has_complete_local_workflow,
     domain_name_needs_user_input,
     ensure_skip_acquire_forcings_when_local_forcing,
@@ -139,11 +169,84 @@ from server.core.plan_rules import (
     user_requires_fresh_cloud_workflow,
 )
 
-OPENAI_AVAILABLE = True
-try:
-    from server.llm.openai_provider import OpenAIProvider  # type: ignore
-except Exception:
-    OPENAI_AVAILABLE = False
+if TYPE_CHECKING:
+    from server.llm.prompt_library import (  # noqa: E402
+        PromptMatch,
+        display_body,
+        enrich_planner_request,
+        find_similar_prompts,
+        langprompt_available,
+        langprompt_import_error,
+        save_prompt_to_library,
+    )
+else:
+    try:
+        from server.llm.prompt_library import (  # noqa: E402
+            PromptMatch,
+            display_body,
+            enrich_planner_request,
+            find_similar_prompts,
+            langprompt_available,
+            langprompt_import_error,
+            save_prompt_to_library,
+        )
+    except ImportError:
+        class PromptMatch:
+            title: str
+            body: str
+            score: float
+            query_type: str
+            source: str
+
+        def langprompt_available() -> bool:
+            return False
+
+        def langprompt_import_error() -> str | None:
+            return "LangPrompt integration is not available."
+
+        def find_similar_prompts(*args, **kwargs):
+            return []
+
+        def save_prompt_to_library(*args, **kwargs) -> bool:
+            return False
+
+        def enrich_planner_request(
+            base_request: str,
+            matches: list[PromptMatch],
+            *,
+            max_examples: int = 2,
+            min_score: float = 0.75,
+        ) -> str:
+            return base_request
+
+        def display_body(match: PromptMatch, *, show_raw: bool = False) -> str:
+            return getattr(match, "body", str(match))
+
+OpenAIProvider = None  # type: ignore[assignment,misc]
+OPENAI_AVAILABLE = False
+OPENAI_IMPORT_ERROR = ""
+
+
+def ensure_openai_provider() -> bool:
+    """Import OpenAI provider lazily (supports install without full app restart)."""
+    global OpenAIProvider, OPENAI_AVAILABLE, OPENAI_IMPORT_ERROR
+    if OPENAI_AVAILABLE and OpenAIProvider is not None:
+        return True
+    try:
+        from server.llm.openai_provider import OpenAIProvider as _OpenAIProvider  # type: ignore
+
+        OpenAIProvider = _OpenAIProvider
+        OPENAI_AVAILABLE = True
+        OPENAI_IMPORT_ERROR = ""
+        return True
+    except Exception as exc:
+        OpenAIProvider = None
+        OPENAI_AVAILABLE = False
+        OPENAI_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+ensure_openai_provider()
 
 GeminiProvider = None  # type: ignore
 GEMINI_AVAILABLE = False
@@ -1232,8 +1335,13 @@ def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> d
 
 def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     cmd = [sys.executable, script_path] + args
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd) if cwd else None)
-    return p.returncode, p.stdout, p.stderr
+    return run_command(cmd, cwd=cwd, env=_subprocess_env())
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PROJ_DISABLE_CACHE"] = "ON"
+    return env
 
 def apply_edited_plan_to_session(plan: dict) -> None:
     """Push plan.config values into Input-tab session state, advanced settings, and widgets."""
@@ -1507,7 +1615,7 @@ def llm_provider_available(provider: str) -> bool:
         return ensure_gemini_provider()
     if provider == "claude":
         return ensure_claude_provider()
-    return OPENAI_AVAILABLE
+    return ensure_openai_provider()
 
 
 def llm_provider_import_error(provider: str) -> str:
@@ -1515,7 +1623,25 @@ def llm_provider_import_error(provider: str) -> str:
         return GEMINI_IMPORT_ERROR
     if provider == "claude":
         return CLAUDE_IMPORT_ERROR
-    return ""
+    return OPENAI_IMPORT_ERROR
+
+
+def openai_provider_client(api_key: str):
+    if not ensure_openai_provider() or OpenAIProvider is None:
+        raise RuntimeError(OPENAI_IMPORT_ERROR or "OpenAI provider is not available.")
+    return OpenAIProvider(api_key=api_key)
+
+
+def gemini_provider_client(api_key: str):
+    if not ensure_gemini_provider() or GeminiProvider is None:
+        raise RuntimeError(GEMINI_IMPORT_ERROR or "Gemini provider is not available.")
+    return GeminiProvider(api_key=api_key)
+
+
+def claude_provider_client(api_key: str):
+    if not ensure_claude_provider() or ClaudeProvider is None:
+        raise RuntimeError(CLAUDE_IMPORT_ERROR or "Claude provider is not available.")
+    return ClaudeProvider(api_key=api_key)
 
 
 def llm_provider_install_hint(provider: str) -> str:
@@ -1585,6 +1711,7 @@ defaults = {
     "gpt_model": "gpt-5-mini",
     "nl_request": "",
     "user_prompt": "",
+    "langprompt_enrich": True,
     "chat_messages": [],
     "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
@@ -1850,6 +1977,11 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
     return False
 
 
+def extra_config_dict(source: dict | None) -> dict:
+    raw = (source or {}).get("extra_config")
+    return raw if isinstance(raw, dict) else {}
+
+
 def apply_semi_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
     """Align delineation/discretization with 02b_basin_semi_distributed.ipynb when template defaults differ."""
     if not is_semi_distributed_workflow(spec, cfg):
@@ -1869,7 +2001,7 @@ def apply_semi_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
         "SETTINGS_MIZU_ROUTING_DT": 3600,
         "MIZU_FROM_MODEL": "SUMMA",
     }
-    extra = spec.get("extra_config") if isinstance(spec.get("extra_config"), dict) else {}
+    extra = extra_config_dict(spec)
     for key, value in defaults.items():
         if extra.get(key) is not None:
             continue
@@ -1897,7 +2029,7 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
     }
     if domain_name:
         defaults["CATCHMENT_SHP_NAME"] = f"{domain_name}_HRUs_elevation.shp"
-    extra = spec.get("extra_config") if isinstance(spec.get("extra_config"), dict) else {}
+    extra = extra_config_dict(spec)
     for key, value in defaults.items():
         if extra.get(key) is not None:
             continue
@@ -1920,7 +2052,7 @@ def apply_lumped_workflow_defaults(cfg: dict, spec: dict, user_request: str = ""
         "LUMPED_WATERSHED_METHOD": "TauDEM",
         "DELINEATE_BY_POURPOINT": True,
     }
-    extra = spec.get("extra_config") if isinstance(spec.get("extra_config"), dict) else {}
+    extra = extra_config_dict(spec)
     for key, value in defaults.items():
         if extra.get(key) is not None:
             continue
@@ -2140,7 +2272,7 @@ def on_fix_missing_plan_field_change(field: str) -> None:
 def resolve_data_access_from_plan(plan_cfg: dict | None) -> str:
     """Read data_access / DATA_ACCESS from plan config or extra_config."""
     plan_cfg = plan_cfg or {}
-    extra = plan_cfg.get("extra_config") if isinstance(plan_cfg.get("extra_config"), dict) else {}
+    extra = extra_config_dict(plan_cfg)
     for key in ("data_access", "DATA_ACCESS"):
         val = s(plan_cfg.get(key)) or s(extra.get(key))
         if val:
@@ -2198,6 +2330,11 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
             needs_cloud = True
         if needs_cloud:
             data_access = "cloud"
+        elif "acquire_attributes" in run_steps and domain_name and domain_has_local_dem(
+            SYMFLUENCE_DATA_DIR, domain_name
+        ):
+            # SYMFLUENCE LOCAL mode reuses existing rasters and fills gaps via cloud.
+            data_access = "local"
     elif domain_name and not domain_has_local_dem(SYMFLUENCE_DATA_DIR, domain_name):
         if {"define_domain", "discretize_domain", "acquire_attributes"} & set(run_steps):
             data_access = "cloud"
@@ -2379,7 +2516,7 @@ def _confirm_domain_from_chat_message(plan: dict, user_message: str) -> dict:
     if explicit:
         cfg = apply_user_provided_domain_name(cfg, explicit)
     elif re.search(r"\bdomain_name\b|\bdomain\s+name\b", user_message, flags=re.IGNORECASE):
-        domain = _s(cfg.get("domain_name"))
+        domain = s(cfg.get("domain_name"))
         if domain:
             cfg = apply_user_provided_domain_name(cfg, domain)
     out["config"] = cfg
@@ -3734,7 +3871,8 @@ def _add_dominant_fraction_column(gdf: gpd.GeoDataFrame, prefix: str, out_col: s
         return gdf
     out = gdf.copy()
     fractions = out[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-    out[out_col] = fractions.idxmax(axis=1).str.extract(r"(\d+)$", expand=False)
+    dominant_cols = pd.Series(fractions.idxmax(axis=1), index=out.index, dtype="string")
+    out[out_col] = dominant_cols.str.extract(r"(\d+)$", expand=False)
     return out
 
 
@@ -3746,13 +3884,14 @@ def _add_elevation_class_column(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         out["elev_mean"] = pd.to_numeric(out["S_1_elev_m"], errors="coerce")
     if "elev_mean" not in out.columns:
         return out
-    values = pd.to_numeric(out["elev_mean"], errors="coerce")
+    values = pd.Series(pd.to_numeric(out["elev_mean"], errors="coerce"))
     valid = values.dropna()
     if valid.empty:
         return out
     n_bins = int(min(9, max(3, valid.nunique())))
     ranked = values.rank(method="first")
-    out["_elev_class"] = pd.qcut(ranked, q=n_bins, labels=False, duplicates="drop") + 1
+    elev_bins = pd.qcut(ranked, q=n_bins, labels=False, duplicates="drop")
+    out["_elev_class"] = pd.Series(elev_bins, index=out.index) + 1
     return out
 
 
@@ -3808,11 +3947,12 @@ def _class_legend_label(
     if profile in {"grus", "forcing"}:
         return str(class_value) if compact else f"GRU {class_value}"
     if profile == "elevation" and "elev_mean" in gdf.columns:
-        subset = gdf[gdf[class_col] == class_value]["elev_mean"]
-        subset = pd.to_numeric(subset, errors="coerce").dropna()
-        if not subset.empty:
-            low = int(subset.min())
-            high = int(subset.max())
+        elev_values = pd.Series(
+            pd.to_numeric(gdf.loc[gdf[class_col] == class_value, "elev_mean"], errors="coerce")
+        ).dropna()
+        if not elev_values.empty:
+            low = int(elev_values.min())
+            high = int(elev_values.max())
             return f"{low}–{high} m" if low != high else f"{low} m"
     if profile == "landclass":
         return f"IGBP {class_value}"
@@ -3939,10 +4079,12 @@ def _add_choropleth_legend_to_map(
     if not legend_spec and not reference_entries:
         return
 
+    from typing import Any
+
     from branca.element import MacroElement
     from jinja2 import Template
 
-    legend = MacroElement()
+    legend: Any = MacroElement()
     legend.reference_entries = reference_entries
     ref_section = _map_legend_reference_section_html()
 
@@ -4458,40 +4600,27 @@ def dump_yaml(data, path: Path):
 
 
 def run_cmd_stream(cmd: list[str], cwd: Path, output_box, log_path: Path | None = None):
-    p = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
     collected: list[str] = []
     log_file = None
+
+    def on_line(line: str) -> None:
+        collected.append(line)
+        if output_box is not None:
+            output_box.code("".join(collected))
+        if log_file is not None:
+            log_file.write(line)
+            log_file.flush()
 
     try:
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = log_path.open("a", encoding="utf-8")
 
-        while True:
-            line = p.stdout.readline() if p.stdout else ""
-            if not line and p.poll() is not None:
-                break
-            if line:
-                collected.append(line)
-                if output_box is not None:
-                    output_box.code("".join(collected))
-                if log_file is not None:
-                    log_file.write(line)
-                    log_file.flush()
-
-        rc = p.wait()
+        rc, out = run_command_stream(cmd, cwd=cwd, env=_subprocess_env(), on_line=on_line)
         if log_file is not None:
             log_file.write(f"\n[return code: {rc}]\n")
             log_file.flush()
-        return rc, "".join(collected)
+        return rc, out if out else "".join(collected)
     finally:
         if log_file is not None:
             log_file.close()
@@ -4531,6 +4660,111 @@ def augment_request_with_ui(nl: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def openai_key_for_langprompt() -> str | None:
+    key = s(st.session_state.api_keys.get("openai"))
+    if key:
+        return key
+    cfg = load_local_settings()
+    return s(cfg.get("openai_api_key")) or None
+
+
+def render_prompt_library_panel() -> None:
+    """LangPrompt: find similar past workflow prompts and optionally reuse them."""
+    if not langprompt_available():
+        import_error = langprompt_import_error()
+        st.caption("Prompt library search requires langchain packages.")
+        if import_error:
+            st.code(import_error)
+        return
+
+    nl = s(st.session_state.get("nl_request"))
+    if not nl or is_plan_json_text(nl):
+        st.markdown("**Prompt library**")
+        st.caption(
+            "Type a workflow description in the prompt box above, then search for similar past prompts."
+        )
+        return
+
+    openai_key = openai_key_for_langprompt()
+    if not openai_key:
+        st.caption("Save an **OpenAI** API key to search the prompt library (embeddings).")
+        return
+
+    st.markdown("**Prompt library**")
+    st.caption("Search past workflow prompts with semantic similarity (LangPrompt).")
+
+    find_col, rebuild_col = st.columns([3, 1])
+    with find_col:
+        find_clicked = st.button(
+            "Find similar prompts",
+            key="langprompt_find_similar",
+            width="stretch",
+            type="secondary",
+        )
+    with rebuild_col:
+        rebuild_clicked = st.button(
+            "Rebuild",
+            key="langprompt_rebuild_store",
+            help="Re-embed all prompts (use after editing prompts/library/prompts.txt).",
+        )
+
+    st.checkbox(
+        "Include similar examples when generating plan",
+        key="langprompt_enrich",
+        help="Prepend close matches from the prompt library as reference for the planner.",
+    )
+
+    if find_clicked or rebuild_clicked:
+        try:
+            matches = find_similar_prompts(
+                nl,
+                api_key=openai_key,
+                top=5,
+                rebuild=rebuild_clicked,
+            )
+            st.session_state["_langprompt_matches"] = matches
+            if matches:
+                st.session_state["_langprompt_search_ok"] = True
+            else:
+                st.session_state["_langprompt_search_empty"] = True
+        except Exception as exc:
+            st.session_state["_langprompt_search_error"] = str(exc)
+
+    if st.session_state.pop("_langprompt_search_ok", False):
+        count = len(st.session_state.get("_langprompt_matches") or [])
+        st.success(f"Found {count} similar prompt(s).")
+    if st.session_state.pop("_langprompt_search_empty", False):
+        st.info("No similar prompts found in the library yet.")
+    search_error = st.session_state.pop("_langprompt_search_error", None)
+    if search_error:
+        st.error(f"Prompt library search failed: {search_error}")
+
+    matches = st.session_state.get("_langprompt_matches") or []
+    if not matches:
+        return
+
+    with st.expander("Similar prompts", expanded=True):
+        for index, match in enumerate(matches):
+            if not hasattr(match, "score"):
+                continue
+            st.markdown(f"**{match.title}** — similarity {match.score:.2f}")
+            preview = display_body(match)
+            if len(preview) > 500:
+                preview = preview[:497] + "..."
+            st.text(preview)
+            if st.button(
+                "Use this prompt",
+                key=f"langprompt_use_{index}",
+                width="stretch",
+                type="secondary",
+            ):
+                st.session_state["_pending_nl_transcript"] = display_body(match)
+                st.session_state["_langprompt_use_ok"] = True
+                st.rerun()
+            if index < len(matches) - 1:
+                st.markdown("---")
+
+
 def run_generate_plan_from_nl_request() -> None:
     """NL prompt -> full SYMFLUENCE run plan (config, steps, needs_user_input)."""
     provider = s(st.session_state.get("llm_provider")) or "openai"
@@ -4549,18 +4783,41 @@ def run_generate_plan_from_nl_request() -> None:
         capture_user_prompt_from_session()
         planner_request = augment_request_with_ui(st.session_state.nl_request)
         model = resolve_llm_model(st.session_state.get("llm_model"), provider)
+        openai_key = openai_key_for_langprompt()
+        langprompt_matches: list[PromptMatch] = []
+        if langprompt_available() and openai_key:
+            try:
+                langprompt_matches = find_similar_prompts(
+                    st.session_state.nl_request,
+                    api_key=openai_key,
+                    top=5,
+                )
+                st.session_state["_langprompt_matches"] = langprompt_matches
+                if st.session_state.get("langprompt_enrich", True):
+                    planner_request = enrich_planner_request(
+                        planner_request,
+                        langprompt_matches,
+                    )
+            except Exception:
+                langprompt_matches = st.session_state.get("_langprompt_matches") or []
+                if st.session_state.get("langprompt_enrich", True) and langprompt_matches:
+                    planner_request = enrich_planner_request(
+                        planner_request,
+                        langprompt_matches,
+                    )
+        model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
         if provider == "gemini":
-            plan = GeminiProvider(api_key=key).generate_run_plan(
+            plan = gemini_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
             )
         elif provider == "claude":
-            plan = ClaudeProvider(api_key=key).generate_run_plan(
+            plan = claude_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
             )
         else:
-            plan = OpenAIProvider(api_key=key).generate_run_plan(
+            plan = openai_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
             )
@@ -4594,6 +4851,14 @@ def run_generate_plan_from_nl_request() -> None:
         refresh_plan_editor_from_state(force=True, remount=True)
         seed_chat_from_generate_plan(user_prompt_for_metadata(), plan)
         save_chat_messages_to_run_folder()
+        if langprompt_available() and openai_key:
+            try:
+                save_prompt_to_library(
+                    st.session_state.nl_request,
+                    api_key=openai_key,
+                )
+            except Exception:
+                pass
         st.success("Run plan generated.")
         st.rerun()
     except Exception as e:
@@ -4621,10 +4886,11 @@ def resolve_voice_transcription_provider() -> tuple[str | None, str | None]:
 
 
 def apply_pending_nl_request_transcript() -> None:
-    """Apply a voice transcript before the nl_request widget is drawn."""
+    """Apply a pending prompt update before the nl_request widget is drawn."""
     pending = st.session_state.pop("_pending_nl_transcript", None)
     if pending is not None:
         st.session_state.nl_request = pending
+        st.session_state.user_prompt = pending
 
 
 def prepare_nl_request_before_render() -> None:
@@ -4647,13 +4913,18 @@ def capture_nl_request_draft() -> None:
 def render_persistent_nl_request(*, visible: bool) -> None:
     """Mount the prompt text_area on every rerun so Prompt/Chat switches keep widget state."""
     prepare_nl_request_before_render()
+    prompt_empty = not s(st.session_state.get("nl_request")) or is_plan_json_text(
+        s(st.session_state.get("nl_request"))
+    )
     if visible:
         def _render_prompt_body() -> None:
+            if prompt_empty:
+                st.caption(NL_REQUEST_PLACEHOLDER)
             st.text_area(
                 "Describe what you want",
                 height=210,
                 key="nl_request",
-                placeholder="Example: Create a safe point-domain SUMMA workflow for Paradise SNOTEL...",
+                placeholder=NL_REQUEST_PLACEHOLDER,
                 label_visibility="collapsed",
             )
 
@@ -4670,6 +4941,7 @@ def render_persistent_nl_request(*, visible: bool) -> None:
         "Describe what you want",
         height=68,
         key="nl_request",
+        placeholder=NL_REQUEST_PLACEHOLDER,
         label_visibility="collapsed",
     )
     st.markdown(
@@ -4703,12 +4975,12 @@ def transcribe_voice_to_nl_request(audio_bytes: bytes, filename: str) -> str | N
     try:
         if provider == "gemini":
             model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL["gemini"]
-            return GeminiProvider(api_key=key).transcribe_audio(
+            return gemini_provider_client(key).transcribe_audio(
                 audio_bytes=audio_bytes,
                 filename=filename,
                 model=model,
             )
-        return OpenAIProvider(api_key=key).transcribe_audio(
+        return openai_provider_client(key).transcribe_audio(
             audio_bytes=audio_bytes,
             filename=filename,
         )
@@ -5689,7 +5961,7 @@ def call_llm_refine_run_plan(
     preserve_workflow_steps: bool = False,
 ) -> tuple[str, dict, bool]:
     if provider_id == "gemini":
-        return GeminiProvider(api_key=api_key).refine_run_plan(
+        return gemini_provider_client(api_key).refine_run_plan(
             model=model,
             user_message=user_message,
             current_plan=current_plan,
@@ -5699,7 +5971,7 @@ def call_llm_refine_run_plan(
             preserve_workflow_steps=preserve_workflow_steps,
         )
     if provider_id == "claude":
-        return ClaudeProvider(api_key=api_key).refine_run_plan(
+        return claude_provider_client(api_key).refine_run_plan(
             model=model,
             user_message=user_message,
             current_plan=current_plan,
@@ -5708,7 +5980,7 @@ def call_llm_refine_run_plan(
             data_dir=SYMFLUENCE_DATA_DIR,
             preserve_workflow_steps=preserve_workflow_steps,
         )
-    return OpenAIProvider(api_key=api_key).refine_run_plan(
+    return openai_provider_client(api_key).refine_run_plan(
         model=model,
         user_message=user_message,
         current_plan=current_plan,
@@ -5945,6 +6217,9 @@ def clear_chat_messages(*, clear_plan: bool = False) -> None:
 ASSISTANT_PANEL_TABS_KEY = "assistant_panel_tabs"
 ASSISTANT_TAB_PROMPT = "Prompt"
 ASSISTANT_TAB_CHAT = "Chat"
+NL_REQUEST_PLACEHOLDER = (
+    "e.g. Run SUMMA preprocessing for Bow River with bounding box and experiment dates."
+)
 
 
 def request_assistant_chat_tab() -> None:
@@ -6212,7 +6487,10 @@ def render_workflow_assistant_panel() -> None:
             apply_pending_nl_request_transcript()
             if st.session_state.pop("_nl_transcribe_ok", False):
                 st.success("Transcription added. Review the prompt, then click Generate plan.")
+            if st.session_state.pop("_langprompt_use_ok", False):
+                st.success("Similar prompt loaded. Review the prompt, then click Generate plan.")
             render_persistent_nl_request(visible=True)
+            render_prompt_library_panel()
 
             voice_provider, _voice_key = resolve_voice_transcription_provider()
             if voice_provider:
@@ -6494,6 +6772,22 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
     else:
         real_spec_dict.pop("pour_point_coords", None)
 
+    if current_pour_local and current_bbox_local:
+        fixed_bbox, bbox_changed, bbox_note = ensure_bounding_box_contains_pour_point(
+            current_pour_local,
+            current_bbox_local,
+        )
+        if bbox_changed:
+            current_bbox_local = fixed_bbox
+            real_spec_dict["bounding_box_coords"] = fixed_bbox
+            st.session_state.selected_bounding_box = fixed_bbox
+            plan = dict(st.session_state.run_plan or {})
+            plan_cfg = dict(plan.get("config") or {})
+            plan_cfg["bounding_box_coords"] = fixed_bbox
+            plan["config"] = plan_cfg
+            st.session_state.run_plan = plan
+            append_session_execution_log(f"\n[Assistant] {bbox_note}\n")
+
     if current_bbox_local:
         real_spec_dict["bounding_box_coords"] = current_bbox_local
     else:
@@ -6599,6 +6893,111 @@ def execute_validate_config_step(output_box) -> tuple[int, str]:
     return rc, msg
 
 
+def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
+    """Return a user-facing error when config is missing fields required for a step."""
+    plan = st.session_state.run_plan or {}
+    plan_cfg = plan.get("config") or {}
+    user_request = user_prompt_for_metadata()
+    domain_name = s(cfg.get("DOMAIN_NAME") or plan_cfg.get("domain_name"))
+    experiment_id = s(plan_cfg.get("experiment_id") or cfg.get("EXPERIMENT_ID") or "run_1")
+    forcing_dataset = s(plan_cfg.get("forcing_dataset") or cfg.get("FORCING_DATASET") or "ERA5")
+
+    if step in ("acquire_attributes", "acquire_forcings"):
+        if not plan_requires_bounding_box(
+            plan_cfg,
+            [step],
+            user_request,
+            data_dir=SYMFLUENCE_DATA_DIR,
+        ):
+            return None
+
+        bbox = s(cfg.get("BOUNDING_BOX_COORDS"))
+        if bbox:
+            return None
+
+        return (
+            f"{step} requires bounding_box_coords for online attribute/forcing download. "
+            "Set a bounding box on the Input tab (map or BBox field), then retry. "
+            "For Bow River near 51.35/-116.02, try 51.76/-116.55/50.95/-115.50 "
+            "(north/west/south/east)."
+        )
+
+    if step == "define_domain":
+        pour = s(cfg.get("POUR_POINT_COORDS"))
+        bbox = s(cfg.get("BOUNDING_BOX_COORDS"))
+        ok, msg = pour_point_inside_bounding_box(pour, bbox)
+        if not ok:
+            return (
+                f"define_domain cannot delineate a watershed when the pour point is outside "
+                f"the bounding box. {msg}"
+            )
+
+    if step == "discretize_domain" and domain_name:
+        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+            return (
+                "discretize_domain needs river basin shapefiles from define_domain first. "
+                f"No {domain_name}_riverBasins_*.shp under "
+                f"SYMFLUENCE_data/domain_{domain_name}/shapefiles/river_basins/. "
+                "Re-run define_domain and confirm that shapefile exists before HRU. "
+                "If define_domain reported success but the file is missing, check the pour "
+                "point lies inside the bounding box (north/west/south/east)."
+            )
+
+    if step == "model_agnostic_preprocessing" and domain_name:
+        missing: list[str] = []
+        hru_count = domain_catchment_hru_count(
+            SYMFLUENCE_DATA_DIR, domain_name, experiment_id
+        )
+        has_catchment_shp = any(
+            path.is_file()
+            for path in domain_catchment_shapefile_candidates(
+                SYMFLUENCE_DATA_DIR, domain_name, experiment_id
+            )
+        )
+        if hru_count < 1:
+            if has_catchment_shp:
+                missing.append(
+                    "discretize_domain (catchment shapefile is empty — widen the bounding box and re-run HRU)"
+                )
+            elif not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+                missing.append("define_domain")
+            else:
+                missing.append("discretize_domain")
+        if not (
+            domain_has_local_era5_raw_forcing(SYMFLUENCE_DATA_DIR, domain_name)
+            or domain_has_local_summa_forcing(SYMFLUENCE_DATA_DIR, domain_name)
+        ):
+            missing.append("acquire_forcings")
+        if missing:
+            return (
+                "model_agnostic_preprocessing needs catchment HRUs and forcing data first. "
+                f"Run these steps before MAP: {', '.join(dict.fromkeys(missing))}."
+            )
+
+    if step == "model_specific_preprocessing" and domain_name:
+        if domain_has_forcing_intersection(
+            SYMFLUENCE_DATA_DIR, domain_name, forcing_dataset=forcing_dataset
+        ):
+            return None
+        return (
+            "model_specific_preprocessing needs the ERA5/catchment intersection from "
+            "model_agnostic_preprocessing. Run define_domain → discretize_domain → "
+            "acquire_forcings → model_agnostic_preprocessing first, or use **Execute plan** "
+            "to run remaining steps in order."
+        )
+
+    return None
+
+
+def format_subprocess_return_code(rc: int) -> str:
+    if rc < 0:
+        return (
+            f"{rc} (process killed by signal {-rc}; often a native library crash — "
+            "see execution.log and SYMFLUENCE_data/.../_workLog_.../)"
+        )
+    return str(rc)
+
+
 def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
     if step in DANGER_STEPS and not st.session_state.allow_run:
         return 1, "Enable **Allow dangerous run steps** in the assistant panel first."
@@ -6609,7 +7008,19 @@ def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
     if step not in DANGER_STEPS and step != "dry_run" and not PROVEN_STATUS.get(step, False):
         return 1, f"Step '{step}' is not marked proven in the assistant yet."
 
-    outdir, out_yaml, _, _ = build_real_run_files_from_state()
+    outdir, out_yaml, manual_cfg, _ = build_real_run_files_from_state()
+    preflight_error = symfluence_step_preflight_error(step, manual_cfg)
+    if preflight_error:
+        log_path = manual_execution_log_path(outdir)
+        ensure_execution_log_preamble(log_path)
+        msg = f"\n===== STEP: {step} =====\nPreflight failed: {preflight_error}\n"
+        append_session_execution_log(msg)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(msg)
+        if output_box is not None:
+            output_box.code(st.session_state.execution_log_text)
+        return 1, preflight_error
+
     log_path = manual_execution_log_path(outdir)
     ensure_execution_log_preamble(log_path)
     cmd = build_symfluence_step_cmd(step, out_yaml)
@@ -6652,7 +7063,12 @@ def execute_step_bundle(bundle_key: str, output_box) -> bool:
                 rc, _ = execute_single_symfluence_step(step, output_box)
         if rc != 0:
             ok = False
-            st.error(f"Bundle stopped at {step} (return code {rc}).")
+            st.error(f"Bundle stopped at {step} (return code {format_subprocess_return_code(rc)}).")
+            if rc < 0:
+                st.caption(
+                    "Negative return codes usually mean the SYMFLUENCE subprocess crashed. "
+                    "Check the Output tab and SYMFLUENCE work logs under SYMFLUENCE_data."
+                )
             break
     if ok:
         st.success(f"Shortcut bundle '{bundle_key}' completed.")
@@ -7360,11 +7776,27 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         or s(st.session_state.selected_bounding_box)
         or bounding_box_input_value()
     )
-    bbox_ok, bbox_msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
-    if pour_coords and bbox_coords and not bbox_ok:
-        st.error(bbox_msg)
-        st.session_state.workflow_executing = False
-        st.stop()
+    if pour_coords and bbox_coords:
+        fixed_bbox, bbox_changed, bbox_note = ensure_bounding_box_contains_pour_point(
+            pour_coords,
+            bbox_coords,
+        )
+        if bbox_changed:
+            bbox_coords = fixed_bbox
+            st.session_state.selected_bounding_box = fixed_bbox
+            plan_cfg = dict(plan.get("config") or {})
+            plan_cfg["bounding_box_coords"] = fixed_bbox
+            plan["config"] = plan_cfg
+            store_run_plan(plan)
+            cfg["BOUNDING_BOX_COORDS"] = fixed_bbox
+            dump_yaml(cfg, out_yaml)
+            st.warning(bbox_note)
+        else:
+            bbox_ok, bbox_msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
+            if not bbox_ok:
+                st.error(bbox_msg)
+                st.session_state.workflow_executing = False
+                st.stop()
 
     danger_confirmed = s(st.session_state.get("danger_phrase", "")) == "RUN"
     danger_found = [step for step in steps if step in DANGER_STEPS]

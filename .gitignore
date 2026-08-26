@@ -9,3 +9,4 @@ runs/*
 !runs/.gitkeep
 .streamlit/secrets.toml
 figures/
+prompts/library/.cache/

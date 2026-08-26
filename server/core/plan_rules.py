@@ -117,7 +117,8 @@ def request_indicates_local_data_reuse(
         return True
 
     cfg = cfg or {}
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     if any(_s(cfg.get(key)).upper() == "LOCAL" for key in ("DATA_ACCESS", "data_access")):
         return True
     if any(_s(extra.get(key)).upper() == "LOCAL" for key in ("DATA_ACCESS", "data_access")):
@@ -329,7 +330,8 @@ def is_weak_domain_name(name: str) -> bool:
 
 
 def domain_name_confirmed_in_plan(cfg: dict) -> bool:
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     return bool(extra.get("domain_name_confirmed") or extra.get("DOMAIN_NAME_CONFIRMED"))
 
 
@@ -677,7 +679,7 @@ def domain_catchment_hru_count(data_dir: str | Path, domain_name: str, experimen
             gdf = gpd.read_file(path)
             for col in ("HRU_ID", "hru_id", "hruId"):
                 if col in gdf.columns:
-                    count = int(gdf[col].nunique())
+                    count = len(gdf[col].unique())
                     break
             if count == 0 and len(gdf) > 0:
                 count = len(gdf)
@@ -692,11 +694,25 @@ def domain_has_local_discretization(
     domain_name: str,
     experiment_id: str = "run_1",
     *,
-    min_hrus: int = 2,
+    min_hrus: int = 1,
 ) -> bool:
     if not data_dir or not _s(domain_name):
         return False
     return domain_catchment_hru_count(data_dir, domain_name, experiment_id) >= min_hrus
+
+
+def domain_has_local_river_basins(
+    data_dir: str | Path | None,
+    domain_name: str,
+) -> bool:
+    """True when define_domain produced at least one river_basins shapefile."""
+    if not data_dir or not _s(domain_name):
+        return False
+    basins_dir = domain_root(data_dir, domain_name) / "shapefiles" / "river_basins"
+    if not basins_dir.is_dir():
+        return False
+    name = _s(domain_name)
+    return any(basins_dir.glob(f"{name}_riverBasins_*.shp"))
 
 
 def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str) -> bool:
@@ -704,6 +720,26 @@ def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str
         return False
     forcing_dir = domain_root(data_dir, domain_name) / "data" / "forcing" / "SUMMA_input"
     return any(forcing_dir.glob("*.nc"))
+
+
+def domain_has_forcing_intersection(
+    data_dir: str | Path | None,
+    domain_name: str,
+    *,
+    forcing_dataset: str = "ERA5",
+) -> bool:
+    """True when model_agnostic_preprocessing intersect output exists."""
+    if not data_dir or not _s(domain_name):
+        return False
+    name = _s(domain_name)
+    base = (
+        domain_root(data_dir, name)
+        / "shapefiles"
+        / "catchment_intersection"
+        / "with_forcing"
+        / f"{name}_{_s(forcing_dataset) or 'ERA5'}_intersected_shapefile"
+    )
+    return base.with_suffix(".shp").is_file() or base.with_suffix(".csv").is_file()
 
 
 def domain_forcing_raw_data_dir(data_dir: str | Path, domain_name: str) -> Path:
@@ -732,7 +768,11 @@ def domain_has_local_era5_raw_forcing(data_dir: str | Path | None, domain_name: 
 
 
 def ensure_local_data_access_in_plan(plan: dict) -> dict:
-    """Set plan config to LOCAL data access (no cloud MAF/gistool fetch)."""
+    """Set plan config to LOCAL data access (reuse on-disk data, no MAF/gistool).
+
+    SYMFLUENCE treats ``LOCAL`` like ``CLOUD`` for ``acquire_*`` steps, skipping
+    files that already exist and downloading only missing artifacts.
+    """
     if not isinstance(plan, dict):
         return plan
     out = dict(plan)
@@ -960,9 +1000,11 @@ def ensure_skip_process_observed_when_local_streamflow(
 
 def domain_has_local_attributes(data_dir: str | Path | None, domain_name: str) -> bool:
     """True when DEM plus at least one land/soil raster already exists on disk."""
+    if not data_dir or not _s(domain_name):
+        return False
     if not domain_has_local_dem(data_dir, domain_name):
         return False
-    root = domain_attributes_root(Path(data_dir), domain_name)
+    root = domain_attributes_root(data_dir, domain_name)
     patterns = (
         "elevation/dem/*.tif",
         "landclass/**/*.tif",
@@ -1045,7 +1087,8 @@ def user_requires_fresh_cloud_workflow(user_request: str, cfg: dict | None = Non
     if any(phrase in text for phrase in _FRESH_CLOUD_WORKFLOW_PHRASES):
         return True
     cfg = cfg or {}
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     data_access = ""
     for key in ("data_access", "DATA_ACCESS"):
         data_access = _s(cfg.get(key) or extra.get(key)).upper()
@@ -1173,7 +1216,8 @@ def plan_uses_local_data(
     if any(p in text for p in _LOCAL_DATA_REUSE_PHRASES):
         return True
 
-    extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
+    extra_raw = cfg.get("extra_config")
+    extra = extra_raw if isinstance(extra_raw, dict) else {}
     data_access_local = any(
         _s(cfg.get(key)).upper() == "LOCAL" or _s(extra.get(key)).upper() == "LOCAL"
         for key in ("DATA_ACCESS", "data_access")

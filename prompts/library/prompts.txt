@@ -1,0 +1,372 @@
+
+
+1:
+Run SUMMA for Bow River from 2004-01-01 01:00 to 2004-01-10 23:00 with experiment id exp_001. The pour point is already selected. Only perform setup and preprocessing, no model run.
+
+2:
+Run a full hydrological workflow for Bow River with experiment id exp025 from 2004-01-01 01:00 to 2004-01-10 23:00. Use hydrological model FUSE. Delineate the domain using pour point 51.3554/-116.0254 and bounding box 51.76/-116.55/50.95/-115.50. Use semidistributed discretization. Perform setup, create pour point, acquire attributes, define domain, discretize domain, process observed data, acquire forcings, model-agnostic preprocessing, model-specific preprocessing, run the model, and postprocess results. This is a full run, not a dry run.
+
+3:
+Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00 with experiment id exp_001. Only perform setup and
+preprocessing, no model run.
+
+
+4:
+Run SUMMA preprocessing for Bow River.
+Configuration:
+- Domain name: Bow_River
+- Experiment ID: exp_010
+- Pour point: 51.35/-116.02
+- Domain definition method: delineate
+- Time range: 2004-01-01 01:00 to 2004-01-10 23:00
+Only perform these steps:
+- validate_config
+- setup_project
+- create_pour_point
+- acquire_attributes
+- define_domain
+- discretize_domain
+- model_agnostic_preprocessing
+
+
+5:
+Extract all model, data, observation, calibration, and evaluation settings from the user prompt.
+Do not put extracted technical fields only in notes. Put them in config.
+
+
+6:
+Run SUMMA preprocessing for Bow River.
+
+Configuration:
+- Domain name: Bow_River
+- Experiment ID: exp_010
+- Pour point: 51.35/-116.02
+- Domain definition method: delineate
+- Time range: 2004-01-01 01:00 to 2004-01-10 23:00
+
+Only perform these steps:
+- validate_config
+- setup_project
+- create_pour_point
+- acquire_attributes
+- define_domain
+- discretize_domain
+- model_agnostic_preprocessing
+- model_specific_preprocessing
+
+Do NOT run the model.
+Return ONLY valid JSON with:
+- config
+- steps
+- needs_user_input
+- notes
+
+7:
+Prepare a SUMMA run for paradise.
+
+Use domain_name paradise.
+Use experiment_id test_1.
+Use pour_point_coords 46.78/-121.75.
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Only run validate_config and setup_project.
+
+8:
+Prepare a point-scale SUMMA setup for Paradise.
+
+Use domain_name paradise.
+Use experiment_id test_2.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Only run validate_config and setup_project.
+
+9:
+Prepare a config-preservation test for Paradise SUMMA.
+
+Use domain_name paradise.
+Use experiment_id test_3.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Only run validate_config and setup_project.
+
+10:
+Prepare a Paradise SNOTEL observation test.
+
+Use domain_name paradise.
+Use experiment_id test_4.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+Use optimization_target swe.
+Use optimization_metric KGE.
+Use calibration_timestep daily.
+
+Run validate_config, setup_project, create_pour_point, and process_observed_data.
+Do not run run_model.
+Do not run calibrate_model.
+
+11:
+Run the Paradise point-scale SUMMA preprocessing workflow.
+
+Use domain_name paradise.
+Use experiment_id test_5.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+Use optimization_target swe.
+Use optimization_metric KGE.
+Use calibration_timestep daily.
+
+Run validate_config, setup_project, create_pour_point, acquire_attributes, define_domain, discretize_domain, acquire_forcings, process_observed_data, model_agnostic_preprocessing, and model_specific_preprocessing.
+
+Do not run run_model.
+Do not run calibrate_model.
+
+
+12:
+Run SUMMA for the already-preprocessed Paradise point-scale SNOTEL example.
+
+Use domain_name paradise.
+Use experiment_id test_6.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+
+Run validate_config and run_model only.
+
+Do not run calibrate_model.
+Do not run postprocess_results.
+
+
+13:
+Run the full Paradise point-scale SUMMA workflow through model execution.
+
+Use domain_name paradise.
+Use experiment_id test_7.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+Use optimization_target swe.
+Use optimization_metric KGE.
+Use calibration_timestep daily.
+
+Run validate_config, setup_project, create_pour_point, acquire_attributes, define_domain, discretize_domain, acquire_forcings, process_observed_data, model_agnostic_preprocessing, model_specific_preprocessing, run_model, and postprocess_results.
+
+Do not run calibrate_model.
+
+
+14:
+Run a small calibration smoke test for the Paradise point-scale SUMMA workflow.
+
+Use domain_name paradise.
+Use experiment_id test_8.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+Use spinup_period 2000-01-01, 2000-01-10.
+Use calibration_period 2000-01-11, 2000-01-20.
+Use evaluation_period 2000-01-21, 2000-01-30.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+Use optimization_target swe.
+Use optimization_metric KGE.
+Use calibration_timestep daily.
+Use iterative_optimization_algorithm DE.
+Use iterations 1.
+Use POPULATION_SIZE 4.
+Use NUM_PROCESSES 1.
+Use MPI_PROCESSES 1.
+
+Run validate_config and calibrate_model only.
+
+Do not run setup_project.
+Do not run run_model.
+
+
+15:
+Prepare a SUMMA advanced-parameter config-preservation test.
+
+Use domain_name advanced_test.
+Use experiment_id test_9.
+Use hydrological_model SUMMA.
+Use domain_def lumped.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 51.1722/-115.5717.
+Use bounding_box_coords 51.76/-116.55/50.95/-115.5.
+
+Use experiment_time_start 2004-01-01 01:00.
+Use experiment_time_end 2004-01-31 23:00.
+
+Set DOWNLOAD_FLUXNET to true.
+Use FLUXNET_STATION DK-Sor.
+Use FORCING_MEASUREMENT_HEIGHT 40.
+Use FORCING_TIME_STEP_SIZE 3600.
+Use DREAM_PAIRS 3.
+Use DREAM_CR 0.9.
+Use DREAM_EPS 0.001.
+Use LIKELIHOOD_FUNCTION gaussian.
+Use MODEL_ERROR_BASE 5.
+Use MODEL_ERROR_FRACTION 0.1.
+Use SETTINGS_MIZU_ROUTING_DT 3600.
+Use ROUTING_DELINEATION lumped.
+Use LUMPED_WATERSHED_METHOD TauDEM.
+
+Only run validate_config and setup_project.
+Do not run run_model.
+Do not run calibrate_model.
+
+
+16:
+Regenerate the Paradise SNOTEL point-scale SUMMA notebook workflow.
+
+Use domain_name paradise.
+Use experiment_id run_notebook_repro_1.
+Use hydrological_model SUMMA.
+Use domain_def point.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+
+Use pour_point_coords 46.78/-121.75.
+Use bounding_box_coords 46.781/-121.751/46.779/-121.749.
+
+Use experiment_time_start 2000-01-01 01:00.
+Use experiment_time_end 2000-01-30 23:00.
+
+Use spinup_period 2000-01-01, 2000-01-10.
+Use calibration_period 2000-01-11, 2000-01-20.
+Use evaluation_period 2000-01-21, 2000-01-30.
+
+Set DOWNLOAD_SNOTEL to true.
+Set SNOTEL_STATION to 679.
+
+Use optimization_target swe.
+Use optimization_metric KGE.
+Use calibration_timestep daily.
+Use iterative_optimization_algorithm DE.
+Use iterations 20.
+Use POPULATION_SIZE 10.
+Use NUM_PROCESSES 1.
+Use MPI_PROCESSES 1.
+
+Use params_to_calibrate tempCritRain,tempRangeTimestep,frozenPrecipMultip,albedoMax,albedoMinWinter,albedoDecayRate,k_soil,vGn_n,theta_sat.
+
+Run validate_config, setup_project, create_pour_point, acquire_attributes, define_domain, discretize_domain, acquire_forcings, process_observed_data, model_agnostic_preprocessing, model_specific_preprocessing, run_model, and postprocess_results.
+
+Do not run calibrate_model.
+
+17:
+Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to 2004-01-10 23:00 with experiment id exp_001
+
+18:
+Run MESH model for Fraser River with experiment id mesh_001
+
+19:
+[config_yaml]
+User intent: change time period to 2010-2020
+
+--- normalized ---
+Config query for test_basin.
+User intent: change time period to 2010-2020
+
+Use domain_name test_basin.
+Use experiment_id run_99.
+Use hydrological_model SUMMA.
+Use domain_def lumped.
+Use discretization GRUs.
+Use forcing_dataset ERA5.
+Use pour_point_coords 51.1722/-115.5717.
+Use bounding_box_coords 51.76/-116.55/50.95/-115.5.
+Use experiment_time_start 2010-01-01 01:00.
+Use experiment_time_end 2020-12-31 23:00.
+Use spinup_period 2010-01-01, 2010-12-31.
+Use calibration_period 2010-01-01, 2015-12-31.
+Use evaluation_period 2016-01-01, 2020-12-31.
+
+--- raw ---
+DOMAIN_NAME: test_basin
+EXPERIMENT_ID: run_99
+HYDROLOGICAL_MODEL: SUMMA
+DOMAIN_DEFINITION_METHOD: lumped
+SUB_GRID_DISCRETIZATION: GRUs
+FORCING_DATASET: ERA5
+POUR_POINT_COORDS: 51.1722/-115.5717
+BOUNDING_BOX_COORDS: 51.76/-116.55/50.95/-115.5
+EXPERIMENT_TIME_START: 2010-01-01 01:00
+EXPERIMENT_TIME_END: 2020-12-31 23:00
+SPINUP_PERIOD: 2010-01-01, 2010-12-31
+CALIBRATION_PERIOD: 2010-01-01, 2015-12-31
+EVALUATION_PERIOD: 2016-01-01, 2020-12-31
+
+20:
+Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00 with experiment id exp_001.
+
+21:
+Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00
+
+22:
+Run Fuse for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
+2004-01-10 23:00

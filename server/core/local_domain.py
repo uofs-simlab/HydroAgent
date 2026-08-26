@@ -290,7 +290,51 @@ def pour_point_inside_bounding_box(pour_coords: str, bbox_coords: str) -> tuple[
         False,
         f"Pour point {lat}/{lon} is outside bounding box "
         f"{north}/{west}/{south}/{east} (north/west/south/east). "
-        "Expand the eastern longitude bound past the pour point before running delineation.",
+        "Expand the box to include the pour point before running delineation "
+        "(for Bow River near 51.35/-116.02, try 51.76/-116.55/50.95/-115.50).",
+    )
+
+
+def bounding_box_around_pour_point(
+    pour_coords: str,
+    *,
+    lat_margin: float = 0.35,
+    lon_margin: float = 0.55,
+) -> str | None:
+    """Build a north/west/south/east bbox centered on the pour point."""
+    pour = _parse_lat_lon_pair(pour_coords)
+    if pour is None:
+        return None
+    lat, lon = pour
+    north = lat + lat_margin
+    south = lat - lat_margin
+    west = lon - lon_margin
+    east = lon + lon_margin
+    return f"{north:.7f}/{west:.7f}/{south:.7f}/{east:.7f}"
+
+
+def ensure_bounding_box_contains_pour_point(
+    pour_coords: str,
+    bbox_coords: str,
+    *,
+    lat_margin: float = 0.35,
+    lon_margin: float = 0.55,
+) -> tuple[str, bool, str]:
+    """Return (bbox, changed, message). Replace bbox when pour point lies outside."""
+    ok, msg = pour_point_inside_bounding_box(pour_coords, bbox_coords)
+    if ok:
+        return bbox_coords, False, ""
+    replacement = bounding_box_around_pour_point(
+        pour_coords,
+        lat_margin=lat_margin,
+        lon_margin=lon_margin,
+    )
+    if replacement is None:
+        return bbox_coords, False, msg
+    return (
+        replacement,
+        True,
+        f"Bounding box adjusted to include pour point {pour_coords}: {replacement}",
     )
 
 
