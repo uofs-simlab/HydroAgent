@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from server.core.plan_rules import (
+    apply_explicit_step_constraints,
+    apply_workflow_config_policies,
     default_symfluence_data_dir,
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
@@ -17,6 +19,11 @@ from server.core.plan_rules import (
     plan_requires_bounding_box,
     pour_point_workflow_skips_bbox,
     request_indicates_local_data_reuse,
+    request_forbids_calibrate,
+    request_forbids_postprocess,
+    request_forbids_run_model,
+    request_requests_validation_dry_run_only,
+    sanitize_planner_experiment_dates,
     sort_plan_steps_by_workflow_order,
     try_restore_local_recovery_plan,
 )
@@ -37,6 +44,27 @@ def _normalize_domain_name_for_config(name: str | None):
 def _extract_domain_name(text: str):
     """Deprecated loose extractor — use extract_explicit_domain_name_from_request."""
     return extract_explicit_domain_name_from_request(text) or None
+
+
+def _apply_negative_step_constraints(steps: list[str], user_request: str) -> list[str]:
+    """Remove steps the user explicitly forbade and unrequested calibrate_model."""
+    if not steps or not user_request:
+        return steps
+    if request_requests_validation_dry_run_only(user_request):
+        return ["validate_config", "dry_run"]
+
+    remove: set[str] = set()
+    if request_forbids_run_model(user_request):
+        remove.update({"run_model", "calibrate_model"})
+    if request_forbids_calibrate(user_request) or not re.search(
+        r"\bcalibrat", user_request.lower()
+    ):
+        remove.add("calibrate_model")
+    if request_forbids_postprocess(user_request):
+        remove.add("postprocess_results")
+    if not remove:
+        return steps
+    return [step for step in steps if step not in remove]
 
 
 def _compact_plan_config(cfg: dict) -> dict:
@@ -253,6 +281,9 @@ def finalize_run_plan(
     if isinstance(end, str) and len(end.strip()) == 10:
         cfg["experiment_time_end"] = end.strip() + " 23:00"
 
+    cfg = sanitize_planner_experiment_dates(cfg, user_request)
+    cfg = apply_workflow_config_policies(cfg, user_request)
+
     if not cfg.get("experiment_id"):
         cfg["experiment_id"] = "exp_001"
 
@@ -323,12 +354,24 @@ def finalize_run_plan(
     bbox_missing = "bounding_box_coords" in missing
 
     if missing_core:
-        plan["needs_user_input"] = missing
-        plan["steps"] = ["validate_config", "dry_run"]
-        plan["notes"] = (
-            f"Missing required inputs: {', '.join(missing)}. "
-            "Returning a safe validation/dry-run plan until those values are provided."
-        )
+        if (
+            missing_core == ["pour_point_coords"]
+            and request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir)
+        ):
+            plan["needs_user_input"] = ["pour_point_coords"]
+            from server.core.plan_rules import _append_plan_note
+
+            _append_plan_note(
+                plan,
+                "Missing pour_point_coords. Workflow steps preserved for local-data reuse.",
+            )
+        else:
+            plan["needs_user_input"] = missing
+            plan["steps"] = ["validate_config", "dry_run"]
+            plan["notes"] = (
+                f"Missing required inputs: {', '.join(missing)}. "
+                "Returning a safe validation/dry-run plan until those values are provided."
+            )
     elif bbox_missing:
         plan["needs_user_input"] = ["bounding_box_coords"]
         from server.core.plan_rules import _append_plan_note
@@ -385,6 +428,8 @@ def finalize_run_plan(
     ordered_steps = sort_plan_steps_by_workflow_order(current_steps)
     if ordered_steps:
         plan["steps"] = ordered_steps
+
+    plan["steps"] = _apply_negative_step_constraints(plan.get("steps", []), user_request)
 
     extracted_fields = []
     for k in [

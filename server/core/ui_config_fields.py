@@ -334,6 +334,8 @@ def normalize_discretization_value(raw: str) -> str:
         return "lumped"
     if lower == "elevation":
         return "elevation"
+    if lower in {"e", "elev"} or lower.startswith("elev"):
+        return "elevation"
     return raw
 
 

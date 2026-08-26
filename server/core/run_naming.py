@@ -11,6 +11,7 @@ PLACEHOLDER_BASIN = "domain"
 PLACEHOLDER_EXPERIMENT = "exp"
 
 _MAC_DUP_SUFFIX_RE = re.compile(r" \((\d+)\)$")
+_UNDERSCORE_DUP_SUFFIX_RE = re.compile(r"_(\d+)$")
 
 
 def sanitize_config_token(name: str) -> str:
@@ -35,8 +36,22 @@ def parse_mac_duplicate_suffix(name: str) -> tuple[str, int | None]:
     return base, int(match.group(1))
 
 
+def duplicate_symfluence_domain(basin_domain: str, suffix_n: int) -> str:
+    """Space-free SYMFLUENCE DOMAIN_NAME for duplicate run ``n`` (TauDEM cannot use spaces)."""
+    basin = sanitize_config_token(basin_domain) or str(basin_domain or "").strip()
+    return f"{basin}_{int(suffix_n)}"
+
+
 def symfluence_domain_mac_suffix(symfluence_domain: str) -> tuple[str, int | None]:
-    return parse_mac_duplicate_suffix(str(symfluence_domain or "").strip())
+    """Split ``BowRiver4 (2)`` or ``BowRiver4_2`` into ``(BowRiver4, 2)``."""
+    text = str(symfluence_domain or "").strip()
+    base, suffix_n = parse_mac_duplicate_suffix(text)
+    if suffix_n is not None:
+        return base, suffix_n
+    match = _UNDERSCORE_DUP_SUFFIX_RE.search(text)
+    if not match:
+        return text, None
+    return text[: match.start()], int(match.group(1))
 
 
 def symfluence_domain_for_run_folder(
@@ -52,7 +67,7 @@ def symfluence_domain_for_run_folder(
         return basin
     base_part, suffix_n = parse_mac_duplicate_suffix(run_folder)
     if base_part == base_run and suffix_n is not None:
-        return f"{basin} ({suffix_n})"
+        return duplicate_symfluence_domain(basin, suffix_n)
     return basin
 
 
@@ -190,7 +205,7 @@ def _allocate_unique_run_folder_excluding(
 
     for n in range(1, 1000):
         candidate = f"{base_run} ({n})"
-        sym_domain = f"{basin} ({n})"
+        sym_domain = duplicate_symfluence_domain(basin, n)
         if not is_run_workspace_taken(
             candidate,
             sym_domain,
@@ -283,7 +298,7 @@ def allocate_unique_run_folder(
 
     for n in range(1, 1000):
         candidate = f"{base_run} ({n})"
-        sym_domain = f"{basin} ({n})"
+        sym_domain = duplicate_symfluence_domain(basin, n)
         if not is_run_workspace_taken(
             candidate,
             sym_domain,

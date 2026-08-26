@@ -232,6 +232,7 @@ Rules:
     - calibrate_model
     - postprocess_results
     when all required inputs are provided and the user requested those steps.
+    If the user asks to delineate (domain_def delineate) and provides pour_point_coords, always include create_pour_point before define_domain.
 
 53. steps must be an ordered list of workflow step names only.
 
