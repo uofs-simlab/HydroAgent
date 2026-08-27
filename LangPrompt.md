@@ -23,6 +23,7 @@ library using semantic (embedding-based) similarity.
    Exact duplicates are skipped.
 5. YAML config queries (flat `KEY: value` files) are normalized to `Use ...`
    lines for matching; the workflow keys are still cached in `prompts.txt`.
+6. requirement.txt:  langchain-core>=0.3.0| langchain-openai>=0.2.0| numpy>=1.24
 
 ## Setup
 
