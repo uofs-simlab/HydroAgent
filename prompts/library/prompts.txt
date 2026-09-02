@@ -370,3 +370,50 @@ Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
 22:
 Run Fuse for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
 2004-01-10 23:00
+
+23:
+run summa for bow river with experiment id = hiva_002
+
+24:
+run summa for 2025/01/10 to 2025/02/30 for bow river
+
+25:
+run summa for bow river from 2024/05/01 to 2024/06/30
+
+26:
+run summa for 2025/05/05 to 2025/06/25
+
+27:
+run summa for 2023/06/03 to 2023/07/13
+
+28:
+run summa for 2022/04/01 to 2022/05/26
+
+29:
+run summa for 2023/05/12 to 2023/06/23
+
+30:
+run summa for  bow river from 2023/04/02 to 2023/05/15
+
+31:
+run summa for bow river from 2022/09/10 t0 2022/10/15
+
+32:
+Run SUMMA for Bow River at 51.35/-116.02 from 2014-01-01 01:00 to
+2014-01-10 23:00
+
+33:
+run summa for 2025/04/10 to 2025/05/30 for bow river
+
+34:
+run summa for bow river from 2023/05/02 to 2023/04/05
+
+35:
+Run SUMMA for Bow River from 2004-04-01 01:00 to
+2004-05-10 23:00 with experiment id exp_001.
+
+36:
+Run Summa for bow river from 2022/04/02 to 2022/05/15
+
+37:
+Run summa for bow river from 2021/04/05 to 2021/05/15

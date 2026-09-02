@@ -23,7 +23,7 @@ A natural-language assistant and Streamlit UI for planning and executing [SYMFLU
 HydroAgent/
 ├── app/
 │   ├── ui_agent.py          # Main Streamlit application
-│   ├── workflow_extras.py   # Results, maps, calibration shortcuts
+│   ├── workflow_extras.py   # Results, maps, calibration shortcuts + calibration agent UI
 │   ├── input_panel_sync.py  # Syncs plan config into session state and Input widgets
 │   └── widget_keys.py       # Versioned Streamlit widget key helpers
 ├── server/
@@ -36,6 +36,7 @@ HydroAgent/
 │   │   ├── validate.py          # Config validation
 │   │   └── parameter_registry.py
 │   ├── capabilities/        # Operation catalog, dependency resolution, proven-status flags
+│   └── calibration/         # CalibHydroAgent integration (agent_integration.py)
 │   └── llm/
 │       ├── plan_shared.py       # Shared schema and plan utilities across providers
 │       ├── openai_provider.py   # OpenAI (GPT) provider

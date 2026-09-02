@@ -1,9 +1,12 @@
 from __future__ import annotations
 # Layout note: minor UI spacing tweaks.
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 import yaml
+
+from server.core.plan_rules import domain_has_usable_local_streamflow
 
 
 # Map normalized assistant/spec fields -> SYMFLUENCE YAML keys
@@ -212,12 +215,75 @@ def sync_legacy_discretization_key(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _parse_experiment_datetime(value: str) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def drop_periods_outside_experiment(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove stale template spinup/calibration/evaluation windows outside the experiment."""
+    exp_start = _parse_experiment_datetime(str(cfg.get("EXPERIMENT_TIME_START") or ""))
+    exp_end = _parse_experiment_datetime(str(cfg.get("EXPERIMENT_TIME_END") or ""))
+    if exp_start is None or exp_end is None:
+        return cfg
+
+    for key in ("SPINUP_PERIOD", "CALIBRATION_PERIOD", "EVALUATION_PERIOD"):
+        period = cfg.get(key)
+        if not period or not isinstance(period, str):
+            continue
+        parts = [part.strip() for part in period.split(",")]
+        if len(parts) != 2:
+            continue
+        period_start = _parse_experiment_datetime(parts[0])
+        period_end = _parse_experiment_datetime(parts[1])
+        if period_start is None or period_end is None:
+            continue
+        if period_end < exp_start or period_start > exp_end:
+            cfg.pop(key, None)
+    return cfg
+
+
+def sanitize_observation_config(
+    cfg: Dict[str, Any],
+    *,
+    data_dir: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Fix template placeholders that break SYMFLUENCE validation or block downloads."""
+    if not cfg.get("DOWNLOAD_USGS_GW"):
+        cfg.pop("USGS_STATION", None)
+    elif cfg.get("USGS_STATION") is not None:
+        cfg["USGS_STATION"] = str(cfg["USGS_STATION"])
+
+    provider = str(cfg.get("STREAMFLOW_DATA_PROVIDER") or "WSC").strip().upper()
+    domain_name = str(cfg.get("DOMAIN_NAME") or "").strip()
+    station_id = str(cfg.get("STATION_ID") or "").strip()
+    has_local = bool(
+        domain_name and data_dir and domain_has_usable_local_streamflow(data_dir, domain_name, cfg)
+    )
+
+    if has_local:
+        cfg["DOWNLOAD_WSC_DATA"] = False
+    elif provider == "WSC" and station_id:
+        cfg["DOWNLOAD_WSC_DATA"] = True
+
+    return cfg
+
+
 def finalize_symfluence_config(cfg: Dict[str, Any], spec: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Last-mile cleanup before writing config.yaml for SYMFLUENCE CLI validation."""
     _ = spec
     cfg = normalize_params_to_calibrate(cfg)
     cfg = sync_legacy_discretization_key(cfg)
     cfg = strip_duplicate_lowercase_keys(cfg)
+    cfg = drop_periods_outside_experiment(cfg)
+    cfg = sanitize_observation_config(
+        cfg,
+        data_dir=cfg.get("SYMFLUENCE_DATA_DIR"),
+    )
     return cfg
 
 

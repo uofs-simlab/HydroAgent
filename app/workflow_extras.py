@@ -19,6 +19,7 @@ ADVANCED_SESSION_FIELDS = [
     ("station_id", "STATION_ID", "Gauging station ID"),
     ("routing_model", "ROUTING_MODEL", "Routing model"),
     ("pet_method", "PET_METHOD", "PET method"),
+    ("stream_threshold", "STREAM_THRESHOLD", "TauDEM stream threshold (flow accumulation)"),
     ("spinup_period", "SPINUP_PERIOD", "Spinup period (YYYY-MM-DD, YYYY-MM-DD)"),
     ("calibration_period", "CALIBRATION_PERIOD", "Calibration period"),
     ("evaluation_period", "EVALUATION_PERIOD", "Evaluation period"),
@@ -132,7 +133,22 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
         add("River basins", layer_paths.get("riverbasins"), "geospatial")
         add("HRUs / GRUs", layer_paths.get("hrugru"), "geospatial")
         add("River network", layer_paths.get("rivernetwork"), "geospatial")
-        add("ERA5 intersection", layer_paths.get("forcing"), "geospatial")
+        forcing_hint = layer_paths.get("forcing")
+        forcing_path = None
+        if forcing_hint:
+            hinted = Path(forcing_hint)
+            forcing_path = _first_existing_artifact(
+                [hinted, hinted.with_suffix(".csv"), hinted.with_suffix(".shp")]
+            )
+        if forcing_path is None and domain_root:
+            from server.core.plan_rules import domain_forcing_intersection_path
+
+            forcing_path = domain_forcing_intersection_path(
+                domain_root.parent,
+                s(ctx.get("domain_name")),
+                forcing_dataset=s(ctx.get("forcing_dataset")) or "ERA5",
+            )
+        add("ERA5 intersection", forcing_path or forcing_hint, "geospatial")
 
     if domain_root and domain_root.exists():
         file_manager = _first_existing_artifact(
@@ -196,14 +212,64 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
                 ),
             }
         )
-    add("routed_flow.csv", mizu_dir / "routed_flow.csv" if mizu_dir else None, "simulation")
+        from server.core.routed_flow import ensure_routed_flow_csv
+
+        try:
+            routed_csv = ensure_routed_flow_csv(mizu_dir)
+        except Exception:
+            routed_csv = None
+        add(
+            "routed_flow.csv",
+            routed_csv or (mizu_dir / "routed_flow.csv"),
+            "simulation",
+        )
+    else:
+        add("routed_flow.csv", mizu_dir / "routed_flow.csv" if mizu_dir else None, "simulation")
 
     if data_dir and domain_root:
         from server.core.plan_rules import domain_streamflow_processed_path
+        from server.core.calibration_logs import (
+            calibration_log_path,
+            find_symfluence_calibration_work_log,
+            iter_calibration_result_dirs,
+            worklog_dir,
+        )
 
         domain_name = s(ctx.get("domain_name"))
+        exp_id = s(ctx.get("experiment_id"))
         obs_path = domain_streamflow_processed_path(data_dir, domain_name)
         add("Observed streamflow (processed)", obs_path, "evaluation")
+        calib_dirs = iter_calibration_result_dirs(domain_root, exp_id)
+        for calib_dir in calib_dirs:
+            add(f"Calibration results ({calib_dir.name})", calib_dir, "calibration")
+            best_params = _first_existing_artifact(sorted(calib_dir.glob("*_best_params.json")))
+            add(
+                f"Best parameters ({calib_dir.name})",
+                best_params or (calib_dir / f"{exp_id}_best_params.json"),
+                "calibration",
+            )
+            iter_csv = _first_existing_artifact(
+                sorted(calib_dir.glob("*iteration_results.csv"))
+            )
+            add(
+                f"Iteration results ({calib_dir.name})",
+                iter_csv or (calib_dir / f"{exp_id}_parallel_iteration_results.csv"),
+                "calibration",
+            )
+            add(f"Final evaluation ({calib_dir.name})", calib_dir / "final_evaluation", "calibration")
+        work_log = find_symfluence_calibration_work_log(domain_root)
+        if calib_dirs or work_log:
+            add(
+                "SYMFLUENCE calibration work log",
+                work_log or worklog_dir(domain_root),
+                "calibration",
+            )
+            if assistant_run:
+                add(
+                    "HydroAgent calibration.log",
+                    calibration_log_path(assistant_run),
+                    "calibration",
+                )
 
     add("Assistant run folder", assistant_run, "assistant")
     add("Assistant config.yaml", assistant_run / "config.yaml" if assistant_run else None, "assistant")
@@ -348,10 +414,22 @@ def sync_calibration_config_to_plan() -> None:
         raw = st.session_state.get(session_key)
         if raw is None or raw == "":
             continue
-        val = str(int(raw)) if session_key in ("iterations", "population_size") else s(raw)
+        if session_key in ("iterations", "population_size"):
+            try:
+                numeric = int(raw)
+            except (TypeError, ValueError):
+                continue
+            cfg[session_key] = str(numeric)
+            cfg[yaml_key] = numeric
+            extra[session_key] = str(numeric)
+            extra[yaml_key] = numeric
+            continue
+        val = s(raw)
         if val:
             cfg[session_key] = val
+            cfg[yaml_key] = val
             extra[session_key] = val
+            extra[yaml_key] = val
     if extra:
         cfg["extra_config"] = extra
     st.session_state.run_plan = plan
@@ -454,12 +532,33 @@ def render_advanced_config_section() -> None:
             st.session_state.station_id = st.text_input(
                 "Station ID",
                 value=s(st.session_state.get("station_id")),
+                placeholder="Leave blank to auto-pick nearest gauge from pour point",
+                help="Optional. WSC example: 05BB001. Blank + WSC provider auto-selects the nearest Environment Canada gauge.",
                 key=input_panel_widget_key("adv_station_id"),
             )
             st.session_state.routing_model = st.text_input(
                 "Routing model",
                 value=s(st.session_state.get("routing_model")) or "mizuRoute",
                 key=input_panel_widget_key("adv_routing_model"),
+            )
+            stream_threshold_raw = st.session_state.get("stream_threshold")
+            stream_threshold_default = 1000
+            if stream_threshold_raw not in (None, ""):
+                try:
+                    stream_threshold_default = int(float(stream_threshold_raw))
+                except (TypeError, ValueError):
+                    pass
+            st.session_state.stream_threshold = st.number_input(
+                "Stream threshold",
+                min_value=100,
+                max_value=50000,
+                value=stream_threshold_default,
+                step=100,
+                help=(
+                    "TauDEM flow-accumulation cutoff for stream delineation. "
+                    "Use a lower value for small domains (e.g. 1000); 5000 can yield no streams."
+                ),
+                key=input_panel_widget_key("adv_stream_threshold"),
             )
         with c2:
             pet_value = coerce_selectbox_value(
@@ -473,21 +572,29 @@ def render_advanced_config_section() -> None:
                 index=PET_METHOD_OPTIONS.index(pet_value),
                 key=input_panel_widget_key("adv_pet_method"),
             )
-            st.session_state.spinup_period = st.text_input(
-                "Spinup period",
-                value=s(st.session_state.get("spinup_period")),
-                placeholder="2004-01-01, 2004-01-04",
-                key=input_panel_widget_key("adv_spinup_period"),
+            from server.core.period_utils import normalize_period_text
+
+            st.session_state.spinup_period = normalize_period_text(
+                st.text_input(
+                    "Spinup period",
+                    value=s(st.session_state.get("spinup_period")),
+                    placeholder="2004-01-01, 2004-01-04",
+                    key=input_panel_widget_key("adv_spinup_period"),
+                )
             )
-            st.session_state.calibration_period = st.text_input(
-                "Calibration period",
-                value=s(st.session_state.get("calibration_period")),
-                key=input_panel_widget_key("adv_calibration_period"),
+            st.session_state.calibration_period = normalize_period_text(
+                st.text_input(
+                    "Calibration period",
+                    value=s(st.session_state.get("calibration_period")),
+                    key=input_panel_widget_key("adv_calibration_period"),
+                )
             )
-            st.session_state.evaluation_period = st.text_input(
-                "Evaluation period",
-                value=s(st.session_state.get("evaluation_period")),
-                key=input_panel_widget_key("adv_evaluation_period"),
+            st.session_state.evaluation_period = normalize_period_text(
+                st.text_input(
+                    "Evaluation period",
+                    value=s(st.session_state.get("evaluation_period")),
+                    key=input_panel_widget_key("adv_evaluation_period"),
+                )
             )
         sync_advanced_config_to_plan()
 
@@ -500,8 +607,22 @@ def augment_request_with_advanced(lines: list[str]) -> list[str]:
     return lines
 
 
-def augment_request_with_calibration(lines: list[str]) -> list[str]:
-    for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
+def augment_request_with_calibration(lines: list[str], nl_request: str = "") -> list[str]:
+    """Only pass calibration widget values that the user named in the main prompt."""
+    try:
+        from calib_hydro_agent.prompt_fields import explicit_calibration_fields_in_prompt
+    except ImportError:
+        return lines
+
+    explicit = explicit_calibration_fields_in_prompt(nl_request)
+    extra_fields = [
+        ("params_to_calibrate", "PARAMS_TO_CALIBRATE"),
+        ("basin_params_to_calibrate", "BASIN_PARAMS_TO_CALIBRATE"),
+    ]
+    all_fields = list(CALIBRATION_SESSION_FIELDS) + extra_fields
+    for session_key, yaml_key in all_fields:
+        if session_key not in explicit:
+            continue
         raw = st.session_state.get(session_key)
         if raw is None or raw == "":
             continue
@@ -636,18 +757,35 @@ def render_flow_duration_tab(ctx: dict, symfluence_data_dir: Path) -> None:
             st.dataframe(fdc, width="stretch", hide_index=True)
 
 
-def render_calibration_section(
+def render_calibration_agent_section(
     *,
-    execute_calibrate_fn,
+    run_agent_fn,
     location: str = "assistant",
 ) -> None:
+    """Calibration UI wired to CalibHydroAgent (design → validate → run → interpret)."""
     from widget_keys import input_panel_widget_key
+    from server.calibration.agent_integration import calib_agent_available, calib_agent_import_error
 
-    prefix = f"calibration_{location}"
-    with st.expander("Calibration", expanded=False):
+    prefix = f"calib_agent_{location}"
+    with st.expander(
+        "Calibration agent (CalibHydroAgent)",
+        expanded=False,
+        key=f"{prefix}_expander",
+    ):
+        if not calib_agent_available():
+            st.warning(
+                "CalibHydroAgent not found. Install sibling repo or set "
+                "`CALIB_HYDRO_AGENT_REPO` to `/path/to/CalibHydroAgent`."
+            )
+            err = calib_agent_import_error()
+            if err:
+                st.caption(err)
+            return
+
         st.caption(
-            "Optimization settings synced to plan/config. Running calibration requires "
-            "**Allow dangerous run steps** and a prepared model setup."
+            "Workflow steps come from the **calibration plan**. Algorithm, metric, parameters, and periods "
+            "are chosen by the agent from your **main prompt** (and SUMMA defaults) unless you name them "
+            "explicitly there — dropdowns update after **Design & validate**."
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -695,7 +833,7 @@ def render_calibration_section(
                     "Iterations",
                     min_value=1,
                     max_value=5000,
-                    value=int(st.session_state.get("iterations", 50) or 50),
+                    value=int(st.session_state.get("iterations", 20) or 20),
                     key=input_panel_widget_key(f"{prefix}_iterations"),
                 )
             )
@@ -708,25 +846,130 @@ def render_calibration_section(
                     key=input_panel_widget_key(f"{prefix}_population"),
                 )
             )
-        st.session_state.calibration_period = st.text_input(
-            "Calibration period",
-            value=s(st.session_state.get("calibration_period")),
-            placeholder="2004-01-05, 2004-01-19",
-            key=input_panel_widget_key(f"{prefix}_calibration_period"),
+        from server.core.period_utils import normalize_period_text
+
+        st.session_state.calibration_period = normalize_period_text(
+            st.text_input(
+                "Calibration period",
+                value=s(st.session_state.get("calibration_period")),
+                placeholder="2004-01-05, 2004-01-19",
+                help="Format: YYYY-MM-DD, YYYY-MM-DD (dates only — no HH:MM).",
+                key=input_panel_widget_key(f"{prefix}_calibration_period"),
+            )
         )
         sync_calibration_config_to_plan()
         sync_advanced_config_to_plan()
 
+        auto_replan = st.checkbox(
+            "Suggest replan after run",
+            value=st.session_state.get("calib_agent_auto_replan", False),
+            key=input_panel_widget_key(f"{prefix}_auto_replan"),
+        )
+        st.session_state.calib_agent_auto_replan = auto_replan
+
+        st.markdown("**Sensitivity-guided parameters**")
+        sensitivity_guided = st.checkbox(
+            "Screen → sensitivity → top N → calibrate",
+            value=bool(st.session_state.get("calib_agent_sensitivity_guided", False)),
+            help=(
+                "Run a short screening calibration on the full default parameter set, "
+                "rank parameters with Symfluence sensitivity analysis, keep the top N, "
+                "then run the final calibration."
+            ),
+            key=input_panel_widget_key(f"{prefix}_sensitivity_guided"),
+        )
+        st.session_state.calib_agent_sensitivity_guided = sensitivity_guided
+        s1, s2 = st.columns(2)
+        with s1:
+            st.session_state.calib_agent_top_n_params = int(
+                st.number_input(
+                    "Top N parameters",
+                    min_value=1,
+                    max_value=20,
+                    value=int(st.session_state.get("calib_agent_top_n_params", 4) or 4),
+                    disabled=not sensitivity_guided,
+                    key=input_panel_widget_key(f"{prefix}_top_n"),
+                )
+            )
+        with s2:
+            st.session_state.calib_agent_screening_iterations = int(
+                st.number_input(
+                    "Screening iterations",
+                    min_value=10,
+                    max_value=500,
+                    value=int(st.session_state.get("calib_agent_screening_iterations", 30) or 30),
+                    disabled=not sensitivity_guided,
+                    help="Short calibration used to sample the parameter space for sensitivity (minimum 10).",
+                    key=input_panel_widget_key(f"{prefix}_screening_iters"),
+                )
+            )
+
+        b1, b2 = st.columns(2)
         disabled = not st.session_state.get("allow_run")
-        if st.button(
-            "Run calibration",
-            key=f"{prefix}_run_calibrate",
-            width="stretch",
-            disabled=disabled,
-        ):
-            execute_calibrate_fn()
+        with b1:
+            if st.button(
+                "Design & validate config",
+                key=f"{prefix}_design",
+                width="stretch",
+            ):
+                run_agent_fn(mode="design")
+        with b2:
+            if st.button(
+                "Run calibration (agent)",
+                key=f"{prefix}_run",
+                width="stretch",
+                disabled=disabled,
+            ):
+                run_agent_fn(mode="run")
         if disabled:
-            st.caption("Enable **Allow dangerous run steps** to run calibration.")
+            st.caption("Enable **Allow dangerous run steps** to execute calibration.")
+
+        last = st.session_state.get("calib_agent_last_outcome")
+        if isinstance(last, dict):
+            st.markdown("**Last agent outcome**")
+            stopped = last.get("stopped")
+            if stopped:
+                st.info(f"Stopped: `{stopped}`")
+            spec = last.get("spec") or {}
+            if spec:
+                st.caption(
+                    f"Model `{spec.get('model')}` · {spec.get('algorithm')} · "
+                    f"{spec.get('optimization_metric')} · {spec.get('number_of_iterations')} iter"
+                )
+            validation = last.get("validation") or {}
+            for issue in validation.get("issues") or []:
+                if issue.get("severity") == "error":
+                    st.error(issue.get("message"))
+                elif issue.get("severity") == "warning":
+                    st.warning(issue.get("message"))
+            prereq = last.get("prerequisites") or {}
+            if prereq.get("missing_steps"):
+                st.warning("Missing steps: " + ", ".join(prereq["missing_steps"]))
+            for note in prereq.get("notes") or []:
+                st.caption(note)
+            interp = last.get("interpretation")
+            if isinstance(interp, dict) and interp.get("summary"):
+                st.success(interp["summary"])
+                for fm in interp.get("failure_modes") or []:
+                    st.error(fm)
+            replan = last.get("replan")
+            if isinstance(replan, dict) and replan.get("action"):
+                st.info(f"Replan: **{replan['action']}** — {replan.get('rationale')}")
+            sensitivity = last.get("sensitivity")
+            if isinstance(sensitivity, dict) and sensitivity.get("enabled"):
+                st.markdown("**Sensitivity guidance**")
+                if sensitivity.get("message"):
+                    st.caption(sensitivity["message"])
+                selected = (sensitivity.get("selected_params") or []) + (
+                    sensitivity.get("selected_basin_params") or []
+                )
+                if selected:
+                    st.success("Selected parameters: " + ", ".join(selected))
+                elif sensitivity_guided := sensitivity.get("top_n"):
+                    st.caption(
+                        f"Will pick top {sensitivity_guided} after screening "
+                        f"({sensitivity.get('screening_iterations', '?')} iter)."
+                    )
 
 
 def render_results_page(*, symfluence_data_dir: Path, runs_dir: Path) -> None:
@@ -881,6 +1124,11 @@ def render_data_page(
     if not ctx.get("domain_name") or not ctx.get("experiment_id"):
         st.info("Configure domain and experiment on **Workflows → Input** first.")
         return
+    assistant_run = ctx.get("assistant_run")
+    if assistant_run:
+        from server.core.calibration_logs import persist_calibration_logs_for_run
+
+        persist_calibration_logs_for_run(assistant_run)
     layer_paths = layer_paths_fn()
     artifacts = scan_run_artifacts(ctx, layer_paths)
     for row in artifacts:
@@ -910,14 +1158,23 @@ def render_logs_page(*, runs_dir: Path, run_folder_skip: set[str]) -> None:
     idx = names.index(default) if default in names else 0
     selected = st.selectbox("Run folder", names, index=idx, key="logs_run_select")
     run_dir = runs_dir / selected
-    log_path = run_dir / "logs" / "execution.log"
+    from server.core.calibration_logs import persist_calibration_logs_for_run
+
+    persist_calibration_logs_for_run(run_dir)
+    logs_dir = run_dir / "logs"
+    log_files = sorted(p for p in logs_dir.glob("*.log") if p.is_file()) if logs_dir.is_dir() else []
     st.markdown(f"**Run directory:** `{run_dir}`")
-    if log_path.exists():
-        st.caption(f"Log file: `{log_path}` ({log_path.stat().st_size} bytes)")
-        n_tail = st.slider("Lines to show", 20, 1000, 120, key="logs_tail_lines")
-        st.code(tail_file(log_path, n_tail) or "(empty log)")
+    if not log_files:
+        st.warning("No log files for this run yet.")
     else:
-        st.warning("No execution.log for this run yet.")
+        log_names = [p.name for p in log_files]
+        default_log = "calibration.log" if "calibration.log" in log_names else "execution.log"
+        log_idx = log_names.index(default_log) if default_log in log_names else 0
+        chosen = st.selectbox("Log file", log_names, index=log_idx, key="logs_file_select")
+        log_path = logs_dir / chosen
+        st.caption(f"Log file: `{log_path}` ({log_path.stat().st_size} bytes)")
+        n_tail = st.slider("Lines to show", 20, 5000, 400, key="logs_tail_lines")
+        st.code(tail_file(log_path, n_tail) or "(empty log)")
     if (run_dir / "config.yaml").exists():
         with st.expander("config.yaml"):
             st.code((run_dir / "config.yaml").read_text(encoding="utf-8")[:12000])
@@ -1002,7 +1259,6 @@ def render_experiments_page(
     runs_dir: Path,
     run_folder_skip: set[str],
     load_run_fn=None,
-    execute_calibrate_fn=None,
 ) -> None:
     st.subheader("Experiments")
     st.caption("Past assistant runs under the local `runs/` folder.")
@@ -1074,14 +1330,6 @@ def render_experiments_page(
             else:
                 st.session_state["_experiments_load_flash"] = ("success", pick)
             st.rerun()
-
-    if execute_calibrate_fn:
-        cal_out = st.empty()
-        render_calibration_section(
-            execute_calibrate_fn=lambda: execute_calibrate_fn(cal_out),
-            location="experiments",
-        )
-
 
 def render_run_shortcuts_section(
     *,

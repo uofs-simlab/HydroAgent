@@ -16,12 +16,14 @@ import traceback
 import json
 import html
 import hashlib
+import importlib
+import math
 import datetime as dt
 import pandas as pd
 import folium
 import streamlit.components.v1 as components
 from streamlit_folium import st_folium
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -54,6 +56,7 @@ from input_panel_sync import sync_plan_config_to_session  # noqa: E402
 from widget_keys import (  # noqa: E402
     bump_all_input_widget_versions,
     bump_config_preview_version,
+    bump_input_panel_widget_version,
     bump_spatial_input_widget_version,
     config_preview_widget_key,
     experiment_datetime_widget_key,
@@ -131,6 +134,8 @@ from server.core.run_naming import (
     symfluence_domain_for_run_folder,
     symfluence_domain_mac_suffix,
 )
+import server.core.plan_rules as _plan_rules_module
+importlib.reload(_plan_rules_module)
 from server.core.plan_rules import (
     apply_chat_config_edits,
     apply_chat_step_edits,
@@ -139,10 +144,12 @@ from server.core.plan_rules import (
     domain_catchment_hru_count,
     domain_has_local_dem,
     domain_has_local_era5_raw_forcing,
-    domain_has_local_streamflow,
+    domain_has_usable_local_streamflow,
     domain_has_local_summa_forcing,
     domain_has_forcing_intersection,
+    domain_has_remapped_forcing,
     domain_has_local_discretization,
+    basin_pour_point_preflight_error,
     domain_has_local_river_basins,
     domain_has_complete_local_workflow,
     domain_name_needs_user_input,
@@ -151,11 +158,18 @@ from server.core.plan_rules import (
     ensure_skip_process_observed_when_local_streamflow,
     extract_explicit_domain_name_from_request,
     extract_station_id_from_request,
+    is_calibration_workflow_plan,
+    planner_mode_instructions,
+    plan_workflow_mode,
     resolve_station_id_from_plan,
+    WORKFLOW_PLAN_MODE_CALIBRATION,
+    WORKFLOW_PLAN_MODE_SIMULATION,
     infer_goal_steps_from_request,
     is_weak_domain_name,
     apply_user_provided_domain_name,
     merge_step_dependencies_preserving_order,
+    merge_domain_config_from_simulation_plan,
+    merge_simulation_steps_into_calibration_plan,
     normalize_committed_plan_config,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
@@ -165,6 +179,7 @@ from server.core.plan_rules import (
     should_reuse_existing_symfluence_domain,
     sort_plan_steps_by_workflow_order,
     strip_user_forbidden_download_steps,
+    strip_agent_calibration_config_unless_in_prompt,
     user_requires_fresh_cloud_workflow,
 )
 
@@ -340,6 +355,7 @@ RUN_FOLDER_SKIP = {"_preview"}
 DEFAULT_SYMFLUENCE_REPO = USER_HOME / "installs" / "SYMFLUENCE"
 DEFAULT_SYMFLUENCE_DATA_DIR = USER_HOME / "installs" / "SYMFLUENCE_data"
 DEFAULT_SYMFLUENCE_PYTHON = USER_HOME / "installs" / "SYMFLUENCE" / "venv" / "bin" / "python"
+DEFAULT_CALIB_HYDRO_AGENT_REPO = USER_HOME / "Desktop" / "CalibHydroAgent"
 
 LOCAL_SETTINGS = load_local_settings()
 
@@ -366,6 +382,11 @@ def s(value) -> str:
     return str(value).strip()
 
 
+def session_state_snapshot() -> dict[str, Any]:
+    """Plain dict copy of Streamlit session state for typed server/bridge calls."""
+    return {str(k): v for k, v in st.session_state.items()}
+
+
 def parse_datetime_value(value: str, fallback: dt.datetime) -> dt.datetime:
     value = s(value)
     if not value:
@@ -379,6 +400,96 @@ def parse_datetime_value(value: str, fallback: dt.datetime) -> dt.datetime:
         except Exception:
             pass
     return fallback
+
+
+def parse_datetime_value_optional(value: str) -> dt.datetime | None:
+    value = s(value)
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+            if fmt == "%Y-%m-%d":
+                return parsed.replace(hour=0, minute=0)
+            return parsed
+        except Exception:
+            pass
+    return None
+
+
+_DEFAULT_EXPERIMENT_START = dt.datetime(2001, 1, 1, 1, 0)
+_DEFAULT_EXPERIMENT_END = dt.datetime(2001, 1, 10, 23, 0)
+EXPERIMENT_DATE_MIN = dt.date(1950, 1, 1)
+EXPERIMENT_DATE_MAX = dt.date(2030, 12, 31)
+_EXPERIMENT_DATE_HELP = f"Selectable range: {EXPERIMENT_DATE_MIN:%Y-%m-%d} to {EXPERIMENT_DATE_MAX:%Y-%m-%d}."
+
+
+def _clamp_experiment_date(value: dt.date, *, min_date: dt.date | None = None) -> dt.date:
+    lower = min_date or EXPERIMENT_DATE_MIN
+    if value < lower:
+        return lower
+    if value > EXPERIMENT_DATE_MAX:
+        return EXPERIMENT_DATE_MAX
+    return value
+
+
+def _experiment_time_plan_keys(kind: str) -> tuple[str, str, str]:
+    if kind == "start":
+        return "tstart", "experiment_time_start", "EXPERIMENT_TIME_START"
+    return "tend", "experiment_time_end", "EXPERIMENT_TIME_END"
+
+
+def resolve_experiment_datetime(kind: str) -> dt.datetime:
+    """Session → plan.config → UI placeholder (never write placeholder back to plan)."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    fallback = _DEFAULT_EXPERIMENT_START if kind == "start" else _DEFAULT_EXPERIMENT_END
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    for raw in (
+        st.session_state.get(session_key),
+        lookup_plan_config(plan_cfg, plan_key, yaml_key),
+    ):
+        parsed = parse_datetime_value_optional(s(raw))
+        if parsed is not None:
+            return parsed
+    return fallback
+
+
+def effective_experiment_time_string(kind: str) -> str:
+    """Authoritative start/end for plan sync — never the Input-tab placeholder."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    for raw in (
+        st.session_state.get(session_key),
+        lookup_plan_config(plan_cfg, plan_key, yaml_key),
+    ):
+        val = s(raw)
+        if val:
+            return val
+    return ""
+
+
+def commit_experiment_datetime_from_widgets(
+    *,
+    kind: str,
+    date_value,
+    time_value,
+) -> None:
+    """Persist widget output; skip writing UI-only placeholder defaults."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    fallback = _DEFAULT_EXPERIMENT_START if kind == "start" else _DEFAULT_EXPERIMENT_END
+    normalized_time = time_value.replace(second=0, microsecond=0)
+    formatted = format_datetime_value(date_value, normalized_time)
+    fallback_formatted = format_datetime_value(fallback.date(), fallback.time())
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    has_authoritative = any(
+        s(v)
+        for v in (
+            st.session_state.get(session_key),
+            lookup_plan_config(plan_cfg, plan_key, yaml_key),
+        )
+    )
+    if has_authoritative or formatted != fallback_formatted:
+        st.session_state[session_key] = formatted
 
 
 def format_datetime_value(date_value, time_value) -> str:
@@ -493,6 +604,7 @@ ASSISTANT_PANEL_TOGGLE_KEY = "assistant_panel_toggle"
 # Middle workflow column: scroll region height (px) and map iframe height inside it.
 WORKFLOW_PANEL_HEIGHT = 720
 WORKFLOW_MAP_HEIGHT = 520
+WORKFLOW_MAP_CENTER = [51.0, -115.5]
 WORKFLOW_MAP_ZOOM = 2
 WORKFLOW_SECTION_KEY = "workflow_section"
 EXECUTION_LOG_TAIL_CHARS = 120_000
@@ -1051,18 +1163,13 @@ def mark_spatial_inputs_stale() -> None:
 
 
 def workflow_input_map_widget_key() -> str:
+    """Stable st_folium key so pan/zoom survive pour-point and bounding-box picks.
+
+    streamlit-folium remounts (and resets the camera) whenever this key or the
+    base-map Leaflet JS changes. Selection overlays belong in a FeatureGroup.
+    """
     version = int(st.session_state.get("workflow_map_widget_version", 0))
-    pour_hidden = int(bool(st.session_state.get("pour_point_map_hidden")))
-    bbox_hidden = int(bool(st.session_state.get("bbox_map_hidden")))
-    pour = None if pour_hidden else _resolve_pour_point_lat_lon()
-    bbox = None if bbox_hidden else _resolve_bounding_box_bounds()
-    pour_tag = (
-        "none"
-        if pour is None
-        else f"{pour[0]:.5f}_{pour[1]:.5f}"
-    )
-    bbox_tag = "none" if bbox is None else "set"
-    return f"input_map_v{version}_ph{pour_hidden}_bh{bbox_hidden}_{pour_tag}_{bbox_tag}"
+    return f"workflow_input_map_v{version}"
 
 
 def pour_point_widget_key() -> str:
@@ -1093,7 +1200,16 @@ def visible_selected_bbox() -> str:
     return s(st.session_state.selected_bounding_box) or bounding_box_input_value()
 
 
+def _on_workflow_input_map_change() -> None:
+    """Apply map clicks before widgets render so markers appear without a second rerun."""
+    handle_workflow_map_selection(
+        st.session_state.get(workflow_input_map_widget_key()),
+        rerun=False,
+    )
+
+
 def bump_workflow_map_widget_version() -> None:
+    """Force a map remount. Avoid on coordinate picks — that resets pan/zoom."""
     st.session_state.workflow_map_widget_version = int(
         st.session_state.get("workflow_map_widget_version", 0)
     ) + 1
@@ -1197,7 +1313,6 @@ def clear_pour_point_selection(*, refresh_editor: bool = True, remount_plan_edit
     bump_spatial_input_widget_version()
     _clear_spatial_from_run_plan(pour=True)
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     if refresh_editor:
         refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
     bump_config_preview_version()
@@ -1212,7 +1327,6 @@ def clear_bounding_box_selection(*, refresh_editor: bool = True, remount_plan_ed
     bump_spatial_input_widget_version()
     _clear_spatial_from_run_plan(bbox=True)
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     if refresh_editor:
         refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
     bump_config_preview_version()
@@ -1598,6 +1712,8 @@ for _provider in ("openai", "gemini", "claude"):
         st.session_state.api_keys[_provider] = _saved_key
 
 st.session_state.setdefault("run_plan", None)
+st.session_state.setdefault("simulation_plan", None)
+st.session_state.setdefault("calibration_plan", None)
 st.session_state.setdefault("execute_plan", False)
 st.session_state.setdefault("workflow_executing", False)
 st.session_state.setdefault("execution_log_text", "")
@@ -1670,7 +1786,7 @@ defaults = {
     "optimization_metric": "KGE",
     "optimization_target": "streamflow",
     "calibration_timestep": "daily",
-    "iterations": 50,
+    "iterations": 20,
     "population_size": 10,
 }
 
@@ -1694,6 +1810,7 @@ WORKFLOW_DISPLAY_ORDER = [
     ("model_agnostic_preprocessing", "MAP"),
     ("model_specific_preprocessing", "MSP"),
     ("run_model", "model"),
+    ("calibrate_model", "calibrate"),
     ("postprocess_results", "postprocess"),
 ]
 
@@ -1767,8 +1884,33 @@ def refresh_workflow_execution_log() -> tuple[bool, str, Path | None]:
     return running, log_text, log_path
 
 
-def render_workflow_output_execution_section() -> None:
-    """Workflow progress and command output on the Output tab (middle panel)."""
+@st.fragment
+def render_output_review_layers_fragment() -> None:
+    """Rebuild only the review map when layer checkboxes change."""
+    available = render_map_layer_checkboxes("out")
+    if available == 0 and symfluence_domain_shapefile_paths():
+        st.caption(
+            "No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first."
+        )
+    output_map = build_pour_point_map(
+        show_dem_layer=st.session_state.show_dem_layer,
+        show_landclass_layer=st.session_state.show_landclass_layer,
+        show_soilclass_layer=st.session_state.show_soilclass_layer,
+        show_riverbasins_layer=st.session_state.show_riverbasins_layer,
+        show_hrugru_layer=st.session_state.show_hrugru_layer,
+        show_forcing_layer=st.session_state.show_forcing_layer,
+        show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
+    )
+    render_workflow_map(
+        output_map,
+        key="output_layers_map",
+        height=360,
+        feature_group_to_add=build_spatial_selection_feature_group(),
+    )
+
+
+def _render_execution_log_body() -> None:
+    """Draw workflow progress + command output from execution.log."""
     global output_box, progress_box
 
     running, log_text, log_path = refresh_workflow_execution_log()
@@ -1804,6 +1946,20 @@ def render_workflow_output_execution_section() -> None:
 
     if log_path is not None:
         st.caption(f"Log file: `{log_path}`")
+
+
+@st.fragment(run_every=5)
+def _render_execution_log_while_running() -> None:
+    _render_execution_log_body()
+
+
+def render_workflow_output_execution_section() -> None:
+    """Workflow progress and command output on the Output tab (middle panel)."""
+    run_dir = active_workflow_run_dir()
+    if run_dir is not None and workflow_is_running(run_dir):
+        _render_execution_log_while_running()
+        return
+    _render_execution_log_body()
 
 
 def clean_cfg_for_safe_run(cfg: dict) -> dict:
@@ -1900,6 +2056,14 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
         return True
     domain_def = s(spec.get("domain_def") or cfg.get("DOMAIN_DEFINITION_METHOD")).lower()
     discretization = s(spec.get("discretization") or cfg.get("DOMAIN_DISCRETIZATION")).upper()
+    model = s(spec.get("hydrological_model") or cfg.get("HYDROLOGICAL_MODEL")).upper()
+    routing = s(spec.get("routing_model") or cfg.get("ROUTING_MODEL")).lower()
+    if (
+        model == "SUMMA"
+        and "mizu" in routing
+        and domain_def in ("delineate", "semidistributed", "semi_distributed")
+    ):
+        return True
     steps = spec.get("steps") or []
     if isinstance(steps, list) and {"define_domain", "discretize_domain"} <= set(steps):
         if domain_def in ("delineate", "semidistributed", "semi_distributed"):
@@ -1920,7 +2084,7 @@ def apply_semi_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
         return cfg
     defaults = {
         "DELINEATION_METHOD": "stream_threshold",
-        "STREAM_THRESHOLD": 5000.0,
+        "STREAM_THRESHOLD": 1000.0,
         "MIN_HRU_SIZE": 0.0,
         "MIN_GRU_SIZE": 0.0,
         "RADIATION_CLASS_NUMBER": 1,
@@ -1950,7 +2114,7 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
     domain_name = s(spec.get("domain_name") or cfg.get("DOMAIN_NAME"))
     defaults = {
         "DELINEATION_METHOD": "stream_threshold",
-        "STREAM_THRESHOLD": 5000.0,
+        "STREAM_THRESHOLD": 1000.0,
         "MIN_HRU_SIZE": 0.0,
         "MIN_GRU_SIZE": 0.0,
         "RADIATION_CLASS_NUMBER": 1,
@@ -2092,7 +2256,7 @@ def is_new_map_click(lat: float, lon: float) -> bool:
     return True
 
 
-def handle_workflow_map_selection(map_data: dict | None) -> None:
+def handle_workflow_map_selection(map_data: dict | None, *, rerun: bool = True) -> None:
     """Apply pour point / bounding box map clicks; ignore stale st_folium replays."""
     if st.session_state.pop("_ignore_map_clicks_once", False):
         return
@@ -2111,7 +2275,8 @@ def handle_workflow_map_selection(map_data: dict | None) -> None:
         current = format_pour_point(lat, lon)
         if s(st.session_state.selected_pour_point) != current:
             set_pour_point_from_map(lat, lon)
-            st.rerun()
+            if rerun:
+                st.rerun()
         return
 
     if st.session_state.map_mode != "bounding_box":
@@ -2124,18 +2289,21 @@ def handle_workflow_map_selection(map_data: dict | None) -> None:
         st.session_state.bbox_point_2 = None
         st.session_state.bbox_selected = False
         sync_spatial_fields_to_run_plan(refresh_editor=True)
-        st.rerun()
+        if rerun:
+            st.rerun()
     elif not st.session_state.bbox_selected:
         lat1, lon1 = st.session_state.bbox_point_1
         set_bounding_box_from_points(lat1, lon1, lat, lon)
-        st.rerun()
+        if rerun:
+            st.rerun()
     else:
         st.session_state.bbox_point_1 = (lat, lon)
         st.session_state.bbox_point_2 = None
         st.session_state.bbox_selected = False
         st.session_state.selected_bounding_box = ""
         mark_spatial_inputs_stale()
-        st.rerun()
+        if rerun:
+            st.rerun()
 
 
 def format_pour_point(lat: float, lon: float) -> str:
@@ -2227,9 +2395,23 @@ def hoist_plan_extra_config_to_spec(spec: dict) -> dict:
     return spec
 
 
+def _station_lookup_cfg_from_plan(plan_cfg: dict | None = None) -> dict:
+    """Plan config enriched with the current pour point for nearest-gauge lookup."""
+    plan_cfg = dict(plan_cfg or {})
+    pour = (
+        s(st.session_state.selected_pour_point)
+        or s(plan_cfg.get("pour_point_coords"))
+    )
+    if pour and not s(plan_cfg.get("pour_point_coords")):
+        plan_cfg["pour_point_coords"] = pour
+    return plan_cfg
+
+
 def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     plan_cfg = plan_cfg or {}
     run_steps = (st.session_state.get("run_plan") or {}).get("steps") or []
+    active_plan = st.session_state.get("run_plan") or {}
+    calibration_plan = is_calibration_workflow_plan(active_plan)
     domain_name = s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name)
     user_request = (
         user_prompt_for_metadata()
@@ -2302,26 +2484,39 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         "hydrological_model": current_hydrological_model(plan_cfg),
         "forcing_dataset": s(lookup_plan_config(plan_cfg, "forcing_dataset", "FORCING_DATASET"))
         or s(st.session_state.forcing_dataset) or None,
-        "station_id": (
+    }
+
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg)
+    explicit_station = (
+        s(lookup_plan_config(plan_cfg, "station_id", "STATION_ID"))
+        or s(st.session_state.station_id)
+    )
+    if calibration_plan:
+        station_id = (
             resolve_station_id_from_plan(
-                plan_cfg,
+                station_lookup_cfg,
                 user_prompt_for_metadata()
                 or conversation_text_for_plan_rules()
                 or s(st.session_state.get("nl_request", "")),
-                fallback=s(st.session_state.station_id),
+                fallback=explicit_station,
             )
             or None
-        ),
+        )
+    else:
+        station_id = explicit_station or None
+    if station_id:
+        spec["station_id"] = station_id
 
-        # Prefer plan/chat NUM_PROCESSES, then Input tab mpi widget
-        "num_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
-        "mpi_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
-
-        "log_level": "INFO",
-        "log_to_file": True,
-        "log_format": "detailed",
-        "force_rerun": True,
-    }
+    spec.update(
+        {
+            "num_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
+            "mpi_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
+            "log_level": "INFO",
+            "log_to_file": True,
+            "log_format": "detailed",
+            "force_rerun": True,
+        }
+    )
 
     # Preserve extra planner-provided config keys.
     # Important for notebook-specific options such as:
@@ -2338,20 +2533,36 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         spec["discretization"] = symfluence_discretization_from_plan(plan_cfg, user_request)
 
     sym_domain = s(spec.get("domain_name"))
-    if plan_uses_local_data(plan_cfg, run_steps, conversation_text_for_plan_rules(), data_dir=SYMFLUENCE_DATA_DIR):
+    obs_cfg = {**plan_cfg, **spec}
+    if calibration_plan and sym_domain and domain_has_usable_local_streamflow(
+        SYMFLUENCE_DATA_DIR, sym_domain, obs_cfg
+    ):
         spec["DOWNLOAD_WSC_DATA"] = False
-    elif sym_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, sym_domain):
-        spec["DOWNLOAD_WSC_DATA"] = False
+    elif (
+        calibration_plan
+        and s(spec.get("streamflow_data_provider") or plan_cfg.get("streamflow_data_provider") or "WSC").upper()
+        == "WSC"
+        and s(spec.get("station_id"))
+    ):
+        spec["DOWNLOAD_WSC_DATA"] = True
+
+    spec["steps"] = list(run_steps)
 
     return hoist_plan_extra_config_to_spec(spec)
 
 
-def store_run_plan(plan: dict | None) -> None:
-    """Persist a compact plan (planner keys only) in session state."""
+def store_run_plan(plan: dict | None, *, mode: str | None = None) -> None:
+    """Persist the active plan and the mode-specific plan slot."""
     if plan is None:
         st.session_state.run_plan = None
         return
-    st.session_state.run_plan = normalize_plan_for_storage(plan)
+    stored = normalize_plan_for_storage(plan)
+    plan_mode = s(mode or stored.get("workflow_plan_mode") or st.session_state.get("workflow_plan_mode"))
+    st.session_state.run_plan = stored
+    if plan_mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        st.session_state.simulation_plan = stored
+    elif plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        st.session_state.calibration_plan = stored
 
 
 def plan_editor_text_from_run_plan() -> str:
@@ -2901,8 +3112,8 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
         "domain_def": s(st.session_state.domain_def),
         "hydrological_model": current_hydrological_model(),
         "forcing_dataset": s(st.session_state.forcing_dataset),
-        "experiment_time_start": s(st.session_state.tstart),
-        "experiment_time_end": s(st.session_state.tend),
+        "experiment_time_start": effective_experiment_time_string("start"),
+        "experiment_time_end": effective_experiment_time_string("end"),
     }
 
     st.session_state.selected_pour_point = values["pour_point_coords"]
@@ -3319,7 +3530,6 @@ def set_pour_point_from_map(lat: float, lon: float) -> None:
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
@@ -3337,7 +3547,6 @@ def set_bounding_box_from_points(lat1: float, lon1: float, lat2: float, lon2: fl
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
@@ -3353,17 +3562,60 @@ def first_existing_gdf(paths: list[str]):
     return None
 
 
+def _zoom_for_span_degrees(span: float) -> int:
+    """Leaflet zoom that frames a lat/lon span instead of the continent default."""
+    span = max(abs(float(span)), 1e-6)
+    zoom = int(round(math.log2(360.0 / span)))
+    return max(5, min(zoom, 14))
+
+
 def _map_view_center_zoom(
     pour_coords: tuple[float, float] | None,
     bbox_bounds: tuple[float, float, float, float] | None,
 ) -> tuple[list[float], int]:
-    """Default map center and zoom."""
+    """Center and zoom for the review map: prefer the defined bounding box."""
     if bbox_bounds is not None:
         north, west, south, east = bbox_bounds
-        return [(north + south) / 2.0, (west + east) / 2.0], WORKFLOW_MAP_ZOOM
+        span = max(abs(north - south), abs(east - west))
+        return [(north + south) / 2.0, (west + east) / 2.0], _zoom_for_span_degrees(span)
     if pour_coords is not None:
-        return [pour_coords[0], pour_coords[1]], WORKFLOW_MAP_ZOOM
-    return [51.0, -115.5], WORKFLOW_MAP_ZOOM
+        return [pour_coords[0], pour_coords[1]], 10
+    return list(WORKFLOW_MAP_CENTER), WORKFLOW_MAP_ZOOM
+
+
+def _fit_review_map_to_extent(
+    m: folium.Map,
+    bbox_bounds: tuple[float, float, float, float] | None,
+    layer_gdfs: list | None = None,
+) -> None:
+    """Frame the review map on the coordinate box, then on loaded shapefiles."""
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        if south != north and west != east:
+            m.fit_bounds([[south, west], [north, east]], padding=(28, 28))
+            return
+    if not layer_gdfs:
+        return
+    souths: list[float] = []
+    wests: list[float] = []
+    norths: list[float] = []
+    easts: list[float] = []
+    for gdf in layer_gdfs:
+        try:
+            framed = gdf
+            if framed.crs and str(framed.crs).lower() not in {"epsg:4326", "wgs84"}:
+                framed = framed.to_crs(4326)
+            minx, miny, maxx, maxy = framed.total_bounds
+            if any(value is None or (isinstance(value, float) and value != value) for value in (minx, miny, maxx, maxy)):
+                continue
+            wests.append(float(minx))
+            souths.append(float(miny))
+            easts.append(float(maxx))
+            norths.append(float(maxy))
+        except Exception:
+            continue
+    if souths:
+        m.fit_bounds([[min(souths), min(wests)], [max(norths), max(easts)]], padding=(28, 28))
 
 
 MAP_FILL_LAYER_SPECS = [
@@ -3376,18 +3628,6 @@ MAP_FILL_LAYER_SPECS = [
 ]
 RIVER_NETWORK_LAYER_SPEC = ("show_rivernetwork_layer", "River network", "rivernetwork")
 MAP_LAYER_CHECKBOX_SPECS = MAP_FILL_LAYER_SPECS + [RIVER_NETWORK_LAYER_SPEC]
-
-
-def _current_fill_layer_selection() -> str | None:
-    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
-        if st.session_state.get(state_key):
-            return path_key
-    return None
-
-
-def _sync_fill_layer_flags_from_selection(selected_path_key: str | None) -> None:
-    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
-        st.session_state[state_key] = bool(selected_path_key) and path_key == selected_path_key
 
 
 def reset_map_layer_ui_state() -> None:
@@ -3544,62 +3784,31 @@ def shapefile_layer_available(path: str) -> bool:
 
 
 def render_map_layer_checkboxes(key_prefix: str) -> int:
-    """Output review map: one fill layer (radio) plus optional river-network overlay."""
+    """Layer toggles for the review map. Returns count of shapefiles found on disk."""
     paths = symfluence_domain_shapefile_paths()
     if not paths:
         st.info("Set **Domain name** and **Experiment ID** to check for review layers.")
         return 0
 
     available_count = 0
-    available_fills: list[tuple[str, str, str]] = []
-    for state_key, label, path_key in MAP_FILL_LAYER_SPECS:
+    cols = st.columns(3)
+    for i, (state_key, label, path_key) in enumerate(MAP_LAYER_CHECKBOX_SPECS):
         shp_path = paths.get(path_key, "")
-        if shapefile_layer_available(shp_path):
+        available = shapefile_layer_available(shp_path)
+        if available:
             available_count += 1
-            available_fills.append((state_key, label, path_key))
-
-    rn_state_key, rn_label, rn_path_key = RIVER_NETWORK_LAYER_SPEC
-    river_path = paths.get(rn_path_key, "")
-    river_available = shapefile_layer_available(river_path)
-    if river_available:
-        available_count += 1
-
-    if not available_fills and not river_available:
-        _sync_fill_layer_flags_from_selection(None)
-        st.session_state.show_rivernetwork_layer = False
-        return 0
-
-    if available_fills:
-        fill_path_keys = [path_key for _, _, path_key in available_fills]
-        fill_labels = {path_key: label for _, label, path_key in available_fills}
-        current_fill = _current_fill_layer_selection()
-        if current_fill not in fill_path_keys:
-            current_fill = fill_path_keys[0]
-        selected_fill = st.radio(
-            "Review fill layer",
-            options=fill_path_keys,
-            index=fill_path_keys.index(current_fill),
-            format_func=lambda path_key: fill_labels[path_key],
-            horizontal=True,
-            label_visibility="collapsed",
-            key=f"{key_prefix}_review_fill_layer",
-        )
-        _sync_fill_layer_flags_from_selection(selected_fill)
-    else:
-        _sync_fill_layer_flags_from_selection(None)
-
-    rn_help = river_path if river_available else f"Not found yet:\n{river_path}"
-    current_rn = bool(st.session_state.get(rn_state_key, False)) if river_available else False
-    if not river_available and st.session_state.get(rn_state_key):
-        st.session_state[rn_state_key] = False
-    st.session_state[rn_state_key] = st.checkbox(
-        rn_label,
-        value=current_rn,
-        disabled=not river_available,
-        key=f"{key_prefix}_{rn_state_key}",
-        help=rn_help,
-    )
-
+        current = bool(st.session_state.get(state_key, False))
+        if not available and current:
+            st.session_state[state_key] = False
+            current = False
+        with cols[i % 3]:
+            st.session_state[state_key] = st.checkbox(
+                label,
+                value=current if available else False,
+                disabled=not available,
+                key=f"{key_prefix}_{state_key}",
+                help=shp_path if available else f"Not found yet:\n{shp_path}",
+            )
     return available_count
 
 
@@ -3692,17 +3901,18 @@ def _map_has_bounding_box() -> bool:
 def _build_map_reference_legend_entries(
     *,
     show_rivernetwork_layer: bool = False,
+    include_spatial_symbols: bool = True,
 ) -> list[dict[str, str]]:
     """Symbol rows for pour point, bounding box, and optional river-network line."""
     entries: list[dict[str, str]] = []
-    if _resolve_pour_point_lat_lon() is not None:
+    if include_spatial_symbols and _resolve_pour_point_lat_lon() is not None:
         entries.append(
             {
                 "label": html.escape("Pour point"),
                 "icon_html": _pour_point_legend_icon_html(),
             }
         )
-    if _map_has_bounding_box():
+    if include_spatial_symbols and _map_has_bounding_box():
         entries.append(
             {
                 "label": html.escape("Bounding box"),
@@ -4186,9 +4396,9 @@ def _resolve_pour_point_lat_lon() -> tuple[float, float] | None:
     return None
 
 
-def _resolve_bounding_box_bounds() -> tuple[float, float, float, float] | None:
+def _resolve_bounding_box_bounds(*, ignore_hidden: bool = False) -> tuple[float, float, float, float] | None:
     """Return (north, west, south, east) from map clicks, text input, or plan config."""
-    if not _bbox_visible_on_map():
+    if not ignore_hidden and not _bbox_visible_on_map():
         return None
 
     if (
@@ -4217,7 +4427,7 @@ def _resolve_bounding_box_bounds() -> tuple[float, float, float, float] | None:
 
 
 def _add_bounding_box_overlay(
-    m: folium.Map,
+    parent: folium.Map | folium.FeatureGroup,
     north: float,
     west: float,
     south: float,
@@ -4232,7 +4442,7 @@ def _add_bounding_box_overlay(
         weight=1,
         fill=True,
         fill_opacity=0.15,
-    ).add_to(m)
+    ).add_to(parent)
     if from_map_clicks and st.session_state.bbox_point_1 and st.session_state.bbox_point_2:
         lat1, lon1 = st.session_state.bbox_point_1
         lat2, lon2 = st.session_state.bbox_point_2
@@ -4240,23 +4450,23 @@ def _add_bounding_box_overlay(
             [lat1, lon1],
             tooltip="Bounding box corner 1",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
         folium.Marker(
             [lat2, lon2],
             tooltip="Bounding box corner 2",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
     else:
         folium.Marker(
             [north, west],
             tooltip="Bounding box (north/west)",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
         folium.Marker(
             [south, east],
             tooltip="Bounding box (south/east)",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
 
 
 def _pour_point_map_icon() -> folium.DivIcon:
@@ -4277,7 +4487,7 @@ def _pour_point_map_icon() -> folium.DivIcon:
 
 
 def _add_pour_point_marker(
-    m: folium.Map,
+    parent: folium.Map | folium.FeatureGroup,
     lat: float,
     lon: float,
     *,
@@ -4287,7 +4497,48 @@ def _add_pour_point_marker(
         location=[lat, lon],
         tooltip=tooltip,
         icon=_pour_point_map_icon(),
-    ).add_to(m)
+    ).add_to(parent)
+
+
+def build_spatial_selection_feature_group() -> folium.FeatureGroup:
+    """Pour-point / bounding-box overlays that update without remounting the map."""
+    fg = folium.FeatureGroup(name="Spatial selection")
+    bbox_bounds = _resolve_bounding_box_bounds()
+    pour_coords = _resolve_pour_point_lat_lon()
+
+    if (
+        _bbox_visible_on_map()
+        and st.session_state.bbox_point_1 is not None
+        and not st.session_state.bbox_selected
+    ):
+        lat1, lon1 = st.session_state.bbox_point_1
+        folium.Marker(
+            [lat1, lon1],
+            tooltip="Bounding box corner 1",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(fg)
+
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        from_clicks = bool(
+            st.session_state.bbox_selected
+            and st.session_state.bbox_point_1
+            and st.session_state.bbox_point_2
+        )
+        _add_bounding_box_overlay(
+            fg,
+            north,
+            west,
+            south,
+            east,
+            from_map_clicks=from_clicks,
+        )
+
+    if pour_coords is not None:
+        tooltip = "Selected pour point" if st.session_state.get("map_point_selected") else "Pour point"
+        _add_pour_point_marker(fg, pour_coords[0], pour_coords[1], tooltip=tooltip)
+
+    return fg
 
 
 def build_pour_point_map(
@@ -4301,27 +4552,22 @@ def build_pour_point_map(
     show_hrugru_layer: bool = False,
     show_forcing_layer: bool = False,
     show_rivernetwork_layer: bool = False,
+    *,
+    lock_initial_view: bool = False,
 ):
-    bbox_bounds = _resolve_bounding_box_bounds()
-    pour_coords = _resolve_pour_point_lat_lon()
-    center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
-    center_lat, center_lon = center[0], center[1]
+    bbox_bounds = None if lock_initial_view else _resolve_bounding_box_bounds(ignore_hidden=True)
+    pour_coords = None if lock_initial_view else _resolve_pour_point_lat_lon()
+    if lock_initial_view:
+        center_lat, center_lon = WORKFLOW_MAP_CENTER
+        zoom = WORKFLOW_MAP_ZOOM
+    else:
+        center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
+        center_lat, center_lon = center[0], center[1]
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
 
-    if (
-        _bbox_visible_on_map()
-        and st.session_state.bbox_point_1 is not None
-        and not st.session_state.bbox_selected
-    ):
-        lat1, lon1 = st.session_state.bbox_point_1
-        folium.Marker(
-            [lat1, lon1],
-            tooltip="Bounding box corner 1",
-            icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
-
     active_legend_spec: dict = {}
+    active_gdfs: list = []
     try:
         layer_paths = symfluence_domain_shapefile_paths()
         if layer_paths:
@@ -4385,8 +4631,6 @@ def build_pour_point_map(
                 folium.GeoJson(**geojson_kwargs).add_to(m)
                 return gdf, legend_spec
 
-            active_gdfs = []
-
             if show_dem_layer:
                 gdf, legend_spec = add_layer_if_exists(dem_path, "DEM Catchment", "red")
                 if gdf is not None:
@@ -4431,35 +4675,20 @@ def build_pour_point_map(
     except Exception as e:
         st.warning(f"Shapefile layer load failed: {e}")
 
-    if bbox_bounds is not None:
-        north, west, south, east = bbox_bounds
-        from_clicks = bool(
-            st.session_state.bbox_selected
-            and st.session_state.bbox_point_1
-            and st.session_state.bbox_point_2
-        )
-        _add_bounding_box_overlay(
-            m,
-            north,
-            west,
-            south,
-            east,
-            from_map_clicks=from_clicks,
-        )
-
+    # Selection markers live in a FeatureGroup so changing them does not remount
+    # the map (streamlit-folium hashes the base-map Leaflet JS into its widget key).
     _add_choropleth_legend_to_map(
         m,
         active_legend_spec,
         reference_entries=_build_map_reference_legend_entries(
             show_rivernetwork_layer=show_rivernetwork_layer,
+            include_spatial_symbols=not lock_initial_view,
         ),
     )
 
-    if pour_coords is not None:
-        tooltip = "Selected pour point" if st.session_state.get("map_point_selected") else "Pour point"
-        _add_pour_point_marker(m, pour_coords[0], pour_coords[1], tooltip=tooltip)
-
     folium.LayerControl().add_to(m)
+    if not lock_initial_view:
+        _fit_review_map_to_extent(m, bbox_bounds, active_gdfs)
     return m
 
 
@@ -4468,15 +4697,21 @@ def render_workflow_map(
     *,
     key: str,
     height: int | None = None,
+    feature_group_to_add: folium.FeatureGroup | None = None,
+    on_change=None,
 ) -> dict | None:
     """Folium map sized to the middle workflow column width."""
-    return st_folium(
-        map_obj,
-        key=key,
-        height=height or WORKFLOW_MAP_HEIGHT,
-        use_container_width=True,
-        returned_objects=["last_clicked"],
-    )
+    kwargs: dict[str, Any] = {
+        "key": key,
+        "height": height or WORKFLOW_MAP_HEIGHT,
+        "use_container_width": True,
+        "returned_objects": ["last_clicked"],
+    }
+    if feature_group_to_add is not None:
+        kwargs["feature_group_to_add"] = feature_group_to_add
+    if on_change is not None:
+        kwargs["on_change"] = on_change
+    return st_folium(map_obj, **kwargs)
 
 
 def dump_yaml(data, path: Path):
@@ -4512,7 +4747,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path, output_box, log_path: Path | None 
             log_file.close()
 
 
-def augment_request_with_ui(nl: str) -> str:
+def augment_request_with_ui(nl: str, *, workflow_plan_mode: str | None = None) -> str:
     lines = [s(nl), "", "Optional UI inputs (use ONLY if non-empty):"]
 
     if s(st.session_state.domain_name):
@@ -4538,7 +4773,11 @@ def augment_request_with_ui(nl: str) -> str:
         lines.append(f"- experiment_time_end: {s(st.session_state.tend)}")
 
     lines = wx.augment_request_with_advanced(lines)
-    lines = wx.augment_request_with_calibration(lines)
+    if s(workflow_plan_mode) == WORKFLOW_PLAN_MODE_CALIBRATION:
+        lines = wx.augment_request_with_calibration(lines, s(nl))
+    mode_hint = planner_mode_instructions(workflow_plan_mode or "")
+    if mode_hint:
+        lines.append(mode_hint.strip())
     return "\n".join(lines).strip() + "\n"
 
 
@@ -4625,7 +4864,11 @@ def render_prompt_library_panel() -> None:
     if not matches:
         return
 
-    with st.expander("Similar prompts", expanded=True):
+    similar_expander_key = "langprompt_similar_expander"
+    if find_clicked or rebuild_clicked:
+        st.session_state[similar_expander_key] = True
+
+    with st.expander("Similar prompts", expanded=False, key=similar_expander_key):
         for index, match in enumerate(matches):
             if not hasattr(match, "score"):
                 continue
@@ -4647,8 +4890,12 @@ def render_prompt_library_panel() -> None:
                 st.markdown("---")
 
 
-def run_generate_plan_from_nl_request() -> None:
-    """NL prompt -> full SYMFLUENCE run plan (config, steps, needs_user_input)."""
+def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
+    """NL prompt -> SYMFLUENCE run plan for simulation or calibration workflow."""
+    workflow_plan_mode = s(workflow_plan_mode).lower()
+    if workflow_plan_mode not in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
+        st.error("Unknown workflow plan mode.")
+        return
     provider = s(st.session_state.get("llm_provider")) or "openai"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
     key = st.session_state.api_keys.get(provider)
@@ -4663,7 +4910,10 @@ def run_generate_plan_from_nl_request() -> None:
         return
     try:
         capture_user_prompt_from_session()
-        planner_request = augment_request_with_ui(st.session_state.nl_request)
+        planner_request = augment_request_with_ui(
+            st.session_state.nl_request,
+            workflow_plan_mode=workflow_plan_mode,
+        )
         openai_key = openai_key_for_langprompt()
         langprompt_matches: list[PromptMatch] = []
         if langprompt_available() and openai_key:
@@ -4704,11 +4954,20 @@ def run_generate_plan_from_nl_request() -> None:
             )
         plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
         convo = conversation_text_for_plan_rules() or s(st.session_state.nl_request)
+        plan["workflow_plan_mode"] = workflow_plan_mode
+        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+            sim_plan = st.session_state.get("simulation_plan")
+            plan = merge_domain_config_from_simulation_plan(plan, sim_plan)
+            plan = merge_simulation_steps_into_calibration_plan(plan, sim_plan)
         plan = normalize_local_workflow_plan(
             plan,
             convo,
             data_dir=SYMFLUENCE_DATA_DIR,
+            workflow_plan_mode=workflow_plan_mode,
         )
+        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+            plan = strip_agent_calibration_config_unless_in_prompt(plan, s(st.session_state.nl_request))
+        st.session_state.workflow_plan_mode = workflow_plan_mode
 
         if not isinstance(plan, dict):
             raise RuntimeError(f"Planner returned non-dict: {type(plan)}")
@@ -4723,7 +4982,7 @@ def run_generate_plan_from_nl_request() -> None:
         if not isinstance(plan["needs_user_input"], list) or not all(isinstance(x, str) for x in plan["needs_user_input"]):
             raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
 
-        store_run_plan(plan)
+        store_run_plan(plan, mode=workflow_plan_mode)
         st.session_state.pop("_committed_plan_steps", None)
         apply_plan_config_to_ui(plan)
         if s(st.session_state.get("run_folder")):
@@ -4739,7 +4998,11 @@ def run_generate_plan_from_nl_request() -> None:
                 )
             except Exception:
                 pass
-        st.success("Run plan generated.")
+        st.success(
+            "Simulation plan generated."
+            if workflow_plan_mode == WORKFLOW_PLAN_MODE_SIMULATION
+            else "Calibration plan generated."
+        )
         st.rerun()
     except Exception as e:
         st.error(f"Planning error: {e}")
@@ -6394,13 +6657,70 @@ def render_workflow_assistant_panel() -> None:
                 '<div class="assistant-plan-divider">------------------</div>',
                 unsafe_allow_html=True,
             )
+        gen_sim_col, gen_cal_col = st.columns(2)
+        with gen_sim_col:
             if st.button(
-                "Generate plan",
-                key="generate_plan_gpt",
+                "Generate simulation plan",
+                key="generate_plan_simulation",
+                width="stretch",
+                type="primary",
+                help="Domain setup, preprocessing, and run_model — no calibration or gauge download.",
+            ):
+                run_generate_plan_from_nl_request(workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION)
+        with gen_cal_col:
+            if st.button(
+                "Generate calibration plan",
+                key="generate_plan_calibration",
                 width="stretch",
                 type="secondary",
+                help="Adds process_observed_data, calibrate_model, station_id, and optimization settings.",
             ):
-                run_generate_plan_from_nl_request()
+                run_generate_plan_from_nl_request(workflow_plan_mode=WORKFLOW_PLAN_MODE_CALIBRATION)
+
+        # Calibration agent: visible once a plan exists (calibration plans use it; simulation plans can add cal later).
+        if st.session_state.get("run_plan") is None:
+            st.info(
+                "After you generate a plan, the **Calibration agent (CalibHydroAgent)** panel appears here. "
+                "Use **Generate calibration plan** when you are ready to optimize parameters."
+            )
+        else:
+            mode_label = plan_workflow_mode(st.session_state.run_plan)
+            if mode_label == WORKFLOW_PLAN_MODE_SIMULATION:
+                st.caption("Plan mode: **simulation** — no station/calibration fields unless you add them in chat.")
+            elif mode_label == WORKFLOW_PLAN_MODE_CALIBRATION:
+                st.caption("Plan mode: **calibration** — includes gauge data and calibrate_model when applicable.")
+
+            st.session_state.allow_run = st.checkbox(
+                "Allow dangerous run steps",
+                value=st.session_state.get("allow_run", False),
+                key="allow_run_before_calibration",
+            )
+            st.text_input(
+                "Type RUN to allow dangerous execution",
+                key="danger_phrase",
+                help="Required for run_model or calibrate_model.",
+            )
+
+            assistant_cal_agent_out = st.empty()
+
+            def _assistant_run_calibration_agent(mode: str) -> None:
+                if mode == "run" and not st.session_state.allow_run:
+                    st.error("Enable **Allow dangerous run steps** first.")
+                    return
+                ok, result = run_calibration_agent_from_state(mode, assistant_cal_agent_out)
+                if result.get("error"):
+                    st.error(result["error"])
+                elif mode == "design" and ok:
+                    st.success("Calibration config designed and validated.")
+                elif mode == "run" and ok and (result.get("run") or {}).get("success"):
+                    st.success("Calibration agent run finished.")
+                elif mode == "run":
+                    st.error("Calibration agent run did not succeed.")
+
+            wx.render_calibration_agent_section(
+                run_agent_fn=_assistant_run_calibration_agent,
+                location="assistant",
+            )
 
         if st.session_state.get("run_plan") is not None:
             plan_text_holder = render_persistent_plan_editor(visible=True)
@@ -6431,15 +6751,6 @@ def render_workflow_assistant_panel() -> None:
                 "Also run create_pour_point",
                 value=st.session_state.want_create_pour_point,
             )
-            st.session_state.allow_run = st.checkbox(
-                "Allow dangerous run steps",
-                value=st.session_state.get("allow_run", False),
-            )
-            st.text_input(
-                "Type RUN to allow dangerous execution",
-                key="danger_phrase",
-                help="Required for run_model or calibrate_model.",
-            )
 
             render_fix_missing_inputs_section(
                 (st.session_state.run_plan or {}).get("needs_user_input", []) or []
@@ -6457,23 +6768,6 @@ def render_workflow_assistant_panel() -> None:
                 location="assistant",
             )
 
-            assistant_cal_out = st.empty()
-
-            def _assistant_run_calibrate() -> None:
-                if not st.session_state.allow_run:
-                    st.error("Enable **Allow dangerous run steps** first.")
-                    return
-                with st.spinner("Running calibration…"):
-                    rc, _ = execute_single_symfluence_step("calibrate_model", assistant_cal_out)
-                if rc == 0:
-                    st.success("Calibration step finished.")
-                else:
-                    st.error(f"Calibration failed (return code {rc}).")
-
-            wx.render_calibration_section(
-                execute_calibrate_fn=_assistant_run_calibrate,
-                location="assistant",
-            )
             steps_set = set(st.session_state.run_plan.get("steps", []) or [])
             needs_confirm = bool(steps_set & DANGER_STEPS)
             can_execute = len(needs) == 0
@@ -6670,6 +6964,20 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 
     dump_yaml(real_cfg, real_out_yaml)
 
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg_local)
+    station_id = resolve_station_id_from_plan(
+        station_lookup_cfg,
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", "")),
+        fallback=s(st.session_state.station_id),
+    )
+    if station_id:
+        real_cfg["STATION_ID"] = station_id
+        if not domain_has_usable_local_streamflow(
+            SYMFLUENCE_DATA_DIR, s(real_cfg.get("DOMAIN_NAME")), real_cfg
+        ):
+            real_cfg["DOWNLOAD_WSC_DATA"] = True
+        dump_yaml(real_cfg, real_out_yaml)
+
     write_run_metadata_files(
         real_outdir,
         st.session_state.run_plan or {},
@@ -6682,6 +6990,39 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 def append_session_execution_log(chunk: str) -> None:
     prev = st.session_state.get("execution_log_text", "") or ""
     st.session_state.execution_log_text = prev + chunk
+
+
+def append_calibration_agent_to_execution_log(outdir: Path, result: dict) -> None:
+    """Persist CalibHydroAgent subprocess output into the run execution.log."""
+    run = result.get("run") if isinstance(result.get("run"), dict) else {}
+    logs = str(run.get("logs_excerpt") or result.get("error") or "").strip()
+    rc = run.get("return_code")
+    stopped = result.get("stopped")
+    interp = result.get("interpretation") if isinstance(result.get("interpretation"), dict) else {}
+    summary = str(interp.get("summary") or "").strip()
+    lines = ["", "===== STEP: calibrate_model ====="]
+    command = run.get("raw", {}).get("command") if isinstance(run.get("raw"), dict) else None
+    if command:
+        lines.append("$ " + " ".join(str(part) for part in command))
+    if stopped:
+        lines.append(f"stopped={stopped}")
+    if summary:
+        lines.append(summary)
+    if logs:
+        lines.append(logs)
+    else:
+        lines.append("(no subprocess output captured)")
+    if rc is not None:
+        lines.append(f"\n[STEP calibrate_model] return code: {rc}")
+    chunk = "\n".join(lines) + "\n"
+    log_path = execution_log_path(outdir)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(chunk)
+    append_session_execution_log(chunk)
+    from server.core.calibration_logs import persist_calibration_logs_for_run
+
+    persist_calibration_logs_for_run(outdir)
 
 
 def manual_execution_log_path(outdir: Path) -> Path:
@@ -6769,8 +7110,14 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
             "(north/west/south/east)."
         )
 
+    pour = s(cfg.get("POUR_POINT_COORDS") or plan_cfg.get("pour_point_coords"))
+    symfluence_domain = (
+        s(cfg.get("DOMAIN_NAME"))
+        or symfluence_domain_name(domain_name, experiment_id)
+        or domain_name
+    )
+
     if step == "define_domain":
-        pour = s(cfg.get("POUR_POINT_COORDS"))
         bbox = s(cfg.get("BOUNDING_BOX_COORDS"))
         ok, msg = pour_point_inside_bounding_box(pour, bbox)
         if not ok:
@@ -6779,15 +7126,22 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
                 f"the bounding box. {msg}"
             )
 
+    basin_err = basin_pour_point_preflight_error(
+        step, pour, SYMFLUENCE_DATA_DIR, symfluence_domain
+    )
+    if basin_err:
+        return basin_err
+
     if step == "discretize_domain" and domain_name:
-        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, symfluence_domain):
             return (
                 "discretize_domain needs river basin shapefiles from define_domain first. "
-                f"No {domain_name}_riverBasins_*.shp under "
-                f"SYMFLUENCE_data/domain_{domain_name}/shapefiles/river_basins/. "
+                f"No {symfluence_domain}_riverBasins_*.shp under "
+                f"SYMFLUENCE_data/domain_{symfluence_domain}/shapefiles/river_basins/. "
                 "Re-run define_domain and confirm that shapefile exists before HRU. "
-                "If define_domain reported success but the file is missing, check the pour "
-                "point lies inside the bounding box (north/west/south/east)."
+                "If define_domain reported success but the file is missing, the pour point "
+                "may lie off the river network or delineation failed for a basin-related reason "
+                "(widening the bounding box alone may not fix this)."
             )
 
     if step == "model_agnostic_preprocessing" and domain_name:
@@ -6822,10 +7176,17 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
             )
 
     if step == "model_specific_preprocessing" and domain_name:
+        if domain_has_remapped_forcing(SYMFLUENCE_DATA_DIR, domain_name):
+            return None
         if domain_has_forcing_intersection(
             SYMFLUENCE_DATA_DIR, domain_name, forcing_dataset=forcing_dataset
         ):
-            return None
+            return (
+                "model_specific_preprocessing needs remapped basin-averaged forcing "
+                "(.nc under data/forcing/basin_averaged_data). MAP created the intersection "
+                "shapefile but remapping did not write NetCDF files. Re-run "
+                "model_agnostic_preprocessing."
+            )
         return (
             "model_specific_preprocessing needs the ERA5/catchment intersection from "
             "model_agnostic_preprocessing. Run define_domain → discretize_domain → "
@@ -6843,6 +7204,69 @@ def format_subprocess_return_code(rc: int) -> str:
             "see execution.log and SYMFLUENCE_data/.../_workLog_.../)"
         )
     return str(rc)
+
+
+def run_calibration_agent_from_state(mode: str, output_box) -> tuple[bool, dict]:
+    """Invoke CalibHydroAgent via server.calibration.agent_integration."""
+    from server.calibration.agent_integration import run_calibration_assistant
+
+    outdir, out_yaml, manual_cfg, _ = build_real_run_files_from_state()
+    st.session_state["_calib_base_config"] = manual_cfg
+
+    user_prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    allow = bool(st.session_state.get("allow_run")) and mode == "run"
+
+    with st.spinner("Calibration agent…" if mode == "run" else "Designing calibration…"):
+        result = run_calibration_assistant(
+            config_path=out_yaml,
+            session_state=session_state_snapshot(),
+            plan=st.session_state.run_plan or {},
+            user_prompt=user_prompt,
+            symfluence_repo=SYMFLUENCE_REPO,
+            symfluence_python=SYMFLUENCE_PYTHON,
+            symfluence_data_dir=SYMFLUENCE_DATA_DIR,
+            calib_repo=DEFAULT_CALIB_HYDRO_AGENT_REPO,
+            execute=(mode == "run"),
+            allow_dangerous=allow,
+            auto_replan=bool(st.session_state.get("calib_agent_auto_replan")),
+            sensitivity_guided=bool(st.session_state.get("calib_agent_sensitivity_guided")),
+            top_n_params=int(st.session_state.get("calib_agent_top_n_params", 4) or 4),
+            screening_iterations=int(st.session_state.get("calib_agent_screening_iterations", 30) or 30),
+        )
+
+    st.session_state["calib_agent_last_outcome"] = result
+    updated_plan = result.get("updated_plan")
+    if isinstance(updated_plan, dict):
+        store_run_plan(updated_plan, mode=WORKFLOW_PLAN_MODE_CALIBRATION)
+        wx.apply_advanced_config_from_plan((updated_plan.get("config") or {}))
+        refresh_plan_editor_from_state(force=True, remount=True)
+        bump_input_panel_widget_version()
+        bump_config_preview_version()
+        write_run_metadata_files(
+            outdir,
+            st.session_state.run_plan or updated_plan,
+            spec_dict=result.get("spec"),
+        )
+
+    msg_lines = []
+    stopped = result.get("stopped")
+    if stopped:
+        msg_lines.append(f"stopped={stopped}")
+    interp = result.get("interpretation") or {}
+    if isinstance(interp, dict) and interp.get("summary"):
+        msg_lines.append(interp["summary"])
+    if result.get("error"):
+        msg_lines.append(str(result["error"]))
+    text = "\n".join(msg_lines) or json.dumps(result, indent=2, default=str)
+    if output_box is not None:
+        output_box.code(text)
+    if mode == "run":
+        append_calibration_agent_to_execution_log(outdir, result)
+    else:
+        append_session_execution_log(f"\n[CalibHydroAgent mode={mode}]\n{text}\n")
+    if isinstance(updated_plan, dict):
+        st.rerun()
+    return bool(result.get("ok")), result
 
 
 def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
@@ -6948,58 +7372,40 @@ def render_run_single_steps_section() -> None:
                 else:
                     st.error(f"Dry run failed (return code {rc}).")
 
-        proven_steps = [
+        allow_dangerous = bool(st.session_state.get("allow_run"))
+        st.markdown("**Workflow steps**")
+        if not allow_dangerous:
+            st.caption(
+                "**Run model** and **Calibrate** appear below but are disabled until you enable "
+                "**Allow dangerous run steps** in the Assistant panel."
+            )
+
+        runnable_steps = [
             (step, label)
             for step, label in WORKFLOW_DISPLAY_ORDER
-            if PROVEN_STATUS.get(step, False)
+            if step in SUPPORTED_STEPS
         ]
-        if proven_steps:
-            st.markdown("**Proven workflow steps**")
-            cols = st.columns(3)
-            for i, (step, label) in enumerate(proven_steps):
-                with cols[i % 3]:
-                    if st.button(
-                        f"Run {label}",
-                        key=f"input_single_{step}",
-                        width="stretch",
-                    ):
-                        with st.spinner(f"Running {label}…"):
-                            rc, _ = execute_single_symfluence_step(step, step_output)
-                        if rc == 0:
-                            st.success(f"{label} completed.")
-                        else:
-                            st.error(f"{label} failed (return code {rc}).")
-
-        st.markdown("**Dangerous steps**")
-        if not st.session_state.allow_run:
-            st.caption("Enable **Allow dangerous run steps** in the assistant panel to run model or calibration.")
-        danger_cols = st.columns(2)
-        with danger_cols[0]:
-            if st.button(
-                "Run model",
-                key="input_single_run_model",
-                width="stretch",
-                disabled=not st.session_state.allow_run,
-            ):
-                with st.spinner("Running model…"):
-                    rc, _ = execute_single_symfluence_step("run_model", step_output)
-                if rc == 0:
-                    st.success("Model run completed.")
-                else:
-                    st.error(f"Model run failed (return code {rc}).")
-        with danger_cols[1]:
-            if st.button(
-                "Calibrate model",
-                key="input_single_calibrate_model",
-                width="stretch",
-                disabled=not st.session_state.allow_run,
-            ):
-                with st.spinner("Calibrating…"):
-                    rc, _ = execute_single_symfluence_step("calibrate_model", step_output)
-                if rc == 0:
-                    st.success("Calibration completed.")
-                else:
-                    st.error(f"Calibration failed (return code {rc}).")
+        cols = st.columns(3)
+        for i, (step, label) in enumerate(runnable_steps):
+            is_danger = step in DANGER_STEPS
+            btn_label = f"Run {label}"
+            if is_danger:
+                btn_label = f"Run {label} (dangerous)"
+            if not PROVEN_STATUS.get(step, False) and not is_danger:
+                btn_label = f"Run {label} (experimental)"
+            with cols[i % 3]:
+                if st.button(
+                    btn_label,
+                    key=f"input_single_{step}",
+                    width="stretch",
+                    disabled=is_danger and not allow_dangerous,
+                ):
+                    with st.spinner(f"Running {label}…"):
+                        rc, _ = execute_single_symfluence_step(step, step_output)
+                    if rc == 0:
+                        st.success(f"{label} completed.")
+                    else:
+                        st.error(f"{label} failed (return code {rc}).")
 
         unproven_labels = [
             label
@@ -7010,9 +7416,10 @@ def render_run_single_steps_section() -> None:
         ]
         if unproven_labels:
             st.caption(
-                "Not available here yet: "
+                "Experimental steps may change; prefer **Execute plan** when they are in your plan. "
+                "Not marked proven yet: "
                 + ", ".join(unproven_labels)
-                + ". Use **Plan steps** or **Execute plan** when those steps are in your plan."
+                + "."
             )
 
 
@@ -7021,8 +7428,10 @@ def render_workflow_input_tab() -> None:
 
     render_start_load_run_section()
     
-    start_dt = parse_datetime_value(st.session_state.tstart, dt.datetime(2001, 1, 1, 1, 0))
-    end_dt = parse_datetime_value(st.session_state.tend, dt.datetime(2001, 1, 10, 23, 0))
+    start_dt = resolve_experiment_datetime("start")
+    end_dt = resolve_experiment_datetime("end")
+    start_date_default = _clamp_experiment_date(start_dt.date())
+    end_date_default = _clamp_experiment_date(end_dt.date(), min_date=start_date_default)
     
     ws1, ws2, ws3 = st.columns(3)
     with ws1:
@@ -7104,7 +7513,10 @@ def render_workflow_input_tab() -> None:
     with ws8:
         start_date = st.date_input(
             "Start date",
-            value=start_dt.date(),
+            value=start_date_default,
+            min_value=EXPERIMENT_DATE_MIN,
+            max_value=EXPERIMENT_DATE_MAX,
+            help=_EXPERIMENT_DATE_HELP,
             key=experiment_datetime_widget_key("experiment_start_date"),
         )
         start_time = st.time_input(
@@ -7112,11 +7524,18 @@ def render_workflow_input_tab() -> None:
             value=start_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_start_time"),
         )
-        st.session_state.tstart = format_datetime_value(start_date, start_time)
+        commit_experiment_datetime_from_widgets(
+            kind="start",
+            date_value=start_date,
+            time_value=start_time,
+        )
     with ws9:
         end_date = st.date_input(
             "End date",
-            value=end_dt.date(),
+            value=end_date_default,
+            min_value=max(EXPERIMENT_DATE_MIN, start_date),
+            max_value=EXPERIMENT_DATE_MAX,
+            help=_EXPERIMENT_DATE_HELP,
             key=experiment_datetime_widget_key("experiment_end_date"),
         )
         end_time = st.time_input(
@@ -7124,9 +7543,17 @@ def render_workflow_input_tab() -> None:
             value=end_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_end_time"),
         )
-        st.session_state.tend = format_datetime_value(end_date, end_time)
+        commit_experiment_datetime_from_widgets(
+            kind="end",
+            date_value=end_date,
+            time_value=end_time,
+        )
     
-    st.caption(f"Experiment time window: `{st.session_state.tstart}` → `{st.session_state.tend}`")
+    st.caption(
+        "Experiment time window: "
+        f"`{effective_experiment_time_string('start') or '—'}` → "
+        f"`{effective_experiment_time_string('end') or '—'}`"
+    )
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown(
@@ -7174,8 +7601,15 @@ def render_workflow_input_tab() -> None:
         show_hrugru_layer=False,
         show_forcing_layer=False,
         show_rivernetwork_layer=False,
+        lock_initial_view=True,
     )
-    map_data = render_workflow_map(map_obj, key=workflow_input_map_widget_key(), height=430)
+    map_data = render_workflow_map(
+        map_obj,
+        key=workflow_input_map_widget_key(),
+        height=430,
+        feature_group_to_add=build_spatial_selection_feature_group(),
+        on_change=_on_workflow_input_map_change,
+    )
     handle_workflow_map_selection(map_data)
     
     status_col1, status_col2 = st.columns(2)
@@ -7193,6 +7627,7 @@ def render_workflow_input_tab() -> None:
             st.caption("Bounding box mode: click first corner, then opposite corner.")
 
     sync_input_panel_to_run_plan()
+    wx.render_advanced_config_section()
     render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
@@ -7357,21 +7792,10 @@ def render_workflow_output_tab() -> None:
 
     with st.expander("Review layers", expanded=False):
         st.caption(
-            "Choose one fill layer below, and optionally overlay **River network**. "
+            "Toggle delineation overlays: river basins, HRUs/GRUs, DEM, landclass, soilclass, "
+            "ERA5 intersected, and river network. Disabled layers are not on disk yet."
         )
-        available = render_map_layer_checkboxes("out")
-        if available == 0 and symfluence_domain_shapefile_paths():
-            st.caption("No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first.")
-        output_map = build_pour_point_map(
-            show_dem_layer=st.session_state.show_dem_layer,
-            show_landclass_layer=st.session_state.show_landclass_layer,
-            show_soilclass_layer=st.session_state.show_soilclass_layer,
-            show_riverbasins_layer=st.session_state.show_riverbasins_layer,
-            show_hrugru_layer=st.session_state.show_hrugru_layer,
-            show_forcing_layer=st.session_state.show_forcing_layer,
-            show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
-        )
-        render_workflow_map(output_map, key="output_layers_map", height=360)
+        render_output_review_layers_fragment()
 
     with st.expander("Advanced", expanded=False):
         st.markdown("**Manual SYMFLUENCE steps**")
@@ -7427,24 +7851,10 @@ if current_page != "Workflows":
     elif current_page == "Logs":
         wx.render_logs_page(runs_dir=RUNS_DIR, run_folder_skip=RUN_FOLDER_SKIP)
     elif current_page == "Experiments":
-        exp_cal_out = st.empty()
-
-        def _experiments_run_calibrate(output_box=exp_cal_out):
-            if not st.session_state.allow_run:
-                st.error("Enable **Allow dangerous run steps** first.")
-                return
-            with st.spinner("Running calibration…"):
-                rc, _ = execute_single_symfluence_step("calibrate_model", output_box)
-            if rc == 0:
-                st.success("Calibration step finished.")
-            else:
-                st.error(f"Calibration failed (return code {rc}).")
-
         wx.render_experiments_page(
             runs_dir=RUNS_DIR,
             run_folder_skip=RUN_FOLDER_SKIP,
             load_run_fn=load_assistant_run,
-            execute_calibrate_fn=_experiments_run_calibrate,
         )
     elif current_page == "Results":
         wx.render_results_page(
@@ -7612,17 +8022,26 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     store_run_plan(plan)
     plan_cfg = (plan or {}).get("config", {}) or {}
 
-    station_id = resolve_station_id_from_plan(plan_cfg, user_request, fallback=s(st.session_state.station_id))
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg)
+    if current_pour and not s(station_lookup_cfg.get("pour_point_coords")):
+        station_lookup_cfg["pour_point_coords"] = current_pour
+    station_id = resolve_station_id_from_plan(
+        station_lookup_cfg,
+        user_request,
+        fallback=s(st.session_state.station_id),
+    )
     if station_id:
         cfg["STATION_ID"] = station_id
-    if plan_uses_local_data(plan_cfg, plan.get("steps") or [], user_request, data_dir=SYMFLUENCE_DATA_DIR) or (
-        symfluence_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, symfluence_domain)
-    ):
+    symfluence_domain_for_obs = s(cfg.get("DOMAIN_NAME")) or basin_domain
+    if domain_has_usable_local_streamflow(SYMFLUENCE_DATA_DIR, symfluence_domain_for_obs, cfg):
         cfg["DOWNLOAD_WSC_DATA"] = False
+    elif station_id and s(cfg.get("STREAMFLOW_DATA_PROVIDER") or plan_cfg.get("streamflow_data_provider") or "WSC").upper() == "WSC":
+        cfg["DOWNLOAD_WSC_DATA"] = True
 
     dump_yaml(cfg, out_yaml)
 
-    # plan.json must match skip-adjusted steps (ensure_skip_* helpers run above).
+    # Simulation plans may drop local-reuse steps here. Calibration plans keep them;
+    # the executor skips re-running those steps when artifacts already exist.
     write_run_metadata_files(outdir, plan, spec_dict)
 
     symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
@@ -7717,18 +8136,6 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     except Exception as e:
         st.error(f"Failed to start workflow: {e}")
         st.session_state.workflow_executing = False
-
-if current_page == "Workflows":
-    _poll_run_dir = active_workflow_run_dir()
-    if _poll_run_dir and workflow_is_running(_poll_run_dir):
-        st.session_state["_workflow_poll_active"] = True
-        import time
-
-        time.sleep(5)
-        st.rerun()
-    elif st.session_state.pop("_workflow_poll_active", False) and _poll_run_dir:
-        sync_workflow_execution_state(_poll_run_dir, st.session_state)
-        st.rerun()
 
 if validate_btn:
     rc, msg = execute_validate_config_step(output_box)

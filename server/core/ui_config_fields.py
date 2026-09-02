@@ -485,7 +485,9 @@ def _coerce_field_value(field: dict[str, Any], raw: str) -> Any:
     if field.get("key") == "discretization":
         return normalize_discretization_value(raw)
     if field_type == "period":
-        return re.sub(r"\s*,\s*", ", ", raw)
+        from server.core.period_utils import normalize_period_text
+
+        return normalize_period_text(raw)
     if field_type in {"coords_bbox", "coords_pp"}:
         return _normalize_coord_token(raw)
     options = field.get("options") or []
@@ -573,6 +575,22 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
     )
     if forcing_match:
         set_field("forcing_dataset", normalize_forcing_dataset(forcing_match.group(1)))
+
+    range_match = re.search(
+        r"\bfrom\s+(\d{4}[-/]\d{2}[-/]\d{2})(?:\s+\d{1,2}:\d{2})?\s+to\s+"
+        r"(\d{4}[-/]\d{2}[-/]\d{2})(?:\s+\d{1,2}:\d{2})?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if range_match:
+        set_field(
+            "experiment_time_start",
+            _normalize_chat_datetime(range_match.group(1).replace("/", "-"), default_hm="01:00"),
+        )
+        set_field(
+            "experiment_time_end",
+            _normalize_chat_datetime(range_match.group(2).replace("/", "-"), default_hm="23:00"),
+        )
 
     coord_patterns: list[tuple[str, str]] = [
         ("pour_point_coords", r"\bpour\s+point(?:\s+coords|\s+coordinates)?\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),

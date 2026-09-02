@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from server.core.plan_rules import (
+    WORKFLOW_PLAN_MODE_CALIBRATION,
+    WORKFLOW_PLAN_MODE_SIMULATION,
     default_symfluence_data_dir,
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
@@ -351,11 +353,20 @@ def finalize_run_plan(
         plan["needs_user_input"] = []
 
     plan = ensure_domain_name_user_input(plan, user_request, data_dir=data_dir)
+    request_text = (user_request or "").lower()
+    workflow_plan_mode = None
+    if "workflow mode: calibration" in request_text:
+        workflow_plan_mode = WORKFLOW_PLAN_MODE_CALIBRATION
+    elif "workflow mode: simulation" in request_text:
+        workflow_plan_mode = WORKFLOW_PLAN_MODE_SIMULATION
+    if workflow_plan_mode and not plan.get("workflow_plan_mode"):
+        plan["workflow_plan_mode"] = workflow_plan_mode
     plan = normalize_local_workflow_plan(
         plan,
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=skip_workflow_step_restore,
+        workflow_plan_mode=workflow_plan_mode,
     )
     cfg = dict(plan.get("config") or {})
 

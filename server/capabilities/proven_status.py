@@ -6,7 +6,7 @@ PROVEN_STATUS = {
     "acquire_attributes": True,
     "define_domain": True,
     "discretize_domain": True,
-    "process_observed_data": False,
+    "process_observed_data": True,
     "acquire_forcings": True,
     "model_agnostic_preprocessing": True,
     "model_specific_preprocessing": True,

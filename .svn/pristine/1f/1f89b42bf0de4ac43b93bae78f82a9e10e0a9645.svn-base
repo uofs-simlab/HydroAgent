@@ -1,0 +1,223 @@
+@article {clark2021,
+      author = "Martyn P. Clark and Reza Zolfaghari and Kevin R. Green and Sean Trim and Wouter J. M. Knoben and Andrew Bennett and Bart Nijssen and Andrew Ireson and Raymond J. Spiteri",
+      title = "The Numerical Implementation of Land Models: Problem Formulation and Laugh Tests",
+      journal = "Journal of Hydrometeorology",
+      year = "2021",
+      publisher = "American Meteorological Society",
+      address = "Boston MA, USA",
+      volume = "22",
+      number = "6",
+      doi = "10.1175/JHM-D-20-0175.1",
+      pages=      "1627 - 1648",
+      url = "https://journals.ametsoc.org/view/journals/hydr/22/6/JHM-D-20-0175.1.xml"
+}
+
+@article{clark2015a,
+  author    = {Clark, Martyn P. and Nijssen, Bart and Lundquist, Jessica D.
+               and Kavetski, Dmitri and Rupp, David E. and Woods, Ross A.
+               and Freer, Jim E. and Gutmann, Ethan D. and Wood, Andrew W.
+               and Gochis, David J. and Rasmussen, Roy M. and Tarboton, David G.
+               and Mahat, Vinod and Flerchinger, Gerald N. and Marks, Danny G.},
+  title     = {A unified approach for process-based hydrologic modeling:
+               1. {Modeling} concept},
+  journal   = {Water Resources Research},
+  year      = {2015},
+  volume    = {51},
+  number    = {4},
+  pages     = {2498--2514},
+  doi       = {10.1002/2015WR017198}
+}
+
+@article{clark2015b,
+  author    = {Clark, Martyn P. and Nijssen, Bart and Lundquist, Jessica D.
+               and Kavetski, Dmitri and Rupp, David E. and Woods, Ross A.
+               and Freer, Jim E. and Gutmann, Ethan D. and Wood, Andrew W.
+               and Brekke, Levi D. and Arnold, Jeffrey R. and Gochis, David J.
+               and Rasmussen, Roy M.},
+  title     = {A unified approach for process-based hydrologic modeling:
+               2. {Model} implementation and case studies},
+  journal   = {Water Resources Research},
+  year      = {2015},
+  volume    = {51},
+  number    = {4},
+  pages     = {2515--2542},
+  doi       = {10.1002/2015WR017200}
+}
+
+@article{clark2008,
+author = {Clark, Martyn P. and Slater, Andrew G. and Rupp, David E. and Woods, Ross A. and Vrugt, Jasper A. and Gupta, Hoshin V. and Wagener, Thorsten and Hay, Lauren E.},
+title = {Framework for Understanding Structural Errors (FUSE): A modular framework to diagnose differences between hydrological models},
+journal = {Water Resources Research},
+volume = {44},
+number = {12},
+pages = {},
+keywords = {model uncertainty, model structure},
+doi = {https://doi.org/10.1029/2007WR006735},
+url = {https://agupubs.onlinelibrary.wiley.com/doi/abs/10.1029/2007WR006735},
+eprint = {https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/2007WR006735},
+abstract = {The problems of identifying the most appropriate model structure for a given problem and quantifying the uncertainty in model structure remain outstanding research challenges for the discipline of hydrology. Progress on these problems requires understanding of the nature of differences between models. This paper presents a methodology to diagnose differences in hydrological model structures: the Framework for Understanding Structural Errors (FUSE). FUSE was used to construct 79 unique model structures by combining components of 4 existing hydrological models. These new models were used to simulate streamflow in two of the basins used in the Model Parameter Estimation Experiment (MOPEX): the Guadalupe River (Texas) and the French Broad River (North Carolina). Results show that the new models produced simulations of streamflow that were at least as good as the simulations produced by the models that participated in the MOPEX experiment. Our initial application of the FUSE method for the Guadalupe River exposed relationships between model structure and model performance, suggesting that the choice of model structure is just as important as the choice of model parameters. However, further work is needed to evaluate model simulations using multiple criteria to diagnose the relative importance of model structural differences in various climate regimes and to assess the amount of independent information in each of the models. This work will be crucial to both identifying the most appropriate model structure for a given problem and quantifying the uncertainty in model structure. To facilitate research on these problems, the FORTRAN-90 source code for FUSE is available upon request from the lead author.},
+year = {2008}
+}
+
+@Article{mizukami2016,
+AUTHOR = {Mizukami, N. and Clark, M. P. and Sampson, K. and Nijssen, B. and Mao, Y. and McMillan, H. and Viger, R. J. and Markstrom, S. L. and Hay, L. E. and Woods, R. and Arnold, J. R. and Brekke, L. D.},
+TITLE = {mizuRoute version 1: a river network routing tool for a continental domain
+water resources applications},
+JOURNAL = {Geoscientific Model Development},
+VOLUME = {9},
+YEAR = {2016},
+NUMBER = {6},
+PAGES = {2223--2238},
+URL = {https://gmd.copernicus.org/articles/9/2223/2016/},
+DOI = {10.5194/gmd-9-2223-2016}
+}
+
+@Article{culver2024,
+      title={Scientific Computing with Large Language Models}, 
+      author={Christopher Culver and Peter Hicks and Mihailo Milenkovic and Sanjif Shanmugavelu and Tobias Becker},
+      year={2024},
+      eprint={2406.07259},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2406.07259}, 
+}
+
+@inproceedings{yildiz2025,
+author = {Yildiz, Orcun and Peterka, Tom},
+title = {Do Large Language Models Speak Scientific Workflows?},
+year = {2025},
+isbn = {9798400718717},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3731599.3767578},
+doi = {10.1145/3731599.3767578},
+abstract = {In this work, we conduct an experimental study to explore applicability of LLMs for configuring, annotating, and translating scientific workflows. We use three different workflow-specific experiments and evaluate several open- and closed-source language models using state-of-the-art workflow systems. Our studies reveal that LLMs often struggle due to a lack of training data for scientific workflows. We further observe that the performance of LLMs varies across experiments and workflow systems. We discuss the implications of our findings and draw attention to several approaches extending LLM capabilities for scientific workflows. Our findings can help workflow developers and users in understanding LLM capabilities in scientific workflows, and motivate further research applying LLMs to workflows.},
+booktitle = {Proceedings of the SC '25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis},
+pages = {2225–2233},
+numpages = {9},
+keywords = {HPC, In Situ Workflows, Large Language Models, Usability, Benchmarking},
+location = {
+},
+series = {SC Workshops '25}
+}
+
+@article{agarwal2024,
+  title         = {CodeMirage: Hallucinations in Code Generated by Large Language Models},
+  author        = {Agarwal, Vibhor and Pei, Yulong and Alamir, Salwa and Liu, Xiaomo},
+  year          = {2024},
+  journal       = {arXiv preprint arXiv:2408.08333},
+  eprint        = {2408.08333},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SE}
+}
+
+@article{wang2024,
+  title         = {Is Your AI-Generated Code Really Safe? Evaluating Large Language Models on Secure Code Generation with CodeSecEval},
+  author        = {Wang, Jiexin and Luo, Xitong and Cao, Liuwen and He, Hongkui and Huang, Hailin and Xie, Jiayuan and Jatowt, Adam and Cai, Yi},
+  year          = {2024},
+  journal       = {arXiv preprint arXiv:2407.02395},
+  eprint        = {2407.02395},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CR}
+}
+
+@article{koster2012,
+  title   = {Snakemake: A Scalable Bioinformatics Workflow Engine},
+  author  = {K{\"o}ster, Johannes and Rahmann, Sven},
+  journal = {Bioinformatics},
+  volume  = {28},
+  number  = {19},
+  pages   = {2520--2522},
+  year    = {2012},
+  doi     = {10.1093/bioinformatics/bts480}
+}
+
+@article{crusoe2022,
+  title   = {Methods Included: Standardizing Computational Reuse and Portability with the Common Workflow Language},
+  author  = {Crusoe, Michael R. and Abeln, Sanne and Iosup, Alexandru and Amstutz, Peter and Chilton, John and Tijani{\'c}, Neboj{\v{s}}a and M{\'e}nager, Herv{\'e} and Soiland-Reyes, Stian and Gavrilovi{\'c}, Bogdan and Goble, Carole and others},
+  journal = {Communications of the ACM},
+  volume  = {65},
+  number  = {6},
+  pages   = {54--63},
+  year    = {2022},
+  doi     = {10.1145/3486897}
+}
+
+
+@Article{xiang2023,
+AUTHOR = {Xiang, Xiaohua and Pan, Zhijun and Wu, Xiaoling and Yang, Hong},
+TITLE = {Seamlessly Coupling Hydrological Modelling Systems and GIS through Object-Oriented Programming},
+JOURNAL = {Journal of Marine Science and Engineering},
+VOLUME = {11},
+YEAR = {2023},
+NUMBER = {11},
+ARTICLE-NUMBER = {2140},
+URL = {https://www.mdpi.com/2077-1312/11/11/2140},
+ISSN = {2077-1312},
+ABSTRACT = {Coupling hydrological modelling systems (HMS) with a geographic information system (GIS) can significantly enhance hydrological research and expand its applications. The calculation for HMS requires geographic information data; however, the current GIS data structure is not equipped to support the object-oriented hydrological modelling. Due to different objectives and design concepts, the differences between HMS and GIS have been profound, especially in their data structures from the perspective of object-oriented programming (OOP). This research introduces a novel approach to extend ArcGIS data structures for HMS, facilitating seamless coupling. This approach employs Microsoft Component Object Model (COM) technology to construct custom data structures that align with hydrological OOP principles. These can then be integrated into ArcGIS through a custom ArcGIS layer as an add-on. As a result, the HMS can leverage the full functionality of ArcGIS without the need for re-coding existing modelling systems. Moreover, HMS can be readily developed by using COM compatible computer languages, enabling the easy adaptation of this coupling approach to other HMS to ensure computational efficiency and to maximise the benefits of ArcGIS features. This new approach has been successfully implemented with the Xin’anjiang model, and the results validate its effectiveness in coastal areas.},
+DOI = {10.3390/jmse11112140}
+}
+
+@ARTICLE{tsegaye2024,
+    
+AUTHOR={Tsegaye, Seneshaw  and Kebedew, Mebrahtom G.  and Albrecht, Kevin K.  and Missimer, Thomas M.  and Thomas, Serge  and Elshall, Ahmed S. },
+           
+TITLE={Integrated GIS-hydrologic-hydraulic modeling to assess combined flood drivers in coastal regions: a case study of Bonita Bay, Florida},
+          
+JOURNAL={Frontiers in Water},
+          
+VOLUME={Volume 6 - 2024},
+  
+YEAR={2024},
+  
+URL={https://www.frontiersin.org/journals/water/articles/10.3389/frwa.2024.1468354},
+  
+DOI={10.3389/frwa.2024.1468354},
+  
+ISSN={2624-9375},
+  
+ABSTRACT={Flooding poses a severe global threat, necessitating advanced methodologies to assess and manage its risks effectively. This study introduces a novel approach that integrates Geographic Information System (GIS) with hydrologic-hydraulic modeling to evaluate the combined drivers of current and future flood risks. The method is applied to the development Bonita Bay in southwest Florida. It occurs in a region highly susceptible to flooding due to its low elevation and proximity to tidal waters. The innovative integration of GIS with hydrologic-hydraulic models enables detailed assessment and visualization of flood inundation areas under multiple flood drivers including design storms, land use changes, groundwater rise, and sea-level rise. This allows for the seamless simulation of complex flood interactions with only minor adjustments to the model for the identified drivers. The results indicate significant increases in initial water storage caused by sea and groundwater level rise and amplified storm runoff from land use changes. A 2% increase in flooded areas is projected with stronger design storms, and a 5% increase by 2,100 compared to 2024. This approach provides a robust framework for developing tailored flood mitigation strategies and can be adapted to various coastal regions globally.}}
+
+@article{li2024,
+      title={A Review of Prominent Paradigms for LLM-Based Agents: Tool Use (Including RAG), Planning, and Feedback Learning}, 
+      author={Xinzhe Li},
+      year={2024},
+      eprint={2406.05804},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2406.05804}, 
+}
+
+@article{ruan2023,
+  title         = {TPTU: Large Language Model-Based AI Agents for Task Planning and Tool Usage},
+  author        = {Ruan, Jingqing and Chen, Yihong and Zhang, Bin and Xu, Zhiwei and Bao, Tianpeng and Du, Guoqing and Shi, Shiwei and Mao, Hangyu and Li, Ziyue and Zeng, Xingyu and Zhao, Rui},
+  year          = {2023},
+  journal       = {arXiv preprint arXiv:2308.03427},
+  eprint        = {2308.03427},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI}
+}
+
+@misc{openai_api_docs,
+  author       = {{OpenAI}},
+  title        = {{OpenAI API Reference}},
+  year         = {2026},
+  howpublished = {\url{https://developers.openai.com/api/reference/overview/}},
+  note         = {Accessed 18 June 2026}
+}
+
+@misc{google_gemini_api_docs,
+  author       = {{Google}},
+  title        = {{Gemini API Documentation}},
+  year         = {2026},
+  howpublished = {\url{https://ai.google.dev/gemini-api/docs}},
+  note         = {Accessed 18 June 2026}
+}
+
+@misc{anthropic_claude_api_docs,
+  author       = {{Anthropic}},
+  title        = {{Claude API Documentation}},
+  year         = {2026},
+  howpublished = {\url{https://platform.claude.com/docs/en/home}},
+  note         = {Accessed 18 June 2026}
+}
