@@ -417,3 +417,13 @@ Run Summa for bow river from 2022/04/02 to 2022/05/15
 
 37:
 Run summa for bow river from 2021/04/05 to 2021/05/15
+
+38:
+run summa for bow river from 2022/04/05 to 2022/05/20
+
+39:
+run summa for bow river from 2023/05/01 to 2023/06/27 
+experiment Id is 002
+
+40:
+Run Summa for Bow river from 2023/04/03 to 2023/05/27

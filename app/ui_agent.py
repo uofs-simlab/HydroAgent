@@ -146,6 +146,7 @@ from server.core.plan_rules import (
     domain_has_local_era5_raw_forcing,
     domain_has_usable_local_streamflow,
     domain_has_local_summa_forcing,
+    domain_forcing_intersection_path,
     domain_has_forcing_intersection,
     domain_has_remapped_forcing,
     domain_has_local_discretization,
@@ -606,6 +607,7 @@ WORKFLOW_PANEL_HEIGHT = 720
 WORKFLOW_MAP_HEIGHT = 520
 WORKFLOW_MAP_CENTER = [51.0, -115.5]
 WORKFLOW_MAP_ZOOM = 2
+WORKFLOW_MAP_MIN_ZOOM = 2
 WORKFLOW_SECTION_KEY = "workflow_section"
 EXECUTION_LOG_TAIL_CHARS = 120_000
 
@@ -2264,8 +2266,7 @@ def handle_workflow_map_selection(map_data: dict | None, *, rerun: bool = True) 
         return
 
     clicked = map_data["last_clicked"]
-    lat = clicked["lat"]
-    lon = clicked["lng"]
+    lat, lon = _normalize_map_click_coords(clicked["lat"], clicked["lng"])
     if _map_click_is_suppressed(lat, lon):
         return
     if not is_new_map_click(lat, lon):
@@ -3583,6 +3584,32 @@ def _map_view_center_zoom(
     return list(WORKFLOW_MAP_CENTER), WORKFLOW_MAP_ZOOM
 
 
+def _normalize_map_click_coords(lat: float, lon: float) -> tuple[float, float]:
+    """Keep clicks on a single world copy (lat in range, lon wrapped to [-180, 180])."""
+    lat = max(-90.0, min(90.0, float(lat)))
+    lon = ((float(lon) + 180.0) % 360.0) - 180.0
+    return lat, lon
+
+
+def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> folium.Map:
+    """One copy of the continents (no tile wrap). Skip hard maxBounds — that freezes pan on a wide map."""
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=zoom,
+        tiles=None,
+        min_zoom=WORKFLOW_MAP_MIN_ZOOM,
+    )
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="OpenStreetMap",
+        no_wrap=True,
+        min_zoom=WORKFLOW_MAP_MIN_ZOOM,
+        overlay=False,
+        control=False,
+    ).add_to(m)
+    return m
+
+
 def _fit_review_map_to_extent(
     m: folium.Map,
     bbox_bounds: tuple[float, float, float, float] | None,
@@ -3688,6 +3715,24 @@ def _first_existing_shapefile(candidates: list[Path]) -> Path | None:
     return None
 
 
+def _first_shapefile_in(directory: Path, *patterns: str) -> Path | None:
+    """First shapefile in a folder matching any glob."""
+    if not directory.is_dir():
+        return None
+    for pattern in patterns:
+        for path in sorted(directory.glob(pattern)):
+            if path.is_file() and path.suffix.lower() == ".shp":
+                return path
+    return None
+
+
+def _shapefile_or_expected(directory: Path, expected_name: str, *extra_globs: str) -> str:
+    found = _first_shapefile_in(directory, expected_name, *extra_globs)
+    if found is not None:
+        return str(found)
+    return str(directory / expected_name)
+
+
 def _resolve_domain_shapefile(
     directory: Path,
     *,
@@ -3700,9 +3745,12 @@ def _resolve_domain_shapefile(
     found = _first_existing_shapefile(candidates)
     if found is not None:
         return str(found)
-    matches = sorted(directory.glob(glob_pattern))
+    matches = sorted(directory.glob(glob_pattern)) if directory.is_dir() else []
     if matches:
         return str(matches[0])
+    loose = _first_shapefile_in(directory, "*.shp")
+    if loose is not None:
+        return str(loose)
     return str(candidates[0]) if candidates else ""
 
 
@@ -3733,11 +3781,18 @@ def symfluence_domain_shapefile_paths(
     """Expected SYMFLUENCE shapefile paths for the current domain and experiment."""
     domain_name = s(domain_name or st.session_state.domain_name)
     experiment_id = s(experiment_id or st.session_state.experiment_id)
-    if not domain_name or not experiment_id:
+    if not domain_name:
         return {}
 
-    domain_name = symfluence_domain_name(domain_name, experiment_id)
-    domain_root = symfluence_data_domain_dir(domain_name)
+    basin = symfluence_domain_name(domain_name, experiment_id)
+    domain_root = symfluence_data_domain_dir(basin, experiment_id)
+    if not domain_root.is_dir():
+        raw_root = SYMFLUENCE_DATA_DIR / f"domain_{domain_name}"
+        if raw_root.is_dir():
+            domain_root = raw_root
+            basin = domain_name
+    domain_name = basin
+    experiment_id = experiment_id or "run_1"
     plan_cfg = (st.session_state.run_plan or {}).get("config") or {}
     domain_def = (
         s(plan_cfg.get("domain_def"))
@@ -3753,16 +3808,42 @@ def symfluence_domain_shapefile_paths(
     catchment_base = domain_root / "shapefiles" / "catchment_intersection"
     river_basins_dir = domain_root / "shapefiles" / "river_basins"
     river_network_dir = domain_root / "shapefiles" / "river_network"
+    forcing_dataset = (
+        s(plan_cfg.get("forcing_dataset"))
+        or s(st.session_state.get("forcing_dataset"))
+        or "ERA5"
+    )
+    forcing_path = domain_forcing_intersection_path(
+        SYMFLUENCE_DATA_DIR,
+        domain_name,
+        forcing_dataset=forcing_dataset,
+    )
+    if forcing_path.suffix.lower() != ".shp" or not forcing_path.is_file():
+        globbed = _first_shapefile_in(
+            catchment_base / "with_forcing",
+            "*intersected*.shp",
+            "*.shp",
+        )
+        if globbed is not None:
+            forcing_path = globbed
     return {
         "domain_root": str(domain_root),
-        "dem": str(catchment_base / "with_dem" / "catchment_with_dem.shp"),
-        "landclass": str(catchment_base / "with_landclass" / "catchment_with_landclass.shp"),
-        "soilclass": str(catchment_base / "with_soilgrids" / "catchment_with_soilclass.shp"),
-        "forcing": str(
-            catchment_base
-            / "with_forcing"
-            / f"{domain_name}_ERA5_intersected_shapefile.shp"
+        "dem": _shapefile_or_expected(
+            catchment_base / "with_dem",
+            "catchment_with_dem.shp",
+            "*.shp",
         ),
+        "landclass": _shapefile_or_expected(
+            catchment_base / "with_landclass",
+            "catchment_with_landclass.shp",
+            "*.shp",
+        ),
+        "soilclass": _shapefile_or_expected(
+            catchment_base / "with_soilgrids",
+            "catchment_with_soilclass.shp",
+            "*.shp",
+        ),
+        "forcing": str(forcing_path),
         "riverbasins": _resolve_domain_shapefile(
             river_basins_dir,
             name_builder=lambda suffix: f"{domain_name}_riverBasins_{suffix}.shp",
@@ -3787,7 +3868,7 @@ def render_map_layer_checkboxes(key_prefix: str) -> int:
     """Layer toggles for the review map. Returns count of shapefiles found on disk."""
     paths = symfluence_domain_shapefile_paths()
     if not paths:
-        st.info("Set **Domain name** and **Experiment ID** to check for review layers.")
+        st.info("Set **Domain name** on Input to check for review layers.")
         return 0
 
     available_count = 0
@@ -4564,7 +4645,7 @@ def build_pour_point_map(
         center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
         center_lat, center_lon = center[0], center[1]
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
+    m = _workflow_base_map(center_lat, center_lon, zoom)
 
     active_legend_spec: dict = {}
     active_gdfs: list = []
