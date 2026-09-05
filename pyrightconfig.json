@@ -2,5 +2,5 @@
   "include": ["app", "server", "tests", "tools", "cli.py"],
   "venvPath": ".",
   "venv": ".venv",
-  "pythonVersion": "3.11"
+  "pythonVersion": "3.12"
 }

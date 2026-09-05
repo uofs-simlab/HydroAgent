@@ -5,6 +5,7 @@ from server.core.plan_rules import (
     normalize_local_workflow_plan,
     strip_agent_calibration_config_unless_in_prompt,
 )
+from server.core.calibration_prompt_fields import explicit_calibration_fields_in_prompt
 
 import sys
 from pathlib import Path
@@ -49,6 +50,22 @@ def test_strip_agent_calibration_keeps_prompt_explicit_fields():
     assert cfg.get("optimization_metric") == "NSE"
     assert cfg.get("iterative_optimization_algorithm") == "DE"
     assert cfg.get("iterations") == "25"
+
+
+def test_standalone_calibration_prompt_field_detection():
+    prompt = (
+        "Calibrate streamflow with KGE using DDS for 30 iterations, population size 10, "
+        "and calibration period 2020-01-01, 2020-12-31"
+    )
+    explicit = explicit_calibration_fields_in_prompt(prompt)
+    assert {
+        "optimization_target",
+        "optimization_metric",
+        "iterative_optimization_algorithm",
+        "iterations",
+        "population_size",
+        "calibration_period",
+    } <= explicit
 
 
 def test_merge_domain_config_from_simulation_plan():

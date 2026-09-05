@@ -609,10 +609,7 @@ def augment_request_with_advanced(lines: list[str]) -> list[str]:
 
 def augment_request_with_calibration(lines: list[str], nl_request: str = "") -> list[str]:
     """Only pass calibration widget values that the user named in the main prompt."""
-    try:
-        from calib_hydro_agent.prompt_fields import explicit_calibration_fields_in_prompt
-    except ImportError:
-        return lines
+    from server.core.calibration_prompt_fields import explicit_calibration_fields_in_prompt
 
     explicit = explicit_calibration_fields_in_prompt(nl_request)
     extra_fields = [

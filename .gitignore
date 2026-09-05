@@ -4,7 +4,13 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
 runs/*
 !runs/.gitkeep
 .streamlit/secrets.toml
 prompts/library/.cache/
+SYMFLUENCE_data/

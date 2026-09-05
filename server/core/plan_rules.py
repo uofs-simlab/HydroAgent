@@ -2005,12 +2005,9 @@ def planner_mode_instructions(mode: str) -> str:
 
 
 def _explicit_agent_calibration_fields(user_request: str) -> set[str]:
-    try:
-        from calib_hydro_agent.prompt_fields import explicit_calibration_fields_in_prompt
+    from server.core.calibration_prompt_fields import explicit_calibration_fields_in_prompt
 
-        return explicit_calibration_fields_in_prompt(user_request)
-    except ImportError:
-        return set()
+    return explicit_calibration_fields_in_prompt(user_request)
 
 
 def strip_agent_calibration_config_unless_in_prompt(plan: dict, user_request: str = "") -> dict:

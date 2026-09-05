@@ -1,6 +1,6 @@
 # HydroAgent
 
-A natural-language assistant and Streamlit UI for planning and executing [SYMFLUENCE](https://github.com/your-org/SYMFLUENCE) hydrological modelling workflows. Describe a modelling run in plain English — HydroAgent generates a structured step-by-step plan, resolves inter-step dependencies, writes the SYMFLUENCE `config.yaml`, and executes each step with live log output.
+A natural-language assistant and Streamlit UI for planning and executing [SYMFLUENCE](https://github.com/uofs-simlab/SYMFLUENCE-HydroAgent) hydrological modelling workflows. Describe a modelling run in plain English — HydroAgent generates a structured step-by-step plan, resolves inter-step dependencies, writes the SYMFLUENCE `config.yaml`, and executes each step with live log output.
 
 ---
 
@@ -54,7 +54,11 @@ HydroAgent/
 ├── examples/                # local_settings.example.yaml
 ├── cli.py                   # Headless plan generator (OpenAI)
 ├── run.sh                   # Launch script
-├── requirements.txt
+├── pyproject.toml           # Direct HydroAgent dependencies and project configuration
+├── uv.lock                  # Exact locked HydroAgent dependency graph
+├── .python-version          # Pinned Python version
+├── requirements*.txt        # Generated pip-compatible dependency exports
+├── symfluence/              # Supported SYMFLUENCE backend submodule
 └── runs/                    # Per-run output folders (config.yaml, plan.json, chat.json, logs)
 ```
 
@@ -64,29 +68,35 @@ HydroAgent/
 
 | Requirement | Notes |
 |-------------|-------|
-| Python 3.11+ | 3.12 or 3.13 tested |
-| [SYMFLUENCE](https://github.com/your-org/SYMFLUENCE) | Installed and working |
+| Python 3.12.14 | Selected by `.python-version`; exact packages are pinned in `uv.lock` |
+| [uv](https://docs.astral.sh/uv/) | Manages the HydroAgent UI and test environment |
+| [Pixi](https://pixi.sh/) | Manages the separate SYMFLUENCE backend environment |
+| [SYMFLUENCE](https://github.com/uofs-simlab/SYMFLUENCE-HydroAgent) | Included as the `symfluence/` Git submodule |
 | SYMFLUENCE_data | Geospatial cache, model installs, domain data |
 | LLM API key | OpenAI, Google Gemini, or Anthropic — at least one required for plan generation |
 
-### Geospatial stack
+### Reproducible environment
 
-GeoPandas and Folium require GDAL. On Linux/macOS, conda-forge is the easiest path:
-
-```bash
-conda create -n hydroagent python=3.12
-conda activate hydroagent
-conda install -c conda-forge geopandas folium pyyaml pandas
-pip install -r requirements.txt
-```
-
-Alternatively, use a plain venv if GDAL is already available system-wide:
+HydroAgent and its SYMFLUENCE backend use separate environments. From the
+HydroAgent repository root, install the locked UI and test environment:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync --frozen
+uv run --frozen pytest
 ```
+
+Then install the locked SYMFLUENCE backend environment:
+
+```bash
+cd symfluence
+pixi install --frozen -e build
+cd ..
+```
+
+No manually managed Conda environment is required. `pyproject.toml` declares the
+HydroAgent dependencies; `uv.lock` records their exact resolved versions. Commit
+both files. The `requirements*.txt` files are generated compatibility exports and
+should not be edited directly.
 
 ---
 
@@ -101,9 +111,9 @@ cp examples/local_settings.example.yaml ~/.symfluence_assistant/config.yaml
 
 ```yaml
 # ~/.symfluence_assistant/config.yaml
-symfluence_repo:    /path/to/SYMFLUENCE
+symfluence_repo:    /path/to/HydroAgent/symfluence
 symfluence_data_dir: /path/to/SYMFLUENCE_data
-symfluence_python:  /path/to/SYMFLUENCE/venv/bin/python
+symfluence_python:  /path/to/HydroAgent/symfluence/.pixi/envs/build/bin/python
 
 # Add whichever LLM key(s) you have — at least one is needed for plan generation
 openai_api_key:     sk-...
@@ -123,7 +133,6 @@ cp .env.example .env
 ## Quick start
 
 ```bash
-chmod +x run.sh
 ./run.sh
 ```
 
@@ -147,7 +156,7 @@ Generate a plan without the UI (OpenAI only):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-python cli.py run "Lumped SUMMA workflow for Bow River at Banff, 2010-2015" \
+uv run --frozen python cli.py run "Lumped SUMMA workflow for Bow River at Banff, 2010-2015" \
     --json-out runs/bow_river_plan.json
 ```
 
@@ -384,7 +393,7 @@ Set `domain_name` and `experiment_id` as separate plan fields (do not merge them
 If catchment shapefiles or DEM are missing from a semidistributed domain, the `restore_local_domain_artifacts.py` tool can rebuild them from the `into/` copies created during domain delineation:
 
 ```bash
-python tools/restore_local_domain_artifacts.py \
+uv run --frozen python tools/restore_local_domain_artifacts.py \
     --data-dir /path/to/SYMFLUENCE_data \
     --domain-name Bow_at_Banff_semi_distributed \
     --experiment-id run_1
@@ -400,7 +409,7 @@ python tools/restore_local_domain_artifacts.py \
 | DEM / shapefile missing | Verify `DOMAIN_NAME` matches a `SYMFLUENCE_data/domain_*` folder; run `restore_local_domain_artifacts.py` if delineation outputs are present but legacy paths are missing |
 | Plan / LLM errors | Check the API key for the selected provider in the sidebar or config file |
 | Provider not available | Ensure `anthropic` or `google-genai` is installed in the same Python environment running Streamlit |
-| GeoPandas import errors | Install GDAL via conda-forge (see Prerequisites) |
+| GeoPandas import errors | Confirm Python 3.12.14 is selected, then rerun `uv sync --frozen` |
 | Run folder collision | The app handles this automatically with `(1)`, `(2)` suffixes; if you see unexpected folder names, check `runs/` for pre-existing folders |
 
 ---
