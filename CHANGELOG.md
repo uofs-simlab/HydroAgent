@@ -40,6 +40,13 @@
 - The Assistant resize divider now starts from the exact grab position, releases
   reliably outside the handle or browser window, and batches drag updates for
   smoother resizing.
+- Confirming **New workflow** now closes the confirmation popover as the clean
+  workflow state loads.
+- Basin-definition prompts with an explicit **include only these workflow
+  steps** list no longer have the full simulation pipeline added afterward.
+- Closed workflow-step lists also recognize wording such as **in this order**.
+- Colon-separated core settings such as `domain_name: ...` and spatial
+  coordinates are preserved deterministically when generating a plan.
 
 ### Known limitations
 

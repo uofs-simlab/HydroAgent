@@ -518,12 +518,12 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
         changed = True
 
     patterns_str: list[tuple[str, str]] = [
-        ("domain_name", r"\bdomain_name\s+([A-Za-z0-9_\-]+)"),
-        ("experiment_id", r"\bexperiment_id\s+([A-Za-z0-9_\-]+)"),
-        ("forcing_dataset", r"\bforcing_dataset\s+([A-Za-z0-9_\-]+)"),
-        ("domain_def", r"\bdomain_def\s+([A-Za-z0-9_\-]+)"),
-        ("discretization", r"\bdiscretization\s+([A-Za-z0-9_\-]+)"),
-        ("data_access", r"\bdata_access\s+([A-Za-z0-9_]+)"),
+        ("domain_name", r"\bdomain_name(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("experiment_id", r"\bexperiment_id(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("forcing_dataset", r"\bforcing_dataset(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("domain_def", r"\bdomain_def(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("discretization", r"\bdiscretization(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("data_access", r"\bdata_access(?:\s*[:=]\s*|\s+)([A-Za-z0-9_]+)"),
         ("routing_model", r"\brouting\s+model\s+([A-Za-z0-9_\-]+)"),
         ("station_id", r"\b(?:WSC\s+)?station\s+ID\s*[`'\"]?\s*(\d{2}[A-Z]{2}\d{3})[`'\"]?"),
         ("delineation_method", r"\bdelineation\s+method\s+([A-Za-z0-9_]+)"),
@@ -599,10 +599,10 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
             r"\bbounding\s+box(?:\s+coords|\s+coordinates)?\s+"
             r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
         ),
-        ("pour_point_coords", r"\bpour_point_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
+        ("pour_point_coords", r"\bpour_point_coords(?:\s*[:=]\s*|\s+)(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
         (
             "bounding_box_coords",
-            r"\bbounding_box_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
+            r"\bbounding_box_coords(?:\s*[:=]\s*|\s+)(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
         ),
     ]
     for key, pat in coord_patterns:

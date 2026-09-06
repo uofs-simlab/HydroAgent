@@ -159,6 +159,106 @@ def test_simulation_restores_omitted_setup_steps():
     ]
 
 
+def test_simulation_honors_closed_basin_definition_step_list():
+    prompt = """Include only these workflow steps:
+
+validate_config
+setup_project
+create_pour_point
+acquire_attributes
+define_domain
+
+Do not include acquire_forcings.
+Do not include model_agnostic_preprocessing.
+Do not include build_model_ready_store.
+Do not include model_specific_preprocessing.
+Do not include run_model.
+"""
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": [
+            "validate_config",
+            "setup_project",
+            "create_pour_point",
+            "acquire_attributes",
+            "define_domain",
+            "acquire_forcings",
+            "model_agnostic_preprocessing",
+            "build_model_ready_store",
+            "model_specific_preprocessing",
+            "run_model",
+        ],
+        "config": {
+            "domain_name": "Bow_at_Banff_CIROH_lumped",
+            "domain_def": "lumped",
+            "data_access": "cloud",
+        },
+    }
+
+    out = normalize_local_workflow_plan(
+        plan,
+        prompt,
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+    )
+
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+    ]
+
+
+def test_affirmative_cloud_prompt_with_order_qualifier_keeps_closed_steps(tmp_path):
+    prompt = """Prepare a fresh, basin-definition-only cloud workflow.
+
+data_access: cloud
+domain_name: Bow_at_Banff_CIROH_lumped
+
+Include only these workflow steps, in this order:
+
+validate_config
+setup_project
+create_pour_point
+acquire_attributes
+define_domain
+"""
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "config": {
+            "domain_name": "Bow_at_Banff_CIROH_lumped",
+            "data_access": "cloud",
+        },
+        "steps": [
+            "validate_config",
+            "setup_project",
+            "create_pour_point",
+            "acquire_attributes",
+            "define_domain",
+            "acquire_forcings",
+            "run_model",
+        ],
+    }
+
+    out = normalize_local_workflow_plan(
+        plan,
+        prompt,
+        data_dir=tmp_path,
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+    )
+
+    assert out["config"]["data_access"] == "cloud"
+    assert out["config"]["extra_config"]["DATA_ACCESS"] == "cloud"
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+    ]
+
+
 def test_simulation_restores_experiment06_short_plan():
     plan = {
         "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,

@@ -77,5 +77,8 @@ def test_assistant_panel_wires_confirmed_new_workflow_control():
 
     assert '"New workflow"' in source
     assert '"Start new workflow"' in source
+    assert 'key=f"new_workflow_popover_v{control_version}"' in source
+    assert 'key=f"confirm_new_workflow_v{control_version}"' in source
+    assert 'st.session_state["new_workflow_control_version"] = control_version + 1' in source
     assert "reset_workflow_session_state(st.session_state)" in source
     assert "Saved runs and SYMFLUENCE data will not be deleted." in source

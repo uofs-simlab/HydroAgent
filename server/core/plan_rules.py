@@ -1669,6 +1669,9 @@ def extract_ordered_workflow_steps(user_request: str) -> list[str]:
     step_lookup.update({k.lower(): v for k, v in _PSEUDO_WORKFLOW_STEP_ALIASES.items()})
     block_patterns = [
         r"workflow_steps\s*:\s*\n(.*?)(?=\n\S|\Z)",
+        r"(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
+        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:\s*\n"
+        r"(.*?)(?=\n\s*(?:do not|this\b|the\b|set\b|use\b|preserve\b|generate\b)|\Z)",
         r"(?:use\s+)?this\s+(?:local[- ]first\s+)?step\s+order\s*:?\s*\n(.*?)(?=\n(?:Do not|Generate\b)|\Z)",
         r"(?:use\s+)?this\s+exact\s+step\s+order\s*:?\s*\n(.*?)(?=\nGenerate\b|\Z)",
     ]
@@ -1710,6 +1713,9 @@ def extract_user_required_steps_from_step_order(user_request: str) -> set[str]:
     step_lookup = {name.lower(): name for name in WORKFLOW_STEP_NAMES}
     block_patterns = (
         r"workflow_steps\s*:\s*\n(.*?)(?=\n\S|\Z)",
+        r"(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
+        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:\s*\n"
+        r"(.*?)(?=\n\s*(?:do not|this\b|the\b|set\b|use\b|preserve\b|generate\b)|\Z)",
         r"(?:use\s+)?this\s+(?:local[- ]first\s+)?step\s+order\s*:?\s*\n(.*?)(?=\n(?:Do not|Generate\b)|\Z)",
         r"(?:use\s+)?this\s+exact\s+step\s+order\s*:?\s*\n(.*?)(?=\nGenerate\b|\Z)",
     )
@@ -2146,6 +2152,20 @@ def restore_simulation_setup_steps_for_calibration(
     mode = plan_workflow_mode(plan)
     if mode not in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
         return plan
+
+    # A closed step list is stronger than the mode's usual full-pipeline default.
+    # This supports domain-definition-only and other deliberately partial workflows.
+    if re.search(
+        r"\b(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
+        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:",
+        user_request or "",
+        flags=re.IGNORECASE,
+    ):
+        exact_steps = extract_ordered_workflow_steps(user_request)
+        if exact_steps:
+            out = dict(plan)
+            out["steps"] = exact_steps
+            return with_user_required_steps(out, set(exact_steps))
 
     from server.core.ui_config_fields import is_lumped_workflow
 

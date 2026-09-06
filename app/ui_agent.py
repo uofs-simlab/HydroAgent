@@ -6717,12 +6717,14 @@ def clear_chat_messages(*, clear_plan: bool = False) -> None:
 
 def render_new_workflow_control() -> None:
     """Render the global, confirmed reset action for the Assistant panel."""
+    control_version = int(st.session_state.get("new_workflow_control_version", 0))
     title_col, action_col = st.columns([0.58, 0.42], vertical_alignment="center")
     with title_col:
         st.markdown("#### Assistant")
     with action_col:
         with st.popover(
             "New workflow",
+            key=f"new_workflow_popover_v{control_version}",
             use_container_width=True,
             help="Clear the current draft and detach the active run without deleting saved files.",
         ):
@@ -6735,11 +6737,13 @@ def render_new_workflow_control() -> None:
                 st.info("The current workflow will continue in its saved run.")
             if st.button(
                 "Start new workflow",
-                key="confirm_new_workflow",
+                key=f"confirm_new_workflow_v{control_version}",
                 type="primary",
                 width="stretch",
             ):
                 reset_workflow_session_state(st.session_state)
+                # Remounting the popover gives it a fresh, closed frontend state.
+                st.session_state["new_workflow_control_version"] = control_version + 1
                 st.session_state["_new_workflow_flash"] = True
                 st.rerun()
 
