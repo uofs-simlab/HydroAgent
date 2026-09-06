@@ -648,37 +648,25 @@ def assistant_panel_button_css() -> str:
         for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES
     )
     panel_scoped = (
-        ".sym-assistant-styled button",
         ".sym-assistant-styled [data-testid='stButton'] button",
-        ".sym-assistant-styled [data-testid='stTabs'] button",
-        ".sym-main-styled button",
         ".sym-main-styled [data-testid='stButton'] button",
-        ".sym-main-styled [data-testid='stTabs'] button",
     )
     scoped = panel_scoped + (key_btns, prefix_btns)
     scoped_hover = (
-        ".sym-assistant-styled button:hover:not(:disabled)",
         ".sym-assistant-styled [data-testid='stButton'] button:hover:not(:disabled)",
-        ".sym-assistant-styled [data-testid='stTabs'] button:hover:not(:disabled)",
-        ".sym-main-styled button:hover:not(:disabled)",
         ".sym-main-styled [data-testid='stButton'] button:hover:not(:disabled)",
-        ".sym-main-styled [data-testid='stTabs'] button:hover:not(:disabled)",
         key_btns_hover,
         prefix_btns_hover,
     )
     scoped_disabled = (
-        ".sym-assistant-styled button:disabled",
         ".sym-assistant-styled [data-testid='stButton'] button:disabled",
-        ".sym-main-styled button:disabled",
         ".sym-main-styled [data-testid='stButton'] button:disabled",
         key_btns_disabled,
         prefix_btns_disabled,
     )
     label_scoped = (
         ".sym-assistant-styled [data-testid='stButton'] button p",
-        ".sym-assistant-styled [data-testid='stTabs'] button p",
         ".sym-main-styled [data-testid='stButton'] button p",
-        ".sym-main-styled [data-testid='stTabs'] button p",
     )
     return f"""
     {", ".join(scoped)} {{
@@ -723,7 +711,7 @@ def panel_edge_toggle_css(key: str, *, edge: str) -> str:
         align-items: center !important;
         justify-content: center !important;
         height: 100% !important;
-        min-height: calc(100dvh - 10.5rem) !important;
+        min-height: var(--sym-workflow-panel-height, 720px) !important;
         max-width: 1.75rem !important;
         width: 1.75rem !important;
         padding: 0 !important;
@@ -763,6 +751,39 @@ def assistant_panel_toggle_css() -> str:
         position: relative !important;
         z-index: 2 !important;
     }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-main-column {
+        flex: 1 1 0px !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-toggle-column {
+        flex: 0 0 28px !important;
+        width: 28px !important;
+        min-width: 28px !important;
+        position: relative !important;
+        overflow: visible !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-assistant-column {
+        flex: 0 0 var(--sym-assistant-panel-width, 28%) !important;
+        width: var(--sym-assistant-panel-width, 28%) !important;
+        min-width: 0 !important;
+    }
+    div.st-key-assistant_panel_toggle::before {
+        content: "";
+        position: absolute;
+        inset: 0 auto 0 50%;
+        width: 1px;
+        transform: translateX(-50%);
+        background: var(--sym-divider-color, rgba(49, 51, 63, 0.18));
+        pointer-events: none;
+    }
+    div.st-key-assistant_panel_toggle button {
+        position: absolute !important;
+        top: 50% !important;
+        right: 50% !important;
+        transform: translateY(-50%) !important;
+        z-index: 3 !important;
+    }
     .sym-assistant-resize-handle {
         position: absolute;
         inset: 0 auto 0 50%;
@@ -777,9 +798,8 @@ def assistant_panel_toggle_css() -> str:
         content: "";
         position: absolute;
         inset: 0 0 0 50%;
-        width: 2px;
+        width: 1px;
         transform: translateX(-50%);
-        border-radius: 2px;
         background: transparent;
         transition: background-color 120ms ease;
     }
@@ -797,7 +817,7 @@ def assistant_panel_toggle_css() -> str:
     )
 
 
-def assistant_panel_resizer_html() -> str:
+def assistant_panel_resizer_html(render_version: int = 0) -> str:
     """Parent-page resize handle for the Streamlit workflow columns."""
     storage_key = json.dumps(ASSISTANT_PANEL_WIDTH_STORAGE_KEY)
     return f"""
@@ -810,6 +830,7 @@ def assistant_panel_resizer_html() -> str:
             const minMainWidth = {WORKFLOW_MAIN_MIN_WIDTH_PX};
             const toggleWidth = 28;
             const defaultRatio = 0.28;
+            const renderVersion = {int(render_version)};
 
             function columnFor(node) {{
                 let current = node;
@@ -838,13 +859,22 @@ def assistant_panel_resizer_html() -> str:
                 const assistantColumn = columns[toggleIndex + 1];
                 if (!mainColumn || !assistantColumn) return;
 
+                mainColumn.classList.add("sym-workflow-main-column");
+                toggleColumn.classList.add("sym-workflow-toggle-column");
+                assistantColumn.classList.add("sym-workflow-assistant-column");
+                for (const column of [mainColumn, toggleColumn, assistantColumn]) {{
+                    column.style.removeProperty("flex");
+                    column.style.removeProperty("width");
+                    column.style.removeProperty("min-width");
+                }}
                 let handle = toggleColumn.querySelector(".sym-assistant-resize-handle");
-                if (handle) return;
-                toggleColumn.style.setProperty("position", "relative", "important");
-                toggleColumn.style.setProperty("overflow", "visible", "important");
+                if (handle) handle.remove();
+                toggleColumn.style.removeProperty("position");
+                toggleColumn.style.removeProperty("overflow");
 
                 handle = doc.createElement("div");
                 handle.className = "sym-assistant-resize-handle";
+                handle.dataset.renderVersion = String(renderVersion);
                 handle.setAttribute("role", "separator");
                 handle.setAttribute("aria-label", "Resize assistant panel");
                 handle.setAttribute("aria-orientation", "vertical");
@@ -872,15 +902,7 @@ def assistant_panel_resizer_html() -> str:
                         sizes.maxAssistantWidth,
                         Math.max(minimumWidth, requestedWidth),
                     );
-                    mainColumn.style.setProperty("flex", "1 1 0px", "important");
-                    mainColumn.style.setProperty("width", "auto", "important");
-                    mainColumn.style.setProperty("min-width", "0", "important");
-                    toggleColumn.style.setProperty("flex", `0 0 ${{toggleWidth}}px`, "important");
-                    toggleColumn.style.setProperty("width", `${{toggleWidth}}px`, "important");
-                    toggleColumn.style.setProperty("min-width", `${{toggleWidth}}px`, "important");
-                    assistantColumn.style.setProperty("flex", `0 0 ${{width}}px`, "important");
-                    assistantColumn.style.setProperty("width", `${{width}}px`, "important");
-                    assistantColumn.style.setProperty("min-width", "0", "important");
+                    row.style.setProperty("--sym-assistant-panel-width", `${{width}}px`);
                     handle.setAttribute("aria-valuenow", String(Math.round((100 * width) / sizes.usable)));
                     if (persist) {{
                         hostWindow.sessionStorage.setItem(storageKey, String(width / sizes.usable));
@@ -1018,7 +1040,12 @@ def assistant_panel_resizer_html() -> str:
 
 
 def render_assistant_panel_resizer() -> None:
-    components.html(assistant_panel_resizer_html(), height=0, width=0)
+    render_version = int(st.session_state.get("assistant_panel_resize_version", 0))
+    components.html(
+        assistant_panel_resizer_html(render_version),
+        height=0,
+        width=0,
+    )
 
 
 def spatial_input_css() -> str:
@@ -1049,22 +1076,8 @@ def spatial_input_css() -> str:
 
 
 def workflow_panel_surface_css() -> str:
-    """Grey workflow column surfaces (match Streamlit sidebar tone)."""
+    """Workflow panel containment and stacking rules."""
     return """
-    .sym-assistant-styled,
-    .sym-main-styled,
-    .sym-assistant-styled [data-testid="stVerticalBlock"],
-    .sym-main-styled [data-testid="stVerticalBlock"] {
-        background-color: #f0f2f6 !important;
-    }
-    @media (prefers-color-scheme: dark) {
-        .sym-assistant-styled,
-        .sym-main-styled,
-        .sym-assistant-styled [data-testid="stVerticalBlock"],
-        .sym-main-styled [data-testid="stVerticalBlock"] {
-            background-color: #262730 !important;
-        }
-    }
     .right-panel {
         border: none;
         border-radius: 0;
@@ -1089,60 +1102,233 @@ def workflow_panel_surface_css() -> str:
         position: relative !important;
         z-index: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > [data-testid="column"]:last-child {
         position: relative !important;
         z-index: 5 !important;
     }
     """
 
 
-def render_workflow_panel_dom_hooks() -> None:
-    """Tag workflow scroll panels for button styling and grey backgrounds."""
-    components.html(
-        """
+def workflow_panel_dom_hooks_html() -> str:
+    """Parent-page hooks for workflow styling and nested-scroll handoff."""
+    return """
         <script>
         (function () {
             const doc = window.parent.document;
-            function panelBg() {
-                const sidebar = doc.querySelector('[data-testid="stSidebar"]');
-                return sidebar
-                    ? getComputedStyle(sidebar).backgroundColor
-                    : "rgb(240, 242, 246)";
+            const hostWindow = doc.defaultView;
+            const hookHost = window.frameElement && window.frameElement.closest(
+                '[data-testid="stElementContainer"]'
+            );
+            if (hookHost) {
+                hookHost.style.setProperty("position", "absolute", "important");
+                hookHost.style.setProperty("width", "0", "important");
+                hookHost.style.setProperty("height", "0", "important");
+                hookHost.style.setProperty("overflow", "hidden", "important");
             }
-            function paintColumnAncestors(node, bg) {
-                let parent = node ? node.parentElement : null;
-                for (let i = 0; i < 12 && parent; i += 1) {
-                    const testId = parent.getAttribute && parent.getAttribute("data-testid");
-                    if (testId === "column" || testId === "stColumn") {
-                        parent.style.setProperty("background-color", bg, "important");
-                        return;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-            function markPanel(markerClass, styledClass) {
+            function panelForMarker(markerClass) {
                 const marker = doc.querySelector("." + markerClass);
-                if (!marker) return;
-                const bg = panelBg();
+                if (!marker) return null;
                 let el = marker.parentElement;
                 for (let i = 0; i < 40 && el; i += 1) {
-                    if (el.getAttribute && el.getAttribute("data-testid") === "stVerticalBlockBorderWrapper") {
-                        el.classList.add(styledClass);
-                        el.style.setProperty("background-color", bg, "important");
-                        paintColumnAncestors(el, bg);
-                        return;
+                    const testId = el.getAttribute && el.getAttribute("data-testid");
+                    const isBorderWrapper = testId === "stVerticalBlockBorderWrapper";
+                    const isScrollableBlock = testId === "stVerticalBlock"
+                        && /(auto|scroll)/.test(hostWindow.getComputedStyle(el).overflowY);
+                    if (isBorderWrapper || isScrollableBlock) {
+                        return el;
                     }
                     el = el.parentElement;
                 }
+                return null;
+            }
+            function markPanel(markerClass, styledClass) {
+                const panel = panelForMarker(markerClass);
+                if (!panel) return null;
+                panel.classList.add(styledClass);
+                return panel;
             }
             function refreshPanels() {
-                markPanel("sym-main-panel", "sym-main-styled");
-                markPanel("sym-assistant-panel", "sym-assistant-styled");
+                doc.querySelectorAll('[data-sym-workflow-painted="true"]').forEach((element) => {
+                    element.style.removeProperty("background-color");
+                    delete element.dataset.symWorkflowPainted;
+                });
+                doc.querySelectorAll(".sym-main-styled, .sym-assistant-styled").forEach((panel) => {
+                    panel.style.removeProperty("background-color");
+                });
+                const mainPanel = markPanel("sym-main-panel", "sym-main-styled");
+                const assistantPanel = markPanel("sym-assistant-panel", "sym-assistant-styled");
+                sizeWorkflowPanels(mainPanel, assistantPanel);
             }
+
+            function layoutForPanel(panel) {
+                let current = panel ? panel.parentElement : null;
+                for (let i = 0; i < 6 && current; i += 1) {
+                    const testId = current.getAttribute && current.getAttribute("data-testid");
+                    if (testId === "stLayoutWrapper") return current;
+                    if (testId === "column" || testId === "stColumn") return null;
+                    current = current.parentElement;
+                }
+                return null;
+            }
+
+            function sizeWorkflowPanels(
+                mainPanel = panelForMarker("sym-main-panel"),
+                assistantPanel = panelForMarker("sym-assistant-panel")
+            ) {
+                if (!mainPanel) return;
+                const row = mainPanel.closest('[data-testid="stHorizontalBlock"]');
+                if (!row) return;
+                const rowRect = row.getBoundingClientRect();
+                const rowTop = rowRect.top;
+                const availableHeight = Math.max(
+                    320,
+                    Math.floor(hostWindow.innerHeight - rowTop - 8)
+                );
+                row.style.setProperty(
+                    "--sym-workflow-panel-height",
+                    availableHeight + "px"
+                );
+                const columns = Array.from(row.children).filter((element) => {
+                    const testId = element.getAttribute && element.getAttribute("data-testid");
+                    return testId === "column" || testId === "stColumn";
+                });
+                const columnBlocks = columns.flatMap((column) =>
+                    Array.from(column.children).filter(
+                        (element) => element.getAttribute
+                            && element.getAttribute("data-testid") === "stVerticalBlock"
+                    )
+                );
+                const sizedElements = new Set([row, ...columns, ...columnBlocks]);
+                for (const panel of [mainPanel, assistantPanel]) {
+                    if (!panel) continue;
+                    const layout = layoutForPanel(panel);
+                    sizedElements.add(panel);
+                    if (layout) sizedElements.add(layout);
+                }
+                for (const element of sizedElements) {
+                    element.style.setProperty("height", availableHeight + "px", "important");
+                    element.style.setProperty("max-height", availableHeight + "px", "important");
+                    element.dataset.symWorkflowSized = "true";
+                }
+            }
+
+            function workflowPanelFor(target) {
+                if (!(target instanceof hostWindow.Element)) return null;
+                const direct = target.closest(".sym-main-styled, .sym-assistant-styled");
+                if (direct) return direct;
+                const column = target.closest('[data-testid="column"], [data-testid="stColumn"]');
+                if (!column) return null;
+                return column.querySelector(".sym-main-styled, .sym-assistant-styled");
+            }
+
+            function nearestNestedScroller(target, panel) {
+                let node = target;
+                while (node && node !== panel) {
+                    if (node instanceof hostWindow.HTMLElement) {
+                        const style = hostWindow.getComputedStyle(node);
+                        const scrollable = /(auto|scroll)/.test(style.overflowY);
+                        if (scrollable && node.scrollHeight > node.clientHeight + 1) return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+
+            function canScroll(element, deltaY) {
+                if (deltaY < 0) return element.scrollTop > 1;
+                return element.scrollTop + element.clientHeight < element.scrollHeight - 1;
+            }
+
+            function wheelPixels(event, panel) {
+                if (event.deltaMode === 1) return event.deltaY * 16;
+                if (event.deltaMode === 2) return event.deltaY * panel.clientHeight;
+                return event.deltaY;
+            }
+
+            function handOffNestedScroll(event) {
+                if (!event.deltaY) return;
+                const panel = workflowPanelFor(event.target);
+                if (!panel) return;
+                const nested = nearestNestedScroller(event.target, panel);
+                if (nested && canScroll(nested, event.deltaY)) return;
+
+                const deltaY = wheelPixels(event, panel);
+                if (!canScroll(panel, deltaY)) return;
+                if (event.cancelable) event.preventDefault();
+                panel.scrollTop += deltaY;
+            }
+
             refreshPanels();
+            hostWindow.requestAnimationFrame(refreshPanels);
+            const resizeController = new AbortController();
+            hostWindow.addEventListener("resize", refreshPanels, {
+                signal: resizeController.signal,
+            });
+            window.addEventListener("beforeunload", () => resizeController.abort(), {
+                once: true,
+            });
+            if (!doc.documentElement.dataset.symWorkflowWheelHandoff) {
+                doc.addEventListener("wheel", handOffNestedScroll, {
+                    capture: true,
+                    passive: false,
+                });
+                doc.documentElement.dataset.symWorkflowWheelHandoff = "true";
+            }
         })();
         </script>
-        """,
+    """
+
+
+def workflow_layout_cleanup_html() -> str:
+    """Remove workflow-only DOM sizing when Streamlit reuses columns on another page."""
+    return """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            doc.querySelectorAll(".sym-assistant-resize-handle").forEach((node) => node.remove());
+            doc.querySelectorAll(
+                ".sym-workflow-main-column, .sym-workflow-toggle-column, " +
+                ".sym-workflow-assistant-column"
+            ).forEach((column) => {
+                for (const property of ["flex", "width", "min-width", "position", "overflow"]) {
+                    column.style.removeProperty(property);
+                }
+                column.classList.remove(
+                    "sym-workflow-main-column",
+                    "sym-workflow-toggle-column",
+                    "sym-workflow-assistant-column"
+                );
+            });
+            doc.querySelectorAll('[data-sym-workflow-painted="true"]').forEach((column) => {
+                column.style.removeProperty("background-color");
+                delete column.dataset.symWorkflowPainted;
+            });
+            doc.querySelectorAll('[data-sym-workflow-sized="true"]').forEach((panel) => {
+                panel.style.removeProperty("height");
+                panel.style.removeProperty("max-height");
+                delete panel.dataset.symWorkflowSized;
+            });
+            doc.querySelectorAll(".sym-main-styled, .sym-assistant-styled").forEach((panel) => {
+                panel.style.removeProperty("background-color");
+                panel.classList.remove("sym-main-styled", "sym-assistant-styled");
+            });
+            doc.querySelectorAll('[data-testid="stHorizontalBlock"]').forEach((row) => {
+                row.style.removeProperty("--sym-assistant-panel-width");
+                row.style.removeProperty("--sym-workflow-panel-height");
+            });
+        })();
+        </script>
+    """
+
+
+def cleanup_workflow_layout() -> None:
+    components.html(workflow_layout_cleanup_html(), height=0, width=0)
+
+
+def render_workflow_panel_dom_hooks() -> None:
+    """Tag workflow panels and install their nested-scroll behavior."""
+    components.html(
+        workflow_panel_dom_hooks_html(),
         height=0,
         width=0,
     )
@@ -2047,6 +2233,7 @@ defaults = {
     "plan_editor_version": 0,
     "assistant_panel_tabs": "Prompt",
     "assistant_panel_open": True,
+    "assistant_panel_resize_version": 0,
     "hydroagent_nav_page": "Workflows",
     "workflow_section": "Input",
     "input_panel_widget_version": 0,
@@ -2182,6 +2369,7 @@ def render_output_review_layers_fragment() -> None:
         show_hrugru_layer=st.session_state.show_hrugru_layer,
         show_forcing_layer=st.session_state.show_forcing_layer,
         show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
+        fit_bbox_when_visible=True,
     )
     render_workflow_map(
         output_map,
@@ -3871,6 +4059,41 @@ def _normalize_map_click_coords(lat: float, lon: float) -> tuple[float, float]:
     return lat, lon
 
 
+def _add_map_wheel_scroll_handoff(m: folium.Map) -> None:
+    """Route ordinary map-wheel gestures to the enclosing workflow panel."""
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    handoff = MacroElement()
+    handoff._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+          var map = {{ this._parent.get_name() }};
+          if (map.scrollWheelZoom) map.scrollWheelZoom.disable();
+          map.getContainer().addEventListener("wheel", function(event) {
+            var frame = window.frameElement;
+            var panel = frame && frame.closest(
+              '[data-testid="stVerticalBlockBorderWrapper"]'
+            );
+            if (!panel || !event.deltaY) return;
+            var deltaY = event.deltaY;
+            if (event.deltaMode === 1) deltaY *= 16;
+            if (event.deltaMode === 2) deltaY *= panel.clientHeight;
+            var canScrollUp = deltaY < 0 && panel.scrollTop > 1;
+            var canScrollDown = deltaY > 0
+              && panel.scrollTop + panel.clientHeight < panel.scrollHeight - 1;
+            if (!canScrollUp && !canScrollDown) return;
+            if (event.cancelable) event.preventDefault();
+            panel.scrollTop += deltaY;
+          }, { passive: false });
+        })();
+        {% endmacro %}
+        """
+    )
+    handoff.add_to(m)
+
+
 def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> folium.Map:
     """One copy of the continents (no tile wrap). Skip hard maxBounds — that freezes pan on a wide map."""
     m = folium.Map(
@@ -3878,6 +4101,7 @@ def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> foliu
         zoom_start=zoom,
         tiles=None,
         min_zoom=WORKFLOW_MAP_MIN_ZOOM,
+        scroll_wheel_zoom=False,
     )
     folium.TileLayer(
         tiles="OpenStreetMap",
@@ -3887,6 +4111,7 @@ def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> foliu
         overlay=False,
         control=False,
     ).add_to(m)
+    _add_map_wheel_scroll_handoff(m)
     return m
 
 
@@ -3899,7 +4124,8 @@ def _fit_review_map_to_extent(
     if bbox_bounds is not None:
         north, west, south, east = bbox_bounds
         if south != north and west != east:
-            m.fit_bounds([[south, west], [north, east]], padding=(28, 28))
+            padding = MAP_BOUNDING_BOX_FIT_PADDING_PX
+            m.fit_bounds([[south, west], [north, east]], padding=(padding, padding))
             return
     if not layer_gdfs:
         return
@@ -3923,6 +4149,120 @@ def _fit_review_map_to_extent(
             continue
     if souths:
         m.fit_bounds([[min(souths), min(wests)], [max(norths), max(easts)]], padding=(28, 28))
+
+
+def _add_fit_bounding_box_control(
+    m: folium.Map,
+    bbox_bounds: tuple[float, float, float, float] | None,
+) -> None:
+    """Add a Leaflet control that restores the camera to the configured box."""
+    if bbox_bounds is None:
+        return
+    north, west, south, east = bbox_bounds
+    if south == north or west == east:
+        return
+
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    control = MacroElement()
+    control.north = north
+    control.west = west
+    control.south = south
+    control.east = east
+    control.padding = MAP_BOUNDING_BOX_FIT_PADDING_PX
+    control._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        var FitBoundingBoxControl = L.Control.extend({
+          options: { position: "topright" },
+          onAdd: function(map) {
+            var container = L.DomUtil.create("div", "leaflet-control-layers leaflet-control");
+            var button = L.DomUtil.create("a", "leaflet-control-layers-toggle", container);
+            button.href = "#";
+            button.title = "Fit map view to bounding box";
+            button.setAttribute("aria-label", "Fit map view to bounding box");
+            button.innerHTML = '<span aria-hidden="true" style="display:block;width:18px;height:18px;border:2px dashed #374151;border-radius:2px;box-sizing:border-box;"></span>';
+            button.style.cssText = "display:flex;align-items:center;justify-content:center;background-image:none;text-decoration:none;";
+            L.DomEvent.disableClickPropagation(container);
+            L.DomEvent.on(button, "click", function(event) {
+              L.DomEvent.preventDefault(event);
+              L.DomEvent.stopPropagation(event);
+              map.fitBounds(
+                [[{{ this.south }}, {{ this.west }}], [{{ this.north }}, {{ this.east }}]],
+                { padding: [{{ this.padding }}, {{ this.padding }}] }
+              );
+              if (event.detail > 0) button.blur();
+            });
+            return container;
+          }
+        });
+        (new FitBoundingBoxControl()).addTo({{ this._parent.get_name() }});
+        {% endmacro %}
+        """
+    )
+    control.add_to(m)
+
+
+def _add_initial_bounding_box_fit_when_visible(
+    m: folium.Map,
+    bbox_bounds: tuple[float, float, float, float] | None,
+) -> None:
+    """Fit a map initialized inside a collapsed expander once it becomes visible."""
+    if bbox_bounds is None:
+        return
+    north, west, south, east = bbox_bounds
+    if south == north or west == east:
+        return
+
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    initial_fit = MacroElement()
+    initial_fit.north = north
+    initial_fit.west = west
+    initial_fit.south = south
+    initial_fit.east = east
+    initial_fit.padding = MAP_BOUNDING_BOX_FIT_PADDING_PX
+    initial_fit._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+          var map = {{ this._parent.get_name() }};
+          var observer = null;
+          var fitApplied = false;
+          function fitWhenVisible() {
+            var target = window.frameElement || map.getContainer();
+            var rect = target.getBoundingClientRect();
+            if (
+              fitApplied
+              || target.getClientRects().length === 0
+              || rect.width < 20
+              || rect.height < 20
+            ) return;
+            fitApplied = true;
+            map.invalidateSize({ pan: false });
+            window.requestAnimationFrame(function () {
+              map.fitBounds(
+                [[{{ this.south }}, {{ this.west }}], [{{ this.north }}, {{ this.east }}]],
+                { padding: [{{ this.padding }}, {{ this.padding }}], animate: false }
+              );
+            });
+            if (observer) observer.disconnect();
+          }
+          map.whenReady(function () {
+            var target = window.frameElement || map.getContainer();
+            if (window.ResizeObserver) {
+              observer = new ResizeObserver(fitWhenVisible);
+              observer.observe(target);
+            }
+            fitWhenVisible();
+          });
+        })();
+        {% endmacro %}
+        """
+    )
+    initial_fit.add_to(m)
 
 
 MAP_FILL_LAYER_SPECS = [
@@ -4175,10 +4515,10 @@ def render_map_layer_checkboxes(key_prefix: str) -> int:
 
 # Match symfluence.reporting.plotters.domain_plotter choropleth recipes.
 SYMFLUENCE_MAP_FILL_OPACITY = 0.7
+MAP_BOUNDING_BOX_FIT_PADDING_PX = 8
 
 MAP_LAYER_CHOROPLETH_PROFILES: dict[str, str] = {
     "HRUs / GRUs": "grus",
-    "River Basins": "grus",
     "DEM Catchment": "elevation",
     "Landclass Catchment": "landclass",
     "Soilclass Catchment": "soilclass",
@@ -4186,11 +4526,11 @@ MAP_LAYER_CHOROPLETH_PROFILES: dict[str, str] = {
 }
 
 MAP_LAYER_CMAP_BY_PROFILE: dict[str, str] = {
-    "grus": "viridis",
+    "grus": "tab20",
     "elevation": "terrain",
     "landclass": "Set2",
     "soilclass": "Set3",
-    "forcing": "viridis",
+    "forcing": "tab20",
 }
 
 MAP_LAYER_DEFAULT_TOOLTIPS: dict[str, list[str]] = {
@@ -4210,7 +4550,7 @@ MAP_LAYER_LEGEND_TITLES: dict[str, str] = {
     "forcing": "GRU units (forcing)",
 }
 
-# Scrollable swatch list up to this many classes; above that use compact gradient summary.
+# Non-categorical legends above this size use a compact gradient summary.
 MAP_LEGEND_MAX_SWATCHES = 120
 MAP_LEGEND_TWO_COLUMN_MIN = 10
 MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 240
@@ -4242,6 +4582,13 @@ def _river_network_legend_icon_html() -> str:
     )
 
 
+def _river_basins_legend_icon_html() -> str:
+    return (
+        '<span style="width:14px;height:10px;border:1.5px solid purple;'
+        'background:rgba(128,0,128,0.10);border-radius:1px;flex-shrink:0;display:block;"></span>'
+    )
+
+
 def _map_has_bounding_box() -> bool:
     if not _bbox_visible_on_map():
         return False
@@ -4261,6 +4608,7 @@ def _map_has_bounding_box() -> bool:
 
 def _build_map_reference_legend_entries(
     *,
+    show_riverbasins_layer: bool = False,
     show_rivernetwork_layer: bool = False,
     include_spatial_symbols: bool = True,
 ) -> list[dict[str, str]]:
@@ -4278,6 +4626,13 @@ def _build_map_reference_legend_entries(
             {
                 "label": html.escape("Bounding box"),
                 "icon_html": _bounding_box_legend_icon_html(),
+            }
+        )
+    if show_riverbasins_layer:
+        entries.append(
+            {
+                "label": html.escape("River basins"),
+                "icon_html": _river_basins_legend_icon_html(),
             }
         )
     if show_rivernetwork_layer:
@@ -4440,7 +4795,7 @@ def _symfluence_class_color_lookup(
     import numpy as np
 
     base_cmap = plt.get_cmap(cmap_name)
-    if continuous or n_classes > 100 or cmap_name == "viridis":
+    if continuous:
         colors = [_matplotlib_rgba_to_hex(base_cmap(i / n_classes)) for i in range(n_classes)]
     elif n_classes > base_cmap.N:
         extra_cmaps = ["Set3", "Set2", "Set1", "Paired", "tab20"]
@@ -4451,6 +4806,12 @@ def _symfluence_class_color_lookup(
                 break
             extra_cmap = plt.get_cmap(extra_name)
             all_colors.extend([extra_cmap(i) for i in np.linspace(0, 1, extra_cmap.N)])
+        if len(all_colors) < n_classes:
+            categorical_fallback = plt.get_cmap("hsv")
+            all_colors.extend(
+                categorical_fallback((index * 0.61803398875) % 1.0)
+                for index in range(n_classes - len(all_colors))
+            )
         colors = [_matplotlib_rgba_to_hex(color) for color in all_colors[:n_classes]]
     else:
         colors = [_matplotlib_rgba_to_hex(base_cmap(i)) for i in np.linspace(0, 1, n_classes)]
@@ -4496,25 +4857,16 @@ def _choropleth_legend_spec(
         "end_color": legend_entries[-1][1],
     }
 
-    if count > MAP_LEGEND_MAX_SWATCHES:
-        if profile in {"grus", "forcing"}:
-            spec.update(
-                {
-                    "mode": "gradient",
-                    "subtitle": "GRU ID (low → high)",
-                    "start_label": legend_entries[0][0],
-                    "end_label": legend_entries[-1][0],
-                }
-            )
-        else:
-            spec.update(
-                {
-                    "mode": "gradient",
-                    "subtitle": f"{count} classes (low → high)",
-                    "start_label": legend_entries[0][0],
-                    "end_label": legend_entries[-1][0],
-                }
-            )
+    categorical_profiles = {"grus", "forcing", "landclass", "soilclass"}
+    if count > MAP_LEGEND_MAX_SWATCHES and profile not in categorical_profiles:
+        spec.update(
+            {
+                "mode": "gradient",
+                "subtitle": f"{count} classes (low → high)",
+                "start_label": legend_entries[0][0],
+                "end_label": legend_entries[-1][0],
+            }
+        )
         return spec
 
     spec.update(
@@ -4522,7 +4874,7 @@ def _choropleth_legend_spec(
             "mode": "swatches",
             "entries": legend_entries,
             "two_column": count >= MAP_LEGEND_TWO_COLUMN_MIN,
-            "value_header": "GRU ID" if profile in {"grus", "forcing"} else "",
+            "value_header": "GRU IDs" if profile in {"grus", "forcing"} and count >= MAP_LEGEND_TWO_COLUMN_MIN else "",
         }
     )
     return spec
@@ -4598,12 +4950,9 @@ def _add_choropleth_legend_to_map(
                 <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
                 <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
               </div>
-              <div style="flex:0 0 auto;height:10px;border-radius:5px;border:1px solid #cbd5e1;margin-bottom:8px;
-                background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
               {% if this.value_header %}
-              <div style="flex:0 0 auto;display:grid;grid-template-columns:18px 1fr 18px 1fr;gap:4px 10px;
-                font-size:10px;color:#6b7280;margin-bottom:4px;">
-                <span></span><span>{{ this.value_header }}</span><span></span><span>{{ this.value_header }}</span>
+              <div style="flex:0 0 auto;font-size:10px;color:#6b7280;margin-bottom:4px;padding-left:18px;">
+                {{ this.value_header }}
               </div>
               {% endif %}
               <div style="flex:1 1 auto;min-height:0;max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
@@ -4727,7 +5076,7 @@ def _symfluence_layer_choropleth(
         class_col,
         MAP_LAYER_CMAP_BY_PROFILE[profile],
         profile=profile,
-        continuous=profile in {"grus", "forcing"},
+        continuous=profile == "elevation",
     )
     if not lookup:
         return gdf, None, {}
@@ -4919,7 +5268,9 @@ def build_pour_point_map(
     show_rivernetwork_layer: bool = False,
     *,
     lock_initial_view: bool = False,
+    fit_bbox_when_visible: bool = False,
 ):
+    visible_bbox_bounds = _resolve_bounding_box_bounds()
     bbox_bounds = None if lock_initial_view else _resolve_bounding_box_bounds(ignore_hidden=True)
     pour_coords = None if lock_initial_view else _resolve_pour_point_lat_lon()
     if lock_initial_view:
@@ -5046,14 +5397,18 @@ def build_pour_point_map(
         m,
         active_legend_spec,
         reference_entries=_build_map_reference_legend_entries(
+            show_riverbasins_layer=show_riverbasins_layer,
             show_rivernetwork_layer=show_rivernetwork_layer,
             include_spatial_symbols=not lock_initial_view,
         ),
     )
 
     folium.LayerControl().add_to(m)
+    _add_fit_bounding_box_control(m, visible_bbox_bounds)
     if not lock_initial_view:
         _fit_review_map_to_extent(m, bbox_bounds, active_gdfs)
+        if fit_bbox_when_visible:
+            _add_initial_bounding_box_fit_when_visible(m, bbox_bounds)
     return m
 
 
@@ -5642,6 +5997,19 @@ st.set_page_config(page_title="HydroAgent: SYMFLUENCE Workflow Assistant Agent",
 st.markdown(
     """
 <style>
+    :root {
+        --sym-divider-color: rgba(49, 51, 63, 0.18);
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --sym-divider-color: rgba(250, 250, 250, 0.42);
+        }
+    }
+    html[data-theme="dark"],
+    body[data-theme="dark"],
+    [data-theme="dark"] {
+        --sym-divider-color: rgba(250, 250, 250, 0.42);
+    }
     /* Slightly compact typography for the whole app (CSS only, not config.toml). */
     html {
         font-size: 14px;
@@ -5660,7 +6028,7 @@ st.markdown(
         justify-content: space-between;
         gap: 1rem;
         padding: 0.25rem 0 0.85rem 0;
-        border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+        border-bottom: 1px solid var(--sym-divider-color);
         margin-bottom: 0.85rem;
     }
     .sym-title-wrap {
@@ -5746,18 +6114,19 @@ st.markdown(
         padding-bottom: 0 !important;
         margin-bottom: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) {
         align-items: stretch !important;
         margin-bottom: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > [data-testid="column"] {
         display: flex !important;
         flex-direction: column !important;
         min-height: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"] [data-testid="stVerticalBlockBorderWrapper"] {
-        height: calc(100dvh - 10.5rem) !important;
-        max-height: calc(100dvh - 10.5rem) !important;
+    .sym-main-styled,
+    .sym-assistant-styled {
+        height: var(--sym-workflow-panel-height, 720px) !important;
+        max-height: var(--sym-workflow-panel-height, 720px) !important;
         overflow-y: auto !important;
         overflow-x: hidden !important;
         flex: 1 1 auto !important;
@@ -6922,7 +7291,6 @@ def render_workflow_assistant_panel() -> None:
         '<span class="sym-assistant-panel" aria-hidden="true"></span><div class="right-panel">',
         unsafe_allow_html=True,
     )
-    render_workflow_panel_dom_hooks()
     apply_pending_assistant_panel_tab_focus()
     capture_plan_editor_draft()
     render_new_workflow_control()
@@ -8033,7 +8401,6 @@ def render_workflow_input_tab() -> None:
         show_hrugru_layer=False,
         show_forcing_layer=False,
         show_rivernetwork_layer=False,
-        lock_initial_view=True,
     )
     map_data = render_workflow_map(
         map_obj,
@@ -8264,6 +8631,7 @@ def render_workflow_output_tab() -> None:
 
 # Sidebar pages (non-Workflows) — after helper definitions so callbacks exist.
 if current_page != "Workflows":
+    cleanup_workflow_layout()
     st.subheader(current_page)
     if current_page == "Dashboard":
         wx.render_dashboard_page(
@@ -8311,13 +8679,17 @@ assistant_panel_open = bool(st.session_state.get("assistant_panel_open", True))
 if assistant_panel_open:
     main_col, toggle_col, assistant_col = st.columns([0.72, 0.02, 0.28], gap="large")
 else:
-    main_col, toggle_col, assistant_col = st.columns([0.98, 0.02, 0.001], gap="small")
+    main_col, toggle_col = st.columns([0.98, 0.02], gap="small")
+    assistant_col = None
 
 with toggle_col:
     toggle_label = "\u276F" if assistant_panel_open else "\u276E"
     toggle_help = "Hide assistant panel" if assistant_panel_open else "Show assistant panel"
     if st.button(toggle_label, key=ASSISTANT_PANEL_TOGGLE_KEY, help=toggle_help):
         st.session_state.assistant_panel_open = not assistant_panel_open
+        st.session_state.assistant_panel_resize_version = int(
+            st.session_state.get("assistant_panel_resize_version", 0)
+        ) + 1
         st.rerun()
     if assistant_panel_open:
         render_assistant_panel_resizer()
@@ -8339,9 +8711,11 @@ with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     with output_tab:
         render_workflow_output_tab()
 
-with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
-    if assistant_panel_open:
+if assistant_col is not None:
+    with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
         render_workflow_assistant_panel()
+
+render_workflow_panel_dom_hooks()
 
 
 def show_text(text: str):

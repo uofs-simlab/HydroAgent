@@ -47,6 +47,30 @@
 - Closed workflow-step lists also recognize wording such as **in this order**.
 - Colon-separated core settings such as `domain_name: ...` and spatial
   coordinates are preserved deterministically when generating a plan.
+- Maps load fitted to a configured bounding box and include a control for
+  restoring that view after panning or zooming.
+- Review-map legends distinguish river basins from GRUs and display GRU
+  identifiers as discrete categories rather than a numeric color bar.
+- Mouse-wheel input scrolls the workflow column over maps and hands off from
+  nested text panes when they reach their scroll boundaries.
+- The workflow and Assistant panels have a shared one-pixel divider that remains
+  visible with the matching header rule in both light and dark themes.
+- Hiding the Assistant removes its column entirely so the workflow expands into
+  the available space; the toggle sits on the workflow side of the divider, and
+  reopening the Assistant restores a freshly bound resize handle.
+- Workflow panels now fit the remaining browser height and update when the
+  window is resized, without adding an overall page scrollbar.
+- Assistant column widths are scoped to the Workflows page and are cleared when
+  navigating elsewhere, preventing reused Streamlit columns from being squeezed.
+- Panel button styling no longer captures select arrows, date controls, help
+  icons, or other internal widget buttons.
+- Workflow panels retain the normal page background so form controls remain
+  visually distinct instead of blending into a sidebar-gray surface.
+- Output review maps fit the configured bounding box after a collapsed review
+  expander becomes visible, and mouse activation no longer leaves the fit
+  control focused.
+- Dashboard, Experiments, Data, Results, and Logs no longer repeat their page
+  titles below the shared page heading.
 
 ### Known limitations
 

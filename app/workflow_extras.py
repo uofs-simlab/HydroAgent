@@ -970,7 +970,6 @@ def render_calibration_agent_section(
 
 
 def render_results_page(*, symfluence_data_dir: Path, runs_dir: Path) -> None:
-    st.subheader("Results")
     st.caption("Saved plots and figures for the active domain/experiment.")
     ctx = workflow_context(runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir)
     if not ctx.get("domain_name") or not ctx.get("experiment_id"):
@@ -1115,7 +1114,6 @@ def render_data_page(
     symfluence_data_dir: Path,
     layer_paths_fn,
 ) -> None:
-    st.subheader("Data")
     st.caption("Artifact checklist for the current domain and experiment.")
     ctx = workflow_context(runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir)
     if not ctx.get("domain_name") or not ctx.get("experiment_id"):
@@ -1141,7 +1139,6 @@ def tail_file(path: Path, n_lines: int = 80) -> str:
 
 
 def render_logs_page(*, runs_dir: Path, run_folder_skip: set[str]) -> None:
-    st.subheader("Logs")
     runs = sorted(
         p
         for p in runs_dir.iterdir()
@@ -1186,7 +1183,6 @@ def render_dashboard_page(
     render_workflow_progress_fn,
     run_folder_skip: set[str],
 ) -> None:
-    st.subheader("Dashboard")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
@@ -1257,7 +1253,6 @@ def render_experiments_page(
     run_folder_skip: set[str],
     load_run_fn=None,
 ) -> None:
-    st.subheader("Experiments")
     st.caption("Past assistant runs under the local `runs/` folder.")
     flash = st.session_state.pop("_experiments_load_flash", None)
     if flash:
