@@ -427,3 +427,6 @@ experiment Id is 002
 
 40:
 Run Summa for Bow river from 2023/04/03 to 2023/05/27
+
+41:
+Configure a lumped SUMMA model of the Bow River basin upstream of the Banff streamflow gauge CAN_05BB001.

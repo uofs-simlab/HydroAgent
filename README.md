@@ -121,7 +121,8 @@ gemini_api_key:     AIza...
 claude_api_key:     sk-ant-...
 ```
 
-API keys can also be entered directly in the UI sidebar and saved from there. For OpenAI only, you can use `.env`:
+HydroAgent automatically uses `OPENAI_API_KEY` from the environment. You can
+export it in your shell or put it in the ignored `.env` file:
 
 ```bash
 cp .env.example .env
@@ -141,7 +142,7 @@ Open `http://localhost:8501` in your browser.
 ### Typical workflow
 
 1. **Workflows → Input** — Set domain, experiment ID, pour point, model, and date range (or click **Load data domain**).
-2. **Workflows → Prompt** — Select a provider, enter your API key, describe the run in plain English, then click **Generate plan**.
+2. **Workflows → Prompt** — Select a provider, confirm its API key is loaded, describe the run in plain English, then click **Generate plan**.
 3. Review the plan JSON; use the **Chat** tab to refine it conversationally if needed.
 4. Click **Resolve dependencies**, then **Execute plan** (confirm `RUN` for `run_model` / `calibrate_model` steps).
 5. **Output / Results** — Inspect logs and artifacts; use the Results tab for routed-flow plots.
@@ -284,7 +285,7 @@ The right column contains the LLM assistant split across two tabs.
 | Control | What it does |
 |---------|-------------|
 | Provider | Selects the LLM backend: **OpenAI (GPT)**, **Google (Gemini)**, or **Anthropic (Claude)**. Switching providers changes the model list and which API key is active. |
-| Your API key | Paste the key for the selected provider. Keys are stored per-provider and never leave your machine. |
+| Your API key | Paste the key for the selected provider. A saved key is stored locally and used only to authenticate requests to that provider. |
 | Save key | Saves the key for the active provider to `~/.symfluence_assistant/config.yaml` so it persists across sessions. |
 | Model | Dropdown of available models for the selected provider. Defaults to the recommended model for each provider. |
 
@@ -303,6 +304,15 @@ Available models by provider:
 Type a plain-English description of the modelling run — basin name, pour point, model type, date range, and any special requirements. Example:
 
 > *"Lumped SUMMA workflow for Bow River at Banff, 2010–2015, using local domain data."*
+
+**Prompt library (optional)**
+
+| Control | What it does |
+|---------|-------------|
+| Find similar prompts | Searches the local prompt history using OpenAI embeddings. Runs only when clicked. |
+| Use prompt-library examples when generating plan | When enabled, retrieves similar prompts and adds close matches to the planner request. Off by default. |
+| Save generated requests to prompt history | When enabled, saves the input after plan generation. Off by default; saved entries are not validated prompt-config pairs. |
+| Rebuild | Regenerates the searchable embedding cache after the library is edited. |
 
 **Voice input**
 
@@ -332,7 +342,8 @@ Inspects the current plan against the SYMFLUENCE operation catalog and inserts a
 | Allow dangerous run steps | Must be enabled before any step that runs or calibrates a model (`run_model`, `calibrate_model`). These steps can take a long time and consume significant compute. |
 | Type RUN to allow dangerous execution | Safety confirmation field. Type `RUN` (exact) to unlock the Execute plan button when dangerous steps are present. |
 | **Execute plan** | Runs every step in the plan sequentially. Disabled until all required inputs are filled and any dangerous-step confirmation is complete. Output streams live to the Output tab. |
-| **Clear plan** | Discards the current plan and resets the assistant panel so you can start fresh. |
+| **Clear plan** | Discards the generated plan and conversation while retaining the current configuration and active run. |
+| **New workflow** | Clears the current prompt, plan, configuration, map selections, and active-run association. Saved runs and SYMFLUENCE data are not deleted. |
 
 #### Chat tab
 

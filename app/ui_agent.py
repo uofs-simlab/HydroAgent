@@ -91,6 +91,12 @@ from server.core.template import (
 )
 from server.core.validate import validate_spec  # noqa: E402
 from server.core.safe_subprocess import run_command, run_command_stream  # noqa: E402
+from server.core.api_keys import load_api_keys_from_environment  # noqa: E402
+from server.core.prompt_library_policy import (  # noqa: E402
+    DEFAULT_SAVE_PROMPT_HISTORY,
+    DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+    prompt_library_action_enabled,
+)
 from server.core.workflow_executor import (  # noqa: E402
     completed_steps_from_log,
     execution_log_path,
@@ -99,6 +105,7 @@ from server.core.workflow_executor import (  # noqa: E402
     sync_workflow_execution_state,
     workflow_is_running,
 )
+from server.core.workflow_session import reset_workflow_session_state  # noqa: E402
 
 from server.core.parameter_registry import (
     load_template_parameters,
@@ -601,6 +608,9 @@ ASSISTANT_PANEL_BUTTON_KEYS = (
 )
 
 ASSISTANT_PANEL_TOGGLE_KEY = "assistant_panel_toggle"
+ASSISTANT_PANEL_WIDTH_STORAGE_KEY = "hydroagent-assistant-panel-width"
+ASSISTANT_PANEL_MIN_WIDTH_PX = 240
+WORKFLOW_MAIN_MIN_WIDTH_PX = 420
 
 # Middle workflow column: scroll region height (px) and map iframe height inside it.
 WORKFLOW_PANEL_HEIGHT = 720
@@ -746,7 +756,269 @@ def panel_edge_toggle_css(key: str, *, edge: str) -> str:
 
 
 def assistant_panel_toggle_css() -> str:
-    return panel_edge_toggle_css(ASSISTANT_PANEL_TOGGLE_KEY, edge="right")
+    return (
+        panel_edge_toggle_css(ASSISTANT_PANEL_TOGGLE_KEY, edge="right")
+        + """
+    div.st-key-assistant_panel_toggle {
+        position: relative !important;
+        z-index: 2 !important;
+    }
+    .sym-assistant-resize-handle {
+        position: absolute;
+        inset: 0 auto 0 50%;
+        width: 0.75rem;
+        transform: translateX(-50%);
+        z-index: 1;
+        cursor: col-resize;
+        touch-action: none;
+        outline: none;
+    }
+    .sym-assistant-resize-handle::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 0 50%;
+        width: 2px;
+        transform: translateX(-50%);
+        border-radius: 2px;
+        background: transparent;
+        transition: background-color 120ms ease;
+    }
+    .sym-assistant-resize-handle:hover::before,
+    .sym-assistant-resize-handle:focus-visible::before,
+    .sym-assistant-resize-handle[data-resizing="true"]::before {
+        background: #94a3b8;
+    }
+    body.sym-assistant-resizing,
+    body.sym-assistant-resizing * {
+        cursor: col-resize !important;
+        user-select: none !important;
+    }
+    """
+    )
+
+
+def assistant_panel_resizer_html() -> str:
+    """Parent-page resize handle for the Streamlit workflow columns."""
+    storage_key = json.dumps(ASSISTANT_PANEL_WIDTH_STORAGE_KEY)
+    return f"""
+        <script>
+        (function () {{
+            const doc = window.parent.document;
+            const hostWindow = window.parent;
+            const storageKey = {storage_key};
+            const minAssistantWidth = {ASSISTANT_PANEL_MIN_WIDTH_PX};
+            const minMainWidth = {WORKFLOW_MAIN_MIN_WIDTH_PX};
+            const toggleWidth = 28;
+            const defaultRatio = 0.28;
+
+            function columnFor(node) {{
+                let current = node;
+                for (let i = 0; i < 20 && current; i += 1) {{
+                    const testId = current.getAttribute && current.getAttribute("data-testid");
+                    if (testId === "column" || testId === "stColumn") return current;
+                    current = current.parentElement;
+                }}
+                return null;
+            }}
+
+            function install(attempt) {{
+                const toggleColumn = columnFor(window.frameElement);
+                const row = toggleColumn && toggleColumn.parentElement;
+                if (!toggleColumn || !row) {{
+                    if (attempt < 30) window.setTimeout(() => install(attempt + 1), 50);
+                    return;
+                }}
+
+                const columns = Array.from(row.children).filter((element) => {{
+                    const testId = element.getAttribute && element.getAttribute("data-testid");
+                    return testId === "column" || testId === "stColumn";
+                }});
+                const toggleIndex = columns.indexOf(toggleColumn);
+                const mainColumn = columns[toggleIndex - 1];
+                const assistantColumn = columns[toggleIndex + 1];
+                if (!mainColumn || !assistantColumn) return;
+
+                let handle = toggleColumn.querySelector(".sym-assistant-resize-handle");
+                if (handle) return;
+                toggleColumn.style.setProperty("position", "relative", "important");
+                toggleColumn.style.setProperty("overflow", "visible", "important");
+
+                handle = doc.createElement("div");
+                handle.className = "sym-assistant-resize-handle";
+                handle.setAttribute("role", "separator");
+                handle.setAttribute("aria-label", "Resize assistant panel");
+                handle.setAttribute("aria-orientation", "vertical");
+                handle.setAttribute("aria-valuemin", "0");
+                handle.setAttribute("aria-valuemax", "100");
+                handle.setAttribute("title", "Drag to resize assistant panel");
+                handle.tabIndex = 0;
+                toggleColumn.appendChild(handle);
+
+                function measurements() {{
+                    const rowStyle = hostWindow.getComputedStyle(row);
+                    const gap = Number.parseFloat(rowStyle.columnGap || rowStyle.gap) || 0;
+                    const usable = Math.max(1, row.getBoundingClientRect().width - toggleWidth - (2 * gap));
+                    const maxAssistantWidth = Math.max(160, usable - minMainWidth);
+                    const effectiveMinimum = Math.min(minAssistantWidth, maxAssistantWidth);
+                    return {{ usable, maxAssistantWidth, effectiveMinimum }};
+                }}
+
+                function applyWidth(requestedWidth, persist, minimumOverride) {{
+                    const sizes = measurements();
+                    const minimumWidth = Number.isFinite(minimumOverride)
+                        ? Math.min(minimumOverride, sizes.maxAssistantWidth)
+                        : sizes.effectiveMinimum;
+                    const width = Math.min(
+                        sizes.maxAssistantWidth,
+                        Math.max(minimumWidth, requestedWidth),
+                    );
+                    mainColumn.style.setProperty("flex", "1 1 0px", "important");
+                    mainColumn.style.setProperty("width", "auto", "important");
+                    mainColumn.style.setProperty("min-width", "0", "important");
+                    toggleColumn.style.setProperty("flex", `0 0 ${{toggleWidth}}px`, "important");
+                    toggleColumn.style.setProperty("width", `${{toggleWidth}}px`, "important");
+                    toggleColumn.style.setProperty("min-width", `${{toggleWidth}}px`, "important");
+                    assistantColumn.style.setProperty("flex", `0 0 ${{width}}px`, "important");
+                    assistantColumn.style.setProperty("width", `${{width}}px`, "important");
+                    assistantColumn.style.setProperty("min-width", "0", "important");
+                    handle.setAttribute("aria-valuenow", String(Math.round((100 * width) / sizes.usable)));
+                    if (persist) {{
+                        hostWindow.sessionStorage.setItem(storageKey, String(width / sizes.usable));
+                    }}
+                }}
+
+                function applySavedWidth() {{
+                    const ratio = Number.parseFloat(hostWindow.sessionStorage.getItem(storageKey));
+                    if (Number.isFinite(ratio) && ratio > 0 && ratio < 1) {{
+                        applyWidth(ratio * measurements().usable, false);
+                    }}
+                }}
+
+                let resizing = false;
+                let activePointerId = null;
+                let dragStartClientX = 0;
+                let dragStartAssistantWidth = 0;
+                let dragMinimumAssistantWidth = 0;
+                let pendingClientX = null;
+                let resizeFrame = null;
+
+                function applyPendingPointerWidth() {{
+                    resizeFrame = null;
+                    if (!resizing || pendingClientX === null) return;
+                    const pointerDelta = dragStartClientX - pendingClientX;
+                    applyWidth(
+                        dragStartAssistantWidth + pointerDelta,
+                        false,
+                        dragMinimumAssistantWidth,
+                    );
+                    pendingClientX = null;
+                }}
+
+                function queuePointerWidth(clientX) {{
+                    pendingClientX = clientX;
+                    if (resizeFrame === null) {{
+                        resizeFrame = hostWindow.requestAnimationFrame(applyPendingPointerWidth);
+                    }}
+                }}
+
+                handle.addEventListener("pointerdown", (event) => {{
+                    if (event.button !== 0) return;
+                    resizing = true;
+                    activePointerId = event.pointerId;
+                    dragStartClientX = event.clientX;
+                    dragStartAssistantWidth = assistantColumn.getBoundingClientRect().width;
+                    dragMinimumAssistantWidth = Math.min(
+                        measurements().effectiveMinimum,
+                        dragStartAssistantWidth,
+                    );
+                    handle.dataset.resizing = "true";
+                    doc.body.classList.add("sym-assistant-resizing");
+                    try {{
+                        handle.setPointerCapture(event.pointerId);
+                    }} catch (_error) {{
+                        // Parent-document listeners still keep the drag reliable.
+                    }}
+                    event.preventDefault();
+                }});
+                function trackResize(event) {{
+                    if (!resizing || event.pointerId !== activePointerId) return;
+                    if ((event.buttons & 1) === 0) {{
+                        finishResize(event);
+                        return;
+                    }}
+                    queuePointerWidth(event.clientX);
+                    if (event.cancelable) event.preventDefault();
+                }}
+                function finishResize(event) {{
+                    if (!resizing) return;
+                    if (
+                        event
+                        && Number.isInteger(event.pointerId)
+                        && activePointerId !== null
+                        && event.pointerId !== activePointerId
+                    ) return;
+
+                    if (resizeFrame !== null) {{
+                        hostWindow.cancelAnimationFrame(resizeFrame);
+                        resizeFrame = null;
+                    }}
+                    if (pendingClientX !== null) {{
+                        const pointerDelta = dragStartClientX - pendingClientX;
+                        applyWidth(
+                            dragStartAssistantWidth + pointerDelta,
+                            false,
+                            dragMinimumAssistantWidth,
+                        );
+                        pendingClientX = null;
+                    }}
+
+                    const pointerId = activePointerId;
+                    resizing = false;
+                    activePointerId = null;
+                    delete handle.dataset.resizing;
+                    doc.body.classList.remove("sym-assistant-resizing");
+                    try {{
+                        if (pointerId !== null && handle.hasPointerCapture(pointerId)) {{
+                            handle.releasePointerCapture(pointerId);
+                        }}
+                    }} catch (_error) {{
+                        // Capture may already be gone after pointercancel or window blur.
+                    }}
+                    applyWidth(
+                        assistantColumn.getBoundingClientRect().width,
+                        true,
+                        dragMinimumAssistantWidth,
+                    );
+                }}
+                doc.addEventListener("pointermove", trackResize, true);
+                doc.addEventListener("pointerup", finishResize, true);
+                doc.addEventListener("pointercancel", finishResize, true);
+                handle.addEventListener("lostpointercapture", finishResize);
+                hostWindow.addEventListener("blur", finishResize);
+                handle.addEventListener("keydown", (event) => {{
+                    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                    const direction = event.key === "ArrowLeft" ? 1 : -1;
+                    applyWidth(assistantColumn.getBoundingClientRect().width + (direction * 24), true);
+                    event.preventDefault();
+                }});
+                handle.addEventListener("dblclick", () => {{
+                    applyWidth(defaultRatio * measurements().usable, true);
+                }});
+
+                applySavedWidth();
+                const resizeController = new AbortController();
+                hostWindow.addEventListener("resize", applySavedWidth, {{ signal: resizeController.signal }});
+                window.addEventListener("beforeunload", () => resizeController.abort(), {{ once: true }});
+            }}
+
+            install(0);
+        }})();
+        </script>
+    """
+
+
+def render_assistant_panel_resizer() -> None:
+    components.html(assistant_panel_resizer_html(), height=0, width=0)
 
 
 def spatial_input_css() -> str:
@@ -1706,12 +1978,19 @@ def llm_provider_install_hint(provider: str) -> str:
 
 if "api_keys" not in st.session_state:
     st.session_state.api_keys = {}
+if "_api_key_sources" not in st.session_state:
+    st.session_state["_api_key_sources"] = {}
+
+st.session_state["_api_key_sources"].update(
+    load_api_keys_from_environment(st.session_state.api_keys)
+)
 
 persistent_cfg = load_persistent_config()
 for _provider in ("openai", "gemini", "claude"):
     _saved_key = (persistent_cfg or {}).get(f"{_provider}_api_key")
     if _saved_key and not st.session_state.api_keys.get(_provider):
         st.session_state.api_keys[_provider] = _saved_key
+        st.session_state["_api_key_sources"][_provider] = "local settings"
 
 st.session_state.setdefault("run_plan", None)
 st.session_state.setdefault("simulation_plan", None)
@@ -1761,7 +2040,8 @@ defaults = {
     "gpt_model": "gpt-5-mini",
     "nl_request": "",
     "user_prompt": "",
-    "langprompt_enrich": True,
+    "langprompt_enrich": DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+    "langprompt_save": DEFAULT_SAVE_PROMPT_HISTORY,
     "chat_messages": [],
     "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
@@ -4013,7 +4293,7 @@ def _build_map_reference_legend_entries(
 def _map_legend_reference_section_html() -> str:
     return """
               {% if this.reference_entries %}
-              <div style="border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px;">
+              <div style="flex:0 0 auto;border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px;">
                 <div style="font-size:10px;font-weight:600;color:#6b7280;margin-bottom:6px;">
                   Map symbols
                 </div>
@@ -4274,6 +4554,7 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
+                max-height:calc(100% - 40px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
@@ -4308,22 +4589,24 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
+                max-height:calc(100% - 40px);box-sizing:border-box;overflow:hidden;
+                display:flex;flex-direction:column;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
-              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
+              <div style="flex:0 0 auto;display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
                 <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
                 <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
               </div>
-              <div style="height:10px;border-radius:5px;border:1px solid #cbd5e1;margin-bottom:8px;
+              <div style="flex:0 0 auto;height:10px;border-radius:5px;border:1px solid #cbd5e1;margin-bottom:8px;
                 background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
               {% if this.value_header %}
-              <div style="display:grid;grid-template-columns:18px 1fr 18px 1fr;gap:4px 10px;
+              <div style="flex:0 0 auto;display:grid;grid-template-columns:18px 1fr 18px 1fr;gap:4px 10px;
                 font-size:10px;color:#6b7280;margin-bottom:4px;">
                 <span></span><span>{{ this.value_header }}</span><span></span><span>{{ this.value_header }}</span>
               </div>
               {% endif %}
-              <div style="max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
+              <div style="flex:1 1 auto;min-height:0;max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
                 {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:12px;{% endif %}">
               {% for entry in this.entries %}
                 <div style="display:flex;align-items:center;gap:6px;margin:2px 0;min-width:0;">
@@ -4350,6 +4633,7 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
+                max-height:calc(100% - 40px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
@@ -4911,9 +5195,20 @@ def render_prompt_library_panel() -> None:
         )
 
     st.checkbox(
-        "Include similar examples when generating plan",
+        "Use prompt-library examples when generating plan",
         key="langprompt_enrich",
-        help="Prepend close matches from the prompt library as reference for the planner.",
+        help=(
+            "Off by default. When enabled, search for similar prompts and prepend close "
+            "matches as reference examples for the planner."
+        ),
+    )
+    st.checkbox(
+        "Save generated requests to prompt history",
+        key="langprompt_save",
+        help=(
+            "Off by default. When enabled, append the request after a plan is generated. "
+            "This saves the input request, not a validated prompt-config pair."
+        ),
     )
 
     if find_clicked or rebuild_clicked:
@@ -4997,7 +5292,14 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
         )
         openai_key = openai_key_for_langprompt()
         langprompt_matches: list[PromptMatch] = []
-        if langprompt_available() and openai_key:
+        use_prompt_examples = prompt_library_action_enabled(
+            st.session_state.get(
+                "langprompt_enrich",
+                DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+            ),
+            openai_key,
+        )
+        if use_prompt_examples and langprompt_available():
             try:
                 langprompt_matches = find_similar_prompts(
                     st.session_state.nl_request,
@@ -5005,14 +5307,13 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
                     top=5,
                 )
                 st.session_state["_langprompt_matches"] = langprompt_matches
-                if st.session_state.get("langprompt_enrich", True):
-                    planner_request = enrich_planner_request(
-                        planner_request,
-                        langprompt_matches,
-                    )
+                planner_request = enrich_planner_request(
+                    planner_request,
+                    langprompt_matches,
+                )
             except Exception:
                 langprompt_matches = st.session_state.get("_langprompt_matches") or []
-                if st.session_state.get("langprompt_enrich", True) and langprompt_matches:
+                if langprompt_matches:
                     planner_request = enrich_planner_request(
                         planner_request,
                         langprompt_matches,
@@ -5071,7 +5372,14 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
         refresh_plan_editor_from_state(force=True, remount=True)
         seed_chat_from_generate_plan(user_prompt_for_metadata(), plan)
         save_chat_messages_to_run_folder()
-        if langprompt_available() and openai_key:
+        save_prompt_history = prompt_library_action_enabled(
+            st.session_state.get(
+                "langprompt_save",
+                DEFAULT_SAVE_PROMPT_HISTORY,
+            ),
+            openai_key,
+        )
+        if save_prompt_history and langprompt_available():
             try:
                 save_prompt_to_library(
                     st.session_state.nl_request,
@@ -6407,6 +6715,38 @@ def clear_chat_messages(*, clear_plan: bool = False) -> None:
     st.session_state.pop("_committed_plan_steps", None)
 
 
+def render_new_workflow_control() -> None:
+    """Render the global, confirmed reset action for the Assistant panel."""
+    title_col, action_col = st.columns([0.58, 0.42], vertical_alignment="center")
+    with title_col:
+        st.markdown("#### Assistant")
+    with action_col:
+        with st.popover(
+            "New workflow",
+            use_container_width=True,
+            help="Clear the current draft and detach the active run without deleting saved files.",
+        ):
+            st.markdown("**Start a new workflow?**")
+            st.caption(
+                "This clears the current prompt, plan, configuration, and map selections. "
+                "Saved runs and SYMFLUENCE data will not be deleted."
+            )
+            if workflow_running_for_current_run():
+                st.info("The current workflow will continue in its saved run.")
+            if st.button(
+                "Start new workflow",
+                key="confirm_new_workflow",
+                type="primary",
+                width="stretch",
+            ):
+                reset_workflow_session_state(st.session_state)
+                st.session_state["_new_workflow_flash"] = True
+                st.rerun()
+
+    if st.session_state.pop("_new_workflow_flash", False):
+        st.success("New workflow ready. Describe what you want in the prompt.")
+
+
 ASSISTANT_PANEL_TABS_KEY = "assistant_panel_tabs"
 ASSISTANT_TAB_PROMPT = "Prompt"
 ASSISTANT_TAB_CHAT = "Chat"
@@ -6581,6 +6921,7 @@ def render_workflow_assistant_panel() -> None:
     render_workflow_panel_dom_hooks()
     apply_pending_assistant_panel_tab_focus()
     capture_plan_editor_draft()
+    render_new_workflow_control()
     st.radio(
         "Assistant panel",
         options=[ASSISTANT_TAB_PROMPT, ASSISTANT_TAB_CHAT],
@@ -6598,8 +6939,6 @@ def render_workflow_assistant_panel() -> None:
             plan_text_holder = render_persistent_plan_editor(visible=False)
         render_workflow_chat_tab()
     else:
-        st.markdown("#### LLM Assistant")
-
         if not FORCINGS_AVAILABLE:
             st.warning("Local install: acquire_forcings is disabled. Use HPC/MAF or provide external forcings.")
 
@@ -6608,6 +6947,7 @@ def render_workflow_assistant_panel() -> None:
             _cfg_key = persistent_cfg.get(f"{_provider}_api_key")
             if _cfg_key and not st.session_state.api_keys.get(_provider):
                 st.session_state.api_keys[_provider] = _cfg_key
+                st.session_state["_api_key_sources"][_provider] = "local settings"
 
         provider_labels = list(LLM_PROVIDER_BY_LABEL.keys())
         current_provider = s(st.session_state.get("llm_provider")) or "openai"
@@ -6626,12 +6966,18 @@ def render_workflow_assistant_panel() -> None:
         active_provider_label = LLM_PROVIDER_LABELS[active_provider]
 
         if st.session_state.api_keys.get(active_provider):
-            st.success(f"{active_provider_label} API key loaded ✔")
+            active_key_source = st.session_state["_api_key_sources"].get(active_provider)
+            if active_key_source == "OPENAI_API_KEY":
+                st.success(
+                    f"{active_provider_label} API key loaded from `OPENAI_API_KEY` ✔"
+                )
+            else:
+                st.success(f"{active_provider_label} API key loaded ✔")
         else:
             st.warning(f"No {active_provider_label} API key loaded")
 
         api_key_help = {
-            "openai": "OpenAI API key.",
+            "openai": "OpenAI API key. HydroAgent automatically uses OPENAI_API_KEY when set.",
             "gemini": "Google AI Studio / Gemini API key.",
             "claude": "Anthropic API key from console.anthropic.com.",
         }.get(active_provider, "LLM API key.")
@@ -6644,6 +6990,7 @@ def render_workflow_assistant_panel() -> None:
         if st.button("Save key", key="save_openai_key", width="stretch", type="secondary"):
             if api_key.strip():
                 st.session_state.api_keys[active_provider] = api_key.strip()
+                st.session_state["_api_key_sources"][active_provider] = "local settings"
                 cfg_local = load_local_settings()
                 cfg_local[f"{active_provider}_api_key"] = api_key.strip()
                 save_local_settings(cfg_local)
@@ -7968,6 +8315,8 @@ with toggle_col:
     if st.button(toggle_label, key=ASSISTANT_PANEL_TOGGLE_KEY, help=toggle_help):
         st.session_state.assistant_panel_open = not assistant_panel_open
         st.rerun()
+    if assistant_panel_open:
+        render_assistant_panel_resizer()
 
 with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     st.markdown('<span class="sym-main-panel" aria-hidden="true"></span>', unsafe_allow_html=True)
