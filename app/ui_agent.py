@@ -4094,6 +4094,49 @@ def _add_map_wheel_scroll_handoff(m: folium.Map) -> None:
     handoff.add_to(m)
 
 
+MAP_LAYER_PANE_Z_INDEX: dict[str, int] = {
+    "sym-dem": 410,
+    "sym-landclass": 420,
+    "sym-soilclass": 430,
+    "sym-forcing": 440,
+    "sym-river-basins": 450,
+    "sym-hru-gru": 460,
+    "sym-river-network": 470,
+    "sym-spatial-overlay": 480,
+}
+
+MAP_LAYER_PANE_BY_NAME: dict[str, str] = {
+    "DEM Catchment": "sym-dem",
+    "Landclass Catchment": "sym-landclass",
+    "Soilclass Catchment": "sym-soilclass",
+    "ERA5 Intersected": "sym-forcing",
+    "River Basins": "sym-river-basins",
+    "HRUs / GRUs": "sym-hru-gru",
+    "River Network": "sym-river-network",
+}
+
+
+def _add_workflow_map_panes(m: folium.Map) -> None:
+    """Give review layers a stable draw order independent of toggle order."""
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    panes = MacroElement()
+    panes.panes = MAP_LAYER_PANE_Z_INDEX
+    panes._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        {% for name, z_index in this.panes.items() %}
+        var pane = {{ this._parent.get_name() }}.getPane({{ name | tojson }})
+          || {{ this._parent.get_name() }}.createPane({{ name | tojson }});
+        pane.style.zIndex = {{ z_index | tojson }};
+        {% endfor %}
+        {% endmacro %}
+        """
+    )
+    panes.add_to(m)
+
+
 def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> folium.Map:
     """One copy of the continents (no tile wrap). Skip hard maxBounds — that freezes pan on a wide map."""
     m = folium.Map(
@@ -4111,6 +4154,7 @@ def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> foliu
         overlay=False,
         control=False,
     ).add_to(m)
+    _add_workflow_map_panes(m)
     _add_map_wheel_scroll_handoff(m)
     return m
 
@@ -4543,7 +4587,7 @@ MAP_LAYER_DEFAULT_TOOLTIPS: dict[str, list[str]] = {
 }
 
 MAP_LAYER_LEGEND_TITLES: dict[str, str] = {
-    "grus": "GRU units",
+    "grus": "GRUs",
     "elevation": "Elevation",
     "landclass": "Land use class",
     "soilclass": "Soil class",
@@ -4631,7 +4675,7 @@ def _build_map_reference_legend_entries(
     if show_riverbasins_layer:
         entries.append(
             {
-                "label": html.escape("River basins"),
+                "label": html.escape("Sub-basin boundaries"),
                 "icon_html": _river_basins_legend_icon_html(),
             }
         )
@@ -4850,8 +4894,8 @@ def _choropleth_legend_spec(
 
     count = len(legend_entries)
     spec: dict = {
-        "title": title,
-        "count": count,
+        "title": f"GRUs ({count})" if profile == "grus" else title,
+        "count": "" if profile == "grus" else count,
         "profile": profile,
         "start_color": legend_entries[0][1],
         "end_color": legend_entries[-1][1],
@@ -4874,7 +4918,7 @@ def _choropleth_legend_spec(
             "mode": "swatches",
             "entries": legend_entries,
             "two_column": count >= MAP_LEGEND_TWO_COLUMN_MIN,
-            "value_header": "GRU IDs" if profile in {"grus", "forcing"} and count >= MAP_LEGEND_TWO_COLUMN_MIN else "",
+            "value_header": "",
         }
     )
     return spec
@@ -4906,7 +4950,7 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
-                max-height:calc(100% - 40px);box-sizing:border-box;overflow-y:auto;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
@@ -4941,14 +4985,16 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
-                max-height:calc(100% - 40px);box-sizing:border-box;overflow:hidden;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow:hidden;
                 display:flex;flex-direction:column;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
               <div style="flex:0 0 auto;display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
                 <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
+                {% if this.count %}
                 <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
+                {% endif %}
               </div>
               {% if this.value_header %}
               <div style="flex:0 0 auto;font-size:10px;color:#6b7280;margin-bottom:4px;padding-left:18px;">
@@ -4982,7 +5028,7 @@ def _add_choropleth_legend_to_map(
             {% macro html(this, kwargs) %}
             <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
                 min-width:196px;max-width:280px;
-                max-height:calc(100% - 40px);box-sizing:border-box;overflow-y:auto;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
                 padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
@@ -5149,14 +5195,18 @@ def _add_bounding_box_overlay(
     *,
     from_map_clicks: bool = False,
 ) -> None:
-    folium.Rectangle(
+    bounding_box = folium.Rectangle(
         bounds=[[south, west], [north, east]],
         tooltip="Bounding box",
         color="red",
         weight=1,
         fill=True,
         fill_opacity=0.15,
-    ).add_to(parent)
+    )
+    # Folium filters this Leaflet path option from constructor kwargs.
+    bounding_box.options["interactive"] = False
+    bounding_box.options["pane"] = "sym-spatial-overlay"
+    bounding_box.add_to(parent)
     if from_map_clicks and st.session_state.bbox_point_1 and st.session_state.bbox_point_2:
         lat1, lon1 = st.session_state.bbox_point_1
         lat2, lon2 = st.session_state.bbox_point_2
@@ -5327,6 +5377,7 @@ def build_pour_point_map(
                     "name": layer_name,
                     "style_function": style_fn,
                     "highlight_function": highlight_fn,
+                    "pane": MAP_LAYER_PANE_BY_NAME[layer_name],
                 }
 
                 if tips:
