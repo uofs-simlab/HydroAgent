@@ -1905,7 +1905,7 @@ def render_output_review_layers_fragment() -> None:
     )
     render_workflow_map(
         output_map,
-        key="output_layers_map",
+        key=f"output_layers_map_{int(st.session_state.get('_review_layers_epoch', 0))}",
         height=360,
         feature_group_to_add=build_spatial_selection_feature_group(),
     )
@@ -1953,6 +1953,11 @@ def _render_execution_log_body() -> None:
 @st.fragment(run_every=5)
 def _render_execution_log_while_running() -> None:
     _render_execution_log_body()
+    if not workflow_running_for_current_run():
+        st.session_state["_review_layers_epoch"] = int(
+            st.session_state.get("_review_layers_epoch", 0)
+        ) + 1
+        st.rerun(scope="app")
 
 
 def render_workflow_output_execution_section() -> None:
@@ -3629,7 +3634,9 @@ def _fit_review_map_to_extent(
     easts: list[float] = []
     for gdf in layer_gdfs:
         try:
-            framed = gdf
+            framed = _ensure_geodataframe(gdf)
+            if framed is None:
+                continue
             if framed.crs and str(framed.crs).lower() not in {"epsg:4326", "wgs84"}:
                 framed = framed.to_crs(4326)
             minx, miny, maxx, maxy = framed.total_bounds
@@ -3690,7 +3697,7 @@ def _shapefile_suffix_candidates(
         "discretization": discretization or s(plan_cfg.get("discretization")),
         "steps": (st.session_state.run_plan or {}).get("steps") or [],
     }
-    if is_semi_distributed_workflow(spec, plan_cfg):
+    if is_semi_distributed_workflow(spec, plan_cfg) or domain_def == "delineate":
         ordered = ["semidistributed", "delineate", "distributed"]
     elif domain_def in ("lumped", "point", "subset"):
         ordered = [domain_def, "lumped"]
@@ -3785,14 +3792,28 @@ def symfluence_domain_shapefile_paths(
         return {}
 
     basin = symfluence_domain_name(domain_name, experiment_id)
-    domain_root = symfluence_data_domain_dir(basin, experiment_id)
-    if not domain_root.is_dir():
-        raw_root = SYMFLUENCE_DATA_DIR / f"domain_{domain_name}"
-        if raw_root.is_dir():
-            domain_root = raw_root
-            basin = domain_name
-    domain_name = basin
     experiment_id = experiment_id or "run_1"
+    run_folder = s(st.session_state.get("run_folder"))
+    root_candidates: list[Path] = []
+    if run_folder:
+        root_candidates.append(
+            symfluence_data_domain_dir(basin, experiment_id, run_folder=run_folder)
+        )
+    root_candidates.append(symfluence_data_domain_dir(basin, experiment_id))
+    root_candidates.append(SYMFLUENCE_DATA_DIR / f"domain_{domain_name}")
+    domain_root = root_candidates[0]
+    for root in root_candidates:
+        if (root / "shapefiles" / "river_network").is_dir() or (
+            root / "shapefiles" / "river_basins"
+        ).is_dir():
+            domain_root = root
+            break
+        if root.is_dir():
+            domain_root = root
+    folder_name = domain_root.name
+    if folder_name.startswith("domain_"):
+        basin = folder_name[len("domain_") :]
+    domain_name = basin
     plan_cfg = (st.session_state.run_plan or {}).get("config") or {}
     domain_def = (
         s(plan_cfg.get("domain_def"))
@@ -3872,6 +3893,7 @@ def render_map_layer_checkboxes(key_prefix: str) -> int:
         return 0
 
     available_count = 0
+    epoch = int(st.session_state.get("_review_layers_epoch", 0))
     cols = st.columns(3)
     for i, (state_key, label, path_key) in enumerate(MAP_LAYER_CHECKBOX_SPECS):
         shp_path = paths.get(path_key, "")
@@ -3879,15 +3901,12 @@ def render_map_layer_checkboxes(key_prefix: str) -> int:
         if available:
             available_count += 1
         current = bool(st.session_state.get(state_key, False))
-        if not available and current:
-            st.session_state[state_key] = False
-            current = False
         with cols[i % 3]:
             st.session_state[state_key] = st.checkbox(
                 label,
-                value=current if available else False,
+                value=current,
                 disabled=not available,
-                key=f"{key_prefix}_{state_key}",
+                key=f"{key_prefix}_{state_key}_{epoch}_{int(available)}",
                 help=shp_path if available else f"Not found yet:\n{shp_path}",
             )
     return available_count
@@ -4030,6 +4049,48 @@ def _map_legend_reference_section_html() -> str:
               </div>
               {% endif %}
     """
+
+
+def _geopandas_module():
+    loader = getattr(gpd, "_load", None)
+    return loader() if callable(loader) else gpd
+
+
+def _ensure_geodataframe(frame, *, path: str = ""):
+    """Keep map layers as GeoDataFrame after pandas ops that drop the geometry class."""
+    if frame is None:
+        return None
+    geopandas = _geopandas_module()
+    geo_cls = geopandas.GeoDataFrame
+    if isinstance(frame, geo_cls):
+        geometry = getattr(frame, "geometry", None)
+        if geometry is None or geometry.isna().all():
+            return None
+        return frame
+
+    columns = list(getattr(frame, "columns", []))
+    geom_col = next((name for name in ("geometry", "geom", "GEOMETRY") if name in columns), None)
+    if geom_col is None:
+        return None
+    out = geo_cls(frame, geometry=geom_col)
+    if out.empty or out.geometry.isna().all():
+        return None
+    if path:
+        out.attrs["source_path"] = path
+    return out
+
+
+def _gdf_to_folium_geojson(gdf) -> dict:
+    gdf = _ensure_geodataframe(gdf)
+    if gdf is None:
+        raise ValueError("layer has no geometry column")
+    try:
+        crs = getattr(gdf, "crs", None)
+        if crs is not None and str(crs).lower() not in {"epsg:4326", "wgs84"}:
+            gdf = gdf.to_crs(4326)
+    except Exception:
+        pass
+    return json.loads(gdf.to_json())
 
 
 def _matplotlib_rgba_to_hex(rgba) -> str:
@@ -4450,7 +4511,12 @@ def _symfluence_layer_choropleth(
 
     title = MAP_LAYER_LEGEND_TITLES.get(profile, layer_name)
     legend_spec = _choropleth_legend_spec(title, legend_entries, profile=profile)
-    return prepared, _make_choropleth_style_functions(class_col, lookup), legend_spec
+    styled = _ensure_geodataframe(prepared)
+    return (
+        gdf if styled is None else styled,
+        _make_choropleth_style_functions(class_col, lookup),
+        legend_spec,
+    )
 
 
 def _resolve_pour_point_lat_lon() -> tuple[float, float] | None:
@@ -4669,8 +4735,8 @@ def build_pour_point_map(
                 if not os.path.exists(shp_path):
                     return None, {}
 
-                gdf = gpd.read_file(shp_path)
-                if gdf.empty:
+                gdf = _ensure_geodataframe(gpd.read_file(shp_path), path=shp_path)
+                if gdf is None or gdf.empty:
                     return None, {}
 
                 legend_spec: dict = {}
@@ -4680,7 +4746,9 @@ def build_pour_point_map(
                 else:
                     styled_gdf, choropleth_styles, legend_spec = _symfluence_layer_choropleth(gdf, layer_name)
                     if choropleth_styles is not None:
-                        gdf = styled_gdf
+                        gdf = _ensure_geodataframe(styled_gdf, path=shp_path)
+                        if gdf is None:
+                            return None, {}
                         style_fn, highlight_fn = choropleth_styles
                     else:
                         style_fn = lambda x, c=color: {"color": c, "weight": 2, "fillOpacity": 0.10}
@@ -4688,7 +4756,7 @@ def build_pour_point_map(
 
                 tips = tooltip_fields or MAP_LAYER_DEFAULT_TOOLTIPS.get(layer_name, [])
                 geojson_kwargs = {
-                    "data": gdf.__geo_interface__,
+                    "data": _gdf_to_folium_geojson(gdf),
                     "name": layer_name,
                     "style_function": style_fn,
                     "highlight_function": highlight_fn,
