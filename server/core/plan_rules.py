@@ -1983,11 +1983,7 @@ def planner_mode_instructions(mode: str) -> str:
     if mode == WORKFLOW_PLAN_MODE_SIMULATION:
         return (
             "\n\nWORKFLOW MODE: simulation only.\n"
-            "- Keep the full SUMMA pipeline: validate_config, setup_project, create_pour_point, "
-            "acquire_attributes, define_domain, discretize_domain, acquire_forcings, "
-            "model_agnostic_preprocessing, build_model_ready_store, model_specific_preprocessing, "
-            "and run_model.\n"
-            "- Do not omit those steps when local files already exist; Execute plan reuses artifacts at run time.\n"
+            "- Preserve the workflow scope requested by the user.\n"
             "- Add postprocess_results only when the user asked for evaluation, metrics, or plots.\n"
             "- Do NOT include calibrate_model or process_observed_data unless the user explicitly requests them above.\n"
             "- Do NOT set station_id, calibration_period, evaluation_period, optimization fields, "
@@ -2327,7 +2323,6 @@ def normalize_local_workflow_plan(
 
     if mode == WORKFLOW_PLAN_MODE_SIMULATION:
         out = strip_calibration_from_plan(out, user_request)
-        out = restore_simulation_setup_steps_for_calibration(out, user_request)
     elif mode == WORKFLOW_PLAN_MODE_CALIBRATION:
         out = restore_simulation_setup_steps_for_calibration(out, user_request)
         out = ensure_calibration_workflow_steps(out, user_request)

@@ -127,7 +127,7 @@ def test_simulation_keeps_domain_steps_when_local_artifacts_exist():
     assert "run_model" in out["steps"]
 
 
-def test_simulation_restores_omitted_setup_steps():
+def test_simulation_preserves_planner_scope():
     plan = {
         "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
         "steps": ["validate_config", "run_model"],
@@ -140,23 +140,11 @@ def test_simulation_restores_omitted_setup_steps():
     }
     out = normalize_local_workflow_plan(
         plan,
-        "",
+        "Use Experiment06 as the domain name.",
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
         skip_workflow_step_restore=True,
     )
-    assert out["steps"] == [
-        "validate_config",
-        "setup_project",
-        "create_pour_point",
-        "acquire_attributes",
-        "define_domain",
-        "discretize_domain",
-        "acquire_forcings",
-        "model_agnostic_preprocessing",
-        "build_model_ready_store",
-        "model_specific_preprocessing",
-        "run_model",
-    ]
+    assert out["steps"] == ["validate_config", "run_model"]
 
 
 def test_simulation_honors_closed_basin_definition_step_list():
@@ -259,7 +247,7 @@ define_domain
     ]
 
 
-def test_simulation_restores_experiment06_short_plan():
+def test_simulation_preserves_experiment06_short_plan():
     plan = {
         "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
         "steps": [
@@ -280,16 +268,8 @@ def test_simulation_restores_experiment06_short_plan():
     }
     out = normalize_local_workflow_plan(
         plan,
-        "run summa for bow river from 2023/04/02 to 2023/05/15",
+        "Use Experiment06 as the domain name and run SUMMA from 2023/04/02 to 2023/05/15.",
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
         skip_workflow_step_restore=True,
     )
-    assert "validate_config" in out["steps"]
-    assert "setup_project" in out["steps"]
-    assert "create_pour_point" in out["steps"]
-    assert "acquire_attributes" in out["steps"]
-    assert "build_model_ready_store" in out["steps"]
-    assert "model_specific_preprocessing" in out["steps"]
-    assert "postprocess_results" not in out["steps"]
-    assert "dry_run" not in out["steps"]
-    assert "calibrate_model" not in out["steps"]
+    assert out["steps"] == ["acquire_attributes", *plan["steps"]]
