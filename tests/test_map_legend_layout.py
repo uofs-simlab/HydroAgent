@@ -114,11 +114,12 @@ def test_workflow_map_loads_fitted_to_configured_bounding_box(monkeypatch):
     monkeypatch.setattr("app.ui_agent.symfluence_domain_shapefile_paths", lambda: {})
     monkeypatch.setattr("app.ui_agent._build_map_reference_legend_entries", lambda **_kwargs: [])
 
-    rendered = build_pour_point_map().get_root().render()
+    rendered = build_pour_point_map(show_layer_control=False).get_root().render()
 
     assert "[[50.8, -116.8], [51.85, -115.15]]" in rendered
     assert 'options: { position: "topright" }' in rendered
     assert '"scrollWheelZoom": false' in rendered
+    assert "L.control.layers(" not in rendered
     assert 'createPane("sym-river-network")' in rendered
     assert 'addEventListener("wheel"' in rendered
     assert "panel.scrollTop += deltaY" in rendered
@@ -142,6 +143,7 @@ def test_output_review_map_fits_after_collapsed_expander_becomes_visible(monkeyp
 
     rendered = build_pour_point_map(fit_bbox_when_visible=True).get_root().render()
 
+    assert "L.control.layers(" in rendered
     assert "new ResizeObserver(fitWhenVisible)" in rendered
     assert "map.invalidateSize({ pan: false })" in rendered
     assert "target.getClientRects().length === 0" in rendered

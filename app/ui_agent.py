@@ -5319,6 +5319,7 @@ def build_pour_point_map(
     *,
     lock_initial_view: bool = False,
     fit_bbox_when_visible: bool = False,
+    show_layer_control: bool = True,
 ):
     visible_bbox_bounds = _resolve_bounding_box_bounds()
     bbox_bounds = None if lock_initial_view else _resolve_bounding_box_bounds(ignore_hidden=True)
@@ -5454,7 +5455,8 @@ def build_pour_point_map(
         ),
     )
 
-    folium.LayerControl().add_to(m)
+    if show_layer_control:
+        folium.LayerControl().add_to(m)
     _add_fit_bounding_box_control(m, visible_bbox_bounds)
     if not lock_initial_view:
         _fit_review_map_to_extent(m, bbox_bounds, active_gdfs)
@@ -8452,6 +8454,7 @@ def render_workflow_input_tab() -> None:
         show_hrugru_layer=False,
         show_forcing_layer=False,
         show_rivernetwork_layer=False,
+        show_layer_control=False,
     )
     map_data = render_workflow_map(
         map_obj,

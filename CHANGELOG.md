@@ -1,6 +1,6 @@
 # Changelog
 
-## Demo hardening — 2026-09-05
+## Demo hardening — 2026-09-06
 
 ### Added
 
@@ -16,6 +16,8 @@
   requests to prompt history.
 - A confirmed **New workflow** action that clears the active draft and run
   association without deleting saved runs or SYMFLUENCE data.
+- A Bow-at-Banff CIROH demo guide with a coarse semi-distributed example and a
+  lumped fallback.
 
 ### Changed
 
@@ -35,8 +37,8 @@
 - Test discovery consistently includes the project root.
 - Generated run commands use the frozen project environment instead of an
   arbitrary global Python installation.
-- Map legends stay within the map viewport, with long class lists scrolling
-  independently instead of clipping the legend heading.
+- Map legends stay within the map viewport and clear the zoom controls, with
+  long class lists scrolling independently instead of clipping the heading.
 - The Assistant resize divider now starts from the exact grab position, releases
   reliably outside the handle or browser window, and batches drag updates for
   smoother resizing.
@@ -49,8 +51,12 @@
   coordinates are preserved deterministically when generating a plan.
 - Maps load fitted to a configured bounding box and include a control for
   restoring that view after panning or zooming.
-- Review-map legends distinguish river basins from GRUs and display GRU
-  identifiers as discrete categories rather than a numeric color bar.
+- Review-map legends use concise labels for GRUs and sub-basin boundaries and
+  display GRU identifiers as discrete categories rather than a numeric color bar.
+- Review layers retain a fixed stacking order regardless of toggle order, and
+  the bounding-box overlay no longer blocks interaction with underlying layers.
+- The Input map no longer displays an empty Layers control; the control remains
+  available on the Output review map.
 - Mouse-wheel input scrolls the workflow column over maps and hands off from
   nested text panes when they reach their scroll boundaries.
 - The workflow and Assistant panels have a shared one-pixel divider that remains
