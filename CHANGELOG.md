@@ -29,6 +29,8 @@
   plan generation. Manual **Find similar prompts** remains available.
 - HydroAgent and the SYMFLUENCE submodule use separate locked environments:
   `uv` for HydroAgent and Pixi for SYMFLUENCE.
+- The unreviewed Banff prompt added during demo preparation was removed; the
+  pre-existing prompt history remains unchanged and disabled by default.
 
 ### Fixed
 
@@ -46,6 +48,9 @@
   workflow state loads.
 - Basin-definition prompts with an explicit **include only these workflow
   steps** list no longer have the full simulation pipeline added afterward.
+- Simulation workflows can retain explicitly requested WSC observed-streamflow
+  processing, station identifiers, and provider settings without treating them
+  as calibration-only configuration.
 - Closed workflow-step lists also recognize wording such as **in this order**.
 - Colon-separated core settings such as `domain_name: ...` and spatial
   coordinates are preserved deterministically when generating a plan.

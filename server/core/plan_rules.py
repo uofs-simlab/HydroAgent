@@ -1884,8 +1884,6 @@ WORKFLOW_PLAN_MODE_SIMULATION = "simulation"
 WORKFLOW_PLAN_MODE_CALIBRATION = "calibration"
 
 _CALIBRATION_PLAN_CONFIG_KEYS = (
-    "station_id",
-    "STATION_ID",
     "calibration_period",
     "CALIBRATION_PERIOD",
     "evaluation_period",
@@ -1906,11 +1904,15 @@ _CALIBRATION_PLAN_CONFIG_KEYS = (
     "PARAMS_TO_CALIBRATE",
     "basin_params_to_calibrate",
     "BASIN_PARAMS_TO_CALIBRATE",
+)
+
+_SIMULATION_STRIP_STEPS = frozenset({"calibrate_model"})
+_OBSERVATION_PLAN_CONFIG_KEYS = (
+    "station_id",
+    "STATION_ID",
     "streamflow_data_provider",
     "STREAMFLOW_DATA_PROVIDER",
 )
-
-_SIMULATION_STRIP_STEPS = frozenset({"calibrate_model", "process_observed_data"})
 
 # Filled by CalibHydroAgent at design time unless the user names them in the main prompt.
 _AGENT_OWNED_CALIBRATION_CONFIG_KEYS = (
@@ -1985,9 +1987,11 @@ def planner_mode_instructions(mode: str) -> str:
             "\n\nWORKFLOW MODE: simulation only.\n"
             "- Preserve the workflow scope requested by the user.\n"
             "- Add postprocess_results only when the user asked for evaluation, metrics, or plots.\n"
-            "- Do NOT include calibrate_model or process_observed_data unless the user explicitly requests them above.\n"
-            "- Do NOT set station_id, calibration_period, evaluation_period, optimization fields, "
-            "params_to_calibrate, or streamflow_data_provider in config.\n"
+            "- Observed-streamflow processing is valid in simulation mode when requested; in that case "
+            "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
+            "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
+            "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
+            "- Do NOT set calibration_period, evaluation_period, optimization fields, or params_to_calibrate in config.\n"
         )
     if mode == WORKFLOW_PLAN_MODE_CALIBRATION:
         return (
@@ -2225,11 +2229,17 @@ def strip_calibration_from_plan(plan: dict, user_request: str = "") -> dict:
 
     for key in _CALIBRATION_PLAN_CONFIG_KEYS:
         cfg.pop(key, None)
+    if "process_observed_data" not in kept_steps:
+        for key in _OBSERVATION_PLAN_CONFIG_KEYS:
+            cfg.pop(key, None)
     extra = cfg.get("extra_config")
     if isinstance(extra, dict):
         extra = dict(extra)
         for key in _CALIBRATION_PLAN_CONFIG_KEYS:
             extra.pop(key, None)
+        if "process_observed_data" not in kept_steps:
+            for key in _OBSERVATION_PLAN_CONFIG_KEYS:
+                extra.pop(key, None)
         if extra:
             cfg["extra_config"] = extra
         else:

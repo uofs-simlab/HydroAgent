@@ -18,15 +18,17 @@ def test_strip_calibration_from_simulation_plan():
         "config": {
             "domain_name": "Experiment04",
             "station_id": "05BB001",
+            "streamflow_data_provider": "WSC",
             "calibration_period": "2022-04-01, 2022-05-01",
             "optimization_metric": "KGE",
         },
     }
     out = strip_calibration_from_plan(plan, "")
     assert "calibrate_model" not in out["steps"]
-    assert "process_observed_data" not in out["steps"]
+    assert "process_observed_data" in out["steps"]
     assert "run_model" in out["steps"]
-    assert "station_id" not in out["config"]
+    assert out["config"]["station_id"] == "05BB001"
+    assert out["config"]["streamflow_data_provider"] == "WSC"
     assert "calibration_period" not in out["config"]
 
 
@@ -70,6 +72,7 @@ def test_simulation_normalize_strips_calibration_fields():
         "config": {
             "domain_name": "Experiment04",
             "station_id": "05BA006",
+            "streamflow_data_provider": "WSC",
             "iterations": 50,
         },
     }
@@ -82,6 +85,7 @@ def test_simulation_normalize_strips_calibration_fields():
     assert is_simulation_workflow_plan(out)
     assert "calibrate_model" not in out["steps"]
     assert "station_id" not in out["config"]
+    assert "streamflow_data_provider" not in out["config"]
     assert "iterations" not in out["config"]
 
 
