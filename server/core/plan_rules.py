@@ -199,7 +199,7 @@ def try_restore_local_recovery_plan(
     if not request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir):
         return out
 
-    ordered = extract_ordered_steps_from_request(user_request)
+    ordered = extract_ordered_workflow_steps(user_request)
     if len(ordered) < 3:
         return out
 
@@ -1739,36 +1739,6 @@ def extract_user_required_steps_from_step_order(user_request: str) -> set[str]:
         if bare:
             required.add(bare)
     return required
-
-
-def extract_ordered_steps_from_request(user_request: str) -> list[str]:
-    """Parse explicit workflow steps from the prompt, preserving listed order."""
-    ordered_block = extract_ordered_workflow_steps(user_request)
-    if len(ordered_block) >= 3:
-        return ordered_block
-    if not user_request:
-        return []
-
-    step_lookup = {name.lower(): name for name in WORKFLOW_STEP_NAMES}
-    found: list[str] = []
-    seen: set[str] = set()
-    for line in user_request.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        bare = step_lookup.get(line.lower())
-        if bare and bare not in seen:
-            found.append(bare)
-            seen.add(bare)
-            continue
-        for step in WORKFLOW_STEP_NAMES:
-            if step == "dry_run":
-                continue
-            if re.search(rf"\b{re.escape(step)}\b", line, flags=re.IGNORECASE) and step not in seen:
-                found.append(step)
-                seen.add(step)
-                break
-    return found
 
 
 def restore_workflow_steps_from_user_request(

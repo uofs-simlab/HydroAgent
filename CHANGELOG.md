@@ -48,10 +48,13 @@
   workflow state loads.
 - Basin-definition prompts with an explicit **include only these workflow
   steps** list no longer have the full simulation pipeline added afterward.
-- Simulation workflows can retain explicitly requested WSC observed-streamflow
+- Simulation workflows can retain explicitly requested observed-streamflow
   processing, station identifiers, and provider settings without treating them
   as calibration-only configuration.
 - Closed workflow-step lists also recognize wording such as **in this order**.
+- Deterministic workflow-step restoration and validation now use only the strict
+  explicit-list parser; incidental mentions of step names are not treated as a
+  user-supplied workflow list.
 - Colon-separated core settings such as `domain_name: ...` and spatial
   coordinates are preserved deterministically when generating a plan.
 - Maps load fitted to a configured bounding box and include a control for

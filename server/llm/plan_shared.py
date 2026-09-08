@@ -13,7 +13,7 @@ from server.core.plan_rules import (
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
     extract_explicit_domain_name_from_request,
-    extract_ordered_steps_from_request,
+    extract_ordered_workflow_steps,
     mark_domain_name_confirmed,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
@@ -291,7 +291,7 @@ def finalize_run_plan(
     data_dir = default_symfluence_data_dir()
     steps_now = plan.get("steps", []) or []
     steps_for_validation = list(steps_now)
-    ordered_steps = extract_ordered_steps_from_request(user_request)
+    ordered_steps = extract_ordered_workflow_steps(user_request)
     if len(ordered_steps) >= 3:
         steps_for_validation = ordered_steps
 
