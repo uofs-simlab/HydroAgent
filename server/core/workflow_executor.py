@@ -229,6 +229,8 @@ def run_workflow_job(run_dir: Path) -> int:
     symfluence_data_dir = Path(job["symfluence_data_dir"])
     symfluence_python = Path(job["symfluence_python"])
     user_request = job.get("user_request", "")
+    if not bool(job.get("enable_prompt_matching", True)):
+        user_request = ""
     resume = bool(job.get("resume"))
 
     plan_path = run_dir / "plan.json"

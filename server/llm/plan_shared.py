@@ -13,9 +13,10 @@ from server.core.plan_rules import (
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
     extract_explicit_domain_name_from_request,
-    extract_ordered_workflow_steps,
+    extract_ordered_steps_from_request,
     mark_domain_name_confirmed,
     normalize_local_workflow_plan,
+    plan_workflow_mode,
     plan_requires_bounding_box,
     pour_point_workflow_skips_bbox,
     request_indicates_local_data_reuse,
@@ -126,6 +127,11 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "domain_def": {
                         "type": ["string", "null"],
                         "enum": ["lumped", "point", "subset", "delineate", None],
+                        "description": (
+                            "SYMFLUENCE domain definition method. Use lumped when the user "
+                            "requests a lumped basin; use delineate for pour-point delineation "
+                            "unless another supported method is explicit."
+                        ),
                     },
                     "experiment_time_start": {"type": ["string", "null"]},
                     "experiment_time_end": {"type": ["string", "null"]},
@@ -135,6 +141,10 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "forcing_dataset": {"type": ["string", "null"]},
                     "discretization": {"type": ["string", "null"]},
                     "routing_model": {"type": ["string", "null"]},
+                    "pet_method": {"type": ["string", "null"]},
+                    "stream_threshold": {"type": ["string", "number", "null"]},
+                    "data_access": {"type": ["string", "null"]},
+                    "num_processes": {"type": ["integer", "null"]},
                     "streamflow_data_provider": {"type": ["string", "null"]},
                     "station_id": {"type": ["string", "null"]},
                     "DOWNLOAD_SNOTEL": {"type": ["boolean", "null"]},
@@ -172,6 +182,10 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "forcing_dataset",
                     "discretization",
                     "routing_model",
+                    "pet_method",
+                    "stream_threshold",
+                    "data_access",
+                    "num_processes",
                     "streamflow_data_provider",
                     "station_id",
                     "DOWNLOAD_SNOTEL",
@@ -227,7 +241,11 @@ def finalize_run_plan(
     user_request: str,
     *,
     skip_workflow_step_restore: bool = False,
+    enable_prompt_matching: bool = True,
+    workflow_plan_mode: str | None = None,
 ) -> Dict[str, Any]:
+    if not enable_prompt_matching:
+        user_request = ""
     cfg = plan.get("config", {}) or {}
 
     if cfg.get("extra_config") is not None and not isinstance(cfg.get("extra_config"), dict):
@@ -265,13 +283,24 @@ def finalize_run_plan(
     if not cfg.get("domain_def"):
         cfg["domain_def"] = "delineate"
 
+    if not enable_prompt_matching:
+        extra_cfg = cfg.get("extra_config") or {}
+        lumped_settings = {
+            str(extra_cfg.get("ROUTING_DELINEATION", "")).lower(),
+            str(extra_cfg.get("PARAMETER_REGIONALIZATION", "")).lower(),
+        }
+        if "lumped" in lumped_settings:
+            cfg["domain_def"] = "lumped"
+
     explicit_domain = extract_explicit_domain_name_from_request(user_request)
     if explicit_domain:
         cfg["domain_name"] = explicit_domain
         cfg = mark_domain_name_confirmed(cfg)
     elif cfg.get("domain_name"):
         cfg["domain_name"] = _normalize_domain_name_for_config(cfg["domain_name"])
-        if explicit_domain and explicit_domain.lower() == _s(cfg["domain_name"]).lower():
+        if not enable_prompt_matching:
+            cfg = mark_domain_name_confirmed(cfg)
+        elif explicit_domain and explicit_domain.lower() == _s(cfg["domain_name"]).lower():
             cfg = mark_domain_name_confirmed(cfg)
 
     plan["config"] = cfg
@@ -283,7 +312,6 @@ def finalize_run_plan(
     required_user_fields = [
         "domain_name",
         "hydrological_model",
-        "pour_point_coords",
         "experiment_time_start",
         "experiment_time_end",
     ]
@@ -291,9 +319,12 @@ def finalize_run_plan(
     data_dir = default_symfluence_data_dir()
     steps_now = plan.get("steps", []) or []
     steps_for_validation = list(steps_now)
-    ordered_steps = extract_ordered_workflow_steps(user_request)
+    ordered_steps = extract_ordered_steps_from_request(user_request)
     if len(ordered_steps) >= 3:
         steps_for_validation = ordered_steps
+
+    if "create_pour_point" in steps_for_validation:
+        required_user_fields.append("pour_point_coords")
 
     if (
         not pour_point_workflow_skips_bbox(
@@ -358,10 +389,15 @@ def finalize_run_plan(
 
     plan = ensure_domain_name_user_input(plan, user_request, data_dir=data_dir)
     request_text = (user_request or "").lower()
-    workflow_plan_mode = None
-    if "workflow mode: calibration" in request_text:
+    workflow_plan_mode = s(workflow_plan_mode).lower() or None
+    if workflow_plan_mode not in {
+        WORKFLOW_PLAN_MODE_CALIBRATION,
+        WORKFLOW_PLAN_MODE_SIMULATION,
+    }:
+        workflow_plan_mode = None
+    if workflow_plan_mode is None and "workflow mode: calibration" in request_text:
         workflow_plan_mode = WORKFLOW_PLAN_MODE_CALIBRATION
-    elif "workflow mode: simulation" in request_text:
+    elif workflow_plan_mode is None and "workflow mode: simulation" in request_text:
         workflow_plan_mode = WORKFLOW_PLAN_MODE_SIMULATION
     if workflow_plan_mode and not plan.get("workflow_plan_mode"):
         plan["workflow_plan_mode"] = workflow_plan_mode
@@ -371,6 +407,7 @@ def finalize_run_plan(
         data_dir=data_dir,
         skip_workflow_step_restore=skip_workflow_step_restore,
         workflow_plan_mode=workflow_plan_mode,
+        enable_prompt_matching=enable_prompt_matching,
     )
     cfg = dict(plan.get("config") or {})
 
@@ -469,6 +506,7 @@ def finalize_plan_refinement(
     conversation_text: str,
     data_dir: Path | None = None,
     preserve_workflow_steps: bool = False,
+    enable_prompt_matching: bool = True,
 ) -> tuple[str, Dict[str, Any], bool]:
     reply = s(result.get("reply")) or "Done."
     update_plan = bool(result.get("update_plan"))
@@ -499,6 +537,8 @@ def finalize_plan_refinement(
         new_plan,
         conversation_text,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=enable_prompt_matching,
+        workflow_plan_mode=plan_workflow_mode(current_plan) or None,
     )
 
     if preserve_workflow_steps:
@@ -522,6 +562,7 @@ def finalize_plan_refinement(
                 conversation_text,
                 data_dir=data_dir,
                 skip_workflow_step_restore=True,
+                enable_prompt_matching=enable_prompt_matching,
             )
 
     return reply, new_plan, True

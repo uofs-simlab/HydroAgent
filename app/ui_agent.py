@@ -1504,7 +1504,7 @@ def sanitize_config_token(name: str) -> str:
 
 def reuse_existing_domain_data_from_session(plan_cfg: dict | None = None) -> bool:
     plan_cfg = plan_cfg or {}
-    user_request = (
+    user_request = phrase_matching_text(
         user_prompt_for_metadata()
         or conversation_text_for_plan_rules()
         or s(st.session_state.get("nl_request", ""))
@@ -1582,7 +1582,9 @@ def finalize_spec_for_symfluence(spec_dict: dict) -> dict:
     raw_expid = spec_dict.get("experiment_id") or "exp"
     basin = symfluence_domain_name(str(raw_domain), str(raw_expid))
     expid = sanitize_config_token(str(raw_expid)) or str(raw_expid)
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     run_folder, sym_domain = resolve_run_workspace(
         basin,
         expid,
@@ -1856,6 +1858,7 @@ def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> d
         user_request,
         catalog=catalog,
         data_dir=SYMFLUENCE_DATA_DIR,
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
     )
 
 def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -2045,8 +2048,8 @@ def build_symfluence_step_cmd(step: str, config_path: Path) -> list[str]:
 DANGER_STEPS = {"run_model", "calibrate_model"}
 
 GPT_MODELS = {
-    "GPT-5 (Recommended)": ["gpt-5-mini", "gpt-5.2", "gpt-5.2-pro"],
-    "GPT-4.x (Legacy / Compatibility)": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+    "GPT-5.6": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+    "GPT-5 Mini": ["gpt-5-mini"],
 }
 ALL_GPT_MODELS = [m for group in GPT_MODELS.values() for m in group]
 
@@ -2228,6 +2231,7 @@ defaults = {
     "user_prompt": "",
     "langprompt_enrich": DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
     "langprompt_save": DEFAULT_SAVE_PROMPT_HISTORY,
+    "enable_prompt_phrase_matching": False,
     "chat_messages": [],
     "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
@@ -2518,7 +2522,9 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
         return False
     spec = spec or {}
     cfg = cfg or {}
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     if is_lumped_workflow(spec, user_request):
         return False
     domain = s(spec.get("domain_name") or cfg.get("DOMAIN_NAME")).lower()
@@ -2607,7 +2613,9 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
 
 def apply_lumped_workflow_defaults(cfg: dict, spec: dict, user_request: str = "") -> dict:
     """Align lumped-basin configs with SYMFLUENCE examples (GRUs + lumped routing)."""
-    user_request = user_request or user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_request or user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     if not is_lumped_workflow(spec, user_request):
         return cfg
     defaults = {
@@ -2671,7 +2679,9 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
         "data_access": "DATA_ACCESS",
     }
 
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     for spec_key, yaml_key in mapping.items():
         if spec.get(spec_key) is None:
             continue
@@ -2882,7 +2892,7 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     active_plan = st.session_state.get("run_plan") or {}
     calibration_plan = is_calibration_workflow_plan(active_plan)
     domain_name = s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name)
-    user_request = (
+    user_request = phrase_matching_text(
         user_prompt_for_metadata()
         or conversation_text_for_plan_rules()
         or s(st.session_state.get("nl_request", ""))
@@ -2964,9 +2974,11 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         station_id = (
             resolve_station_id_from_plan(
                 station_lookup_cfg,
-                user_prompt_for_metadata()
-                or conversation_text_for_plan_rules()
-                or s(st.session_state.get("nl_request", "")),
+                phrase_matching_text(
+                    user_prompt_for_metadata()
+                    or conversation_text_for_plan_rules()
+                    or s(st.session_state.get("nl_request", ""))
+                ),
                 fallback=explicit_station,
             )
             or None
@@ -2996,7 +3008,9 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
 
     spec = wx.merge_advanced_into_spec(spec, plan_cfg)
 
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     disc = lookup_plan_config(plan_cfg, "discretization", "DOMAIN_DISCRETIZATION")
     if disc is not None and s(disc):
         spec["discretization"] = symfluence_discretization_from_plan(plan_cfg, user_request)
@@ -3096,6 +3110,8 @@ def _chat_message_has_literal_config(text: str) -> bool:
 
 def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
     """Apply deterministic chat parsers before/after LLM refinement."""
+    if not prompt_phrase_matching_enabled():
+        return _deep_copy_plan(plan), False
     before = canonical_plan_config(plan.get("config") or {})
     patched = preserve_explicit_config_fields_from_prompt(
         apply_chat_step_order_edits(
@@ -3120,6 +3136,8 @@ def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
 
 def _confirm_domain_from_chat_message(plan: dict, user_message: str) -> dict:
     """Mark domain_name confirmed when the user explicitly sets it in chat."""
+    if not prompt_phrase_matching_enabled():
+        return plan
     if not isinstance(plan, dict) or not s(user_message):
         return plan
     out = dict(plan)
@@ -3149,6 +3167,7 @@ def commit_chat_plan_update(
         conversation_text,
         data_dir=SYMFLUENCE_DATA_DIR,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
     )
     sorted_steps = sort_plan_steps_by_workflow_order(list(new_plan.get("steps") or []))
     if sorted_steps:
@@ -3175,6 +3194,7 @@ def commit_chat_plan_update(
             conversation_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             skip_workflow_step_restore=False,
+            enable_prompt_matching=prompt_phrase_matching_enabled(),
         )
         if list(restored.get("steps") or []) != list(plan.get("steps") or []):
             store_run_plan(restored)
@@ -3661,6 +3681,7 @@ def resolve_plan_missing_inputs(
     user_request: str = "",
 ) -> list[str]:
     """Compute needs_user_input from step requirements and domain-name policy."""
+    user_request = phrase_matching_text(user_request)
     required = get_required_config_fields_for_steps(steps, plan_cfg, user_request)
     missing = [k for k in required if not plan_config_field_present(plan_cfg, k)]
     if domain_name_needs_user_input(plan_cfg, user_request, data_dir=SYMFLUENCE_DATA_DIR):
@@ -5548,7 +5569,10 @@ def augment_request_with_ui(nl: str, *, workflow_plan_mode: str | None = None) -
     lines = wx.augment_request_with_advanced(lines)
     if s(workflow_plan_mode) == WORKFLOW_PLAN_MODE_CALIBRATION:
         lines = wx.augment_request_with_calibration(lines, s(nl))
-    mode_hint = planner_mode_instructions(workflow_plan_mode or "")
+    mode_hint = planner_mode_instructions(
+        workflow_plan_mode or "",
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
+    )
     if mode_hint:
         lines.append(mode_hint.strip())
     return "\n".join(lines).strip() + "\n"
@@ -5564,6 +5588,35 @@ def openai_key_for_langprompt() -> str | None:
 
 def render_prompt_library_panel() -> None:
     """LangPrompt: find similar past workflow prompts and optionally reuse them."""
+    st.markdown("**Prompt handling**")
+    examples_col, matching_col = st.columns(2)
+    with examples_col:
+        st.checkbox(
+            "Use stored-prompt library",
+            key="langprompt_enrich",
+            help=(
+                "Off by default. When enabled, search for similar prompts and prepend close "
+                "matches as reference examples for the planner."
+            ),
+        )
+    with matching_col:
+        st.checkbox(
+            "Enable phrase matching in prompts",
+            key="enable_prompt_phrase_matching",
+            help=(
+                "Off by default. When enabled, allow HydroAgent's legacy deterministic rules "
+                "to inspect the prompt in addition to the LLM's structured plan."
+            ),
+        )
+    st.checkbox(
+        "Save generated requests to prompt history",
+        key="langprompt_save",
+        help=(
+            "Off by default. When enabled, append the request after a plan is generated. "
+            "This saves the input request, not a validated prompt-config pair."
+        ),
+    )
+
     if not langprompt_available():
         import_error = langprompt_import_error()
         st.caption("Prompt library search requires langchain packages.")
@@ -5573,7 +5626,6 @@ def render_prompt_library_panel() -> None:
 
     nl = s(st.session_state.get("nl_request"))
     if not nl or is_plan_json_text(nl):
-        st.markdown("**Prompt library**")
         st.caption(
             "Type a workflow description in the prompt box above, then search for similar past prompts."
         )
@@ -5584,7 +5636,6 @@ def render_prompt_library_panel() -> None:
         st.caption("Save an **OpenAI** API key to search the prompt library (embeddings).")
         return
 
-    st.markdown("**Prompt library**")
     st.caption("Search past workflow prompts with semantic similarity (LangPrompt).")
 
     find_col, rebuild_col = st.columns([3, 1])
@@ -5601,23 +5652,6 @@ def render_prompt_library_panel() -> None:
             key="langprompt_rebuild_store",
             help="Re-embed all prompts (use after editing prompts/library/prompts.txt).",
         )
-
-    st.checkbox(
-        "Use prompt-library examples when generating plan",
-        key="langprompt_enrich",
-        help=(
-            "Off by default. When enabled, search for similar prompts and prepend close "
-            "matches as reference examples for the planner."
-        ),
-    )
-    st.checkbox(
-        "Save generated requests to prompt history",
-        key="langprompt_save",
-        help=(
-            "Off by default. When enabled, append the request after a plan is generated. "
-            "This saves the input request, not a validated prompt-config pair."
-        ),
-    )
 
     if find_clicked or rebuild_clicked:
         try:
@@ -5694,6 +5728,7 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
         return
     try:
         capture_user_prompt_from_session()
+        enable_prompt_matching = prompt_phrase_matching_enabled()
         planner_request = augment_request_with_ui(
             st.session_state.nl_request,
             workflow_plan_mode=workflow_plan_mode,
@@ -5731,18 +5766,25 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
             plan = gemini_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
         elif provider == "claude":
             plan = claude_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
         else:
             plan = openai_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
-        plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
+        if enable_prompt_matching:
+            plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
         convo = conversation_text_for_plan_rules() or s(st.session_state.nl_request)
         plan["workflow_plan_mode"] = workflow_plan_mode
         if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
@@ -5754,8 +5796,9 @@ def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
             convo,
             data_dir=SYMFLUENCE_DATA_DIR,
             workflow_plan_mode=workflow_plan_mode,
+            enable_prompt_matching=enable_prompt_matching,
         )
-        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION and enable_prompt_matching:
             plan = strip_agent_calibration_config_unless_in_prompt(plan, s(st.session_state.nl_request))
         st.session_state.workflow_plan_mode = workflow_plan_mode
 
@@ -6709,6 +6752,16 @@ def user_prompt_for_metadata() -> str:
     return ""
 
 
+def prompt_phrase_matching_enabled() -> bool:
+    """Whether legacy deterministic phrase rules may inspect prompt prose."""
+    return bool(st.session_state.get("enable_prompt_phrase_matching", False))
+
+
+def phrase_matching_text(text: str = "") -> str:
+    """Expose prompt prose to legacy rules only when the user opts in."""
+    return s(text) if prompt_phrase_matching_enabled() else ""
+
+
 def capture_user_prompt_from_session() -> None:
     """Snapshot the prompt box when generating a plan (before plan JSON can leak in)."""
     nl = s(st.session_state.get("nl_request"))
@@ -6884,6 +6937,7 @@ def call_llm_refine_run_plan(
     context_text: str,
     preserve_workflow_steps: bool = False,
 ) -> tuple[str, dict, bool]:
+    enable_prompt_matching = prompt_phrase_matching_enabled()
     if provider_id == "gemini":
         return gemini_provider_client(api_key).refine_run_plan(
             model=model,
@@ -6893,6 +6947,7 @@ def call_llm_refine_run_plan(
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             preserve_workflow_steps=preserve_workflow_steps,
+            enable_prompt_matching=enable_prompt_matching,
         )
     if provider_id == "claude":
         return claude_provider_client(api_key).refine_run_plan(
@@ -6903,6 +6958,7 @@ def call_llm_refine_run_plan(
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             preserve_workflow_steps=preserve_workflow_steps,
+            enable_prompt_matching=enable_prompt_matching,
         )
     return openai_provider_client(api_key).refine_run_plan(
         model=model,
@@ -6912,6 +6968,7 @@ def call_llm_refine_run_plan(
         context_text=context_text,
         data_dir=SYMFLUENCE_DATA_DIR,
         preserve_workflow_steps=preserve_workflow_steps,
+        enable_prompt_matching=enable_prompt_matching,
     )
 
 
@@ -7820,7 +7877,9 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
     station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg_local)
     station_id = resolve_station_id_from_plan(
         station_lookup_cfg,
-        user_prompt_for_metadata() or s(st.session_state.get("nl_request", "")),
+        phrase_matching_text(
+            user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+        ),
         fallback=s(st.session_state.station_id),
     )
     if station_id:
@@ -7938,7 +7997,7 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
     """Return a user-facing error when config is missing fields required for a step."""
     plan = st.session_state.run_plan or {}
     plan_cfg = plan.get("config") or {}
-    user_request = user_prompt_for_metadata()
+    user_request = phrase_matching_text(user_prompt_for_metadata())
     domain_name = s(cfg.get("DOMAIN_NAME") or plan_cfg.get("domain_name"))
     experiment_id = s(plan_cfg.get("experiment_id") or cfg.get("EXPERIMENT_ID") or "run_1")
     forcing_dataset = s(plan_cfg.get("forcing_dataset") or cfg.get("FORCING_DATASET") or "ERA5")
@@ -8780,6 +8839,7 @@ def show_text(text: str):
 if st.session_state.execute_plan and st.session_state.run_plan:
     st.session_state.execute_plan = False
     capture_user_prompt_from_session()
+    enable_prompt_matching = prompt_phrase_matching_enabled()
     committed_steps = st.session_state.get("_committed_plan_steps")
     plan = normalize_local_workflow_plan(
         force_steps(
@@ -8790,6 +8850,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         or user_prompt_for_metadata()
         or s(st.session_state.get("nl_request", "")),
         data_dir=SYMFLUENCE_DATA_DIR,
+        enable_prompt_matching=enable_prompt_matching,
     )
     if isinstance(committed_steps, list) and committed_steps:
         plan["steps"] = list(committed_steps)
@@ -8860,6 +8921,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         cfg.pop("BOUNDING_BOX_COORDS", None)
 
     user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    matching_request = phrase_matching_text(user_request)
     basin_domain = symfluence_domain_name(
         s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
         s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
@@ -8867,17 +8929,17 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     symfluence_domain = basin_domain
     plan = ensure_skip_acquire_forcings_when_local_forcing(
         plan,
-        user_request,
+        matching_request,
         data_dir=SYMFLUENCE_DATA_DIR,
     )
     plan = ensure_skip_model_agnostic_when_local_preprocessing(
         plan,
-        user_request,
+        matching_request,
         data_dir=SYMFLUENCE_DATA_DIR,
     )
     plan = ensure_skip_process_observed_when_local_streamflow(
         plan,
-        user_request,
+        matching_request,
         data_dir=SYMFLUENCE_DATA_DIR,
         symfluence_domain=symfluence_domain,
     )
@@ -8889,7 +8951,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         station_lookup_cfg["pour_point_coords"] = current_pour
     station_id = resolve_station_id_from_plan(
         station_lookup_cfg,
-        user_request,
+        matching_request,
         fallback=s(st.session_state.station_id),
     )
     if station_id:
@@ -8985,6 +9047,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
                 "symfluence_data_dir": str(SYMFLUENCE_DATA_DIR),
                 "symfluence_python": str(SYMFLUENCE_PYTHON),
                 "user_request": user_request,
+                "enable_prompt_matching": enable_prompt_matching,
                 "resume": resume,
             },
         )

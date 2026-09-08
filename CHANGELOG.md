@@ -12,8 +12,8 @@
   installed beside HydroAgent.
 - Automatic discovery of `OPENAI_API_KEY` without saving another plaintext copy
   in HydroAgent's local configuration.
-- Independent controls for using prompt-library examples and saving generated
-  requests to prompt history.
+- Independent controls for using prompt-library examples, enabling legacy
+  prompt phrase matching, and saving generated requests to prompt history.
 - A confirmed **New workflow** action that clears the active draft and run
   association without deleting saved runs or SYMFLUENCE data.
 - A Bow-at-Banff CIROH demo guide with a coarse semi-distributed example and a
@@ -23,14 +23,20 @@
 
 - Prompt-library example enrichment is off by default.
 - Automatic prompt-history saving is off by default.
+- Deterministic phrase matching over prompt prose is off by default, so the
+  planner's structured config and step list remain authoritative. The original
+  phrase-matching behavior remains available as an opt-in setting.
+- Data-access policy, stream threshold, PET method, and process count are now
+  first-class structured planner fields rather than depending on prompt parsing.
 - The assistant panel can be resized by dragging its divider; its width is
   retained for the current browser session.
-- Disabling example enrichment now skips the automatic embedding search during
-  plan generation. Manual **Find similar prompts** remains available.
+- When stored-prompt examples are disabled, plan generation does not search the
+  saved prompts or add them to the LLM context. Manual **Find similar prompts**
+  remains available.
 - HydroAgent and the SYMFLUENCE submodule use separate locked environments:
   `uv` for HydroAgent and Pixi for SYMFLUENCE.
-- The unreviewed Banff prompt added during demo preparation was removed; the
-  pre-existing prompt history remains unchanged and disabled by default.
+- The OpenAI model selector now offers GPT-5.6 Sol, Terra, and Luna alongside
+  GPT-5 Mini; older OpenAI model choices have been removed.
 
 ### Fixed
 
@@ -46,15 +52,11 @@
   smoother resizing.
 - Confirming **New workflow** now closes the confirmation popover as the clean
   workflow state loads.
-- Basin-definition prompts with an explicit **include only these workflow
-  steps** list no longer have the full simulation pipeline added afterward.
 - Simulation workflows can retain explicitly requested observed-streamflow
   processing, station identifiers, and provider settings without treating them
   as calibration-only configuration.
-- Closed workflow-step lists also recognize wording such as **in this order**.
-- Deterministic workflow-step restoration and validation now use only the strict
-  explicit-list parser; incidental mentions of step names are not treated as a
-  user-supplied workflow list.
+- Pour-point coordinates are required only for workflows that create a pour
+  point, not for downstream runs of an existing domain.
 - Colon-separated core settings such as `domain_name: ...` and spatial
   coordinates are preserved deterministically when generating a plan.
 - Maps load fitted to a configured bounding box and include a control for
@@ -78,19 +80,8 @@
   navigating elsewhere, preventing reused Streamlit columns from being squeezed.
 - Panel button styling no longer captures select arrows, date controls, help
   icons, or other internal widget buttons.
-- Workflow panels retain the normal page background so form controls remain
-  visually distinct instead of blending into a sidebar-gray surface.
 - Output review maps fit the configured bounding box after a collapsed review
   expander becomes visible, and mouse activation no longer leaves the fit
   control focused.
 - Dashboard, Experiments, Data, Results, and Logs no longer repeat their page
   titles below the shared page heading.
-
-### Known limitations
-
-- Prompt-history entries are raw inputs rather than approved prompt-config
-  pairs; keep history enrichment disabled unless the library has been reviewed.
-- Station identifiers are not yet resolved deterministically into both a gauge
-  coordinate and a validated watershed bounding box.
-- A complete Bow-at-Banff workflow should be pretested before the live demo;
-  validation and dry-run behavior are more mature than unattended execution.

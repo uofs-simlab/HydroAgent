@@ -4,11 +4,26 @@ from server.core.plan_rules import (
     WORKFLOW_PLAN_MODE_CALIBRATION,
     WORKFLOW_PLAN_MODE_SIMULATION,
     ensure_calibration_workflow_steps,
+    extract_ordered_steps_from_request,
     is_calibration_workflow_plan,
     is_simulation_workflow_plan,
     normalize_local_workflow_plan,
     strip_calibration_from_plan,
 )
+
+
+def test_legacy_prompt_matching_keeps_permissive_step_extraction():
+    prompt = (
+        "First run setup_project for the domain.\n"
+        "Then acquire_attributes for delineation.\n"
+        "Finally define_domain before continuing."
+    )
+
+    assert extract_ordered_steps_from_request(prompt) == [
+        "setup_project",
+        "acquire_attributes",
+        "define_domain",
+    ]
 
 
 def test_strip_calibration_from_simulation_plan():
@@ -131,7 +146,7 @@ def test_simulation_keeps_domain_steps_when_local_artifacts_exist():
     assert "run_model" in out["steps"]
 
 
-def test_simulation_preserves_planner_scope():
+def test_simulation_preserves_planner_scope_when_prompt_matching_disabled():
     plan = {
         "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
         "steps": ["validate_config", "run_model"],
@@ -147,11 +162,45 @@ def test_simulation_preserves_planner_scope():
         "Use Experiment06 as the domain name.",
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=False,
     )
     assert out["steps"] == ["validate_config", "run_model"]
 
 
-def test_simulation_honors_closed_basin_definition_step_list():
+def test_simulation_restores_legacy_full_pipeline_when_prompt_matching_enabled():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": ["validate_config", "run_model"],
+        "config": {
+            "domain_name": "Experiment06",
+            "domain_def": "delineate",
+            "hydrological_model": "SUMMA",
+            "routing_model": "mizuRoute",
+        },
+    }
+    out = normalize_local_workflow_plan(
+        plan,
+        "Use Experiment06 as the domain name.",
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        skip_workflow_step_restore=True,
+        enable_prompt_matching=True,
+    )
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+        "discretize_domain",
+        "acquire_forcings",
+        "model_agnostic_preprocessing",
+        "build_model_ready_store",
+        "model_specific_preprocessing",
+        "run_model",
+    ]
+
+
+def test_simulation_preserves_structured_basin_scope_when_prompt_matching_disabled():
     prompt = """Include only these workflow steps:
 
 validate_config
@@ -174,11 +223,6 @@ Do not include run_model.
             "create_pour_point",
             "acquire_attributes",
             "define_domain",
-            "acquire_forcings",
-            "model_agnostic_preprocessing",
-            "build_model_ready_store",
-            "model_specific_preprocessing",
-            "run_model",
         ],
         "config": {
             "domain_name": "Bow_at_Banff_CIROH_lumped",
@@ -191,6 +235,7 @@ Do not include run_model.
         plan,
         prompt,
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        enable_prompt_matching=False,
     )
 
     assert out["steps"] == [
@@ -202,7 +247,7 @@ Do not include run_model.
     ]
 
 
-def test_affirmative_cloud_prompt_with_order_qualifier_keeps_closed_steps(tmp_path):
+def test_cloud_structured_plan_keeps_scope_when_prompt_matching_disabled(tmp_path):
     prompt = """Prepare a fresh, basin-definition-only cloud workflow.
 
 data_access: cloud
@@ -228,8 +273,6 @@ define_domain
             "create_pour_point",
             "acquire_attributes",
             "define_domain",
-            "acquire_forcings",
-            "run_model",
         ],
     }
 
@@ -238,6 +281,7 @@ define_domain
         prompt,
         data_dir=tmp_path,
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        enable_prompt_matching=False,
     )
 
     assert out["config"]["data_access"] == "cloud"
@@ -251,7 +295,7 @@ define_domain
     ]
 
 
-def test_simulation_preserves_experiment06_short_plan():
+def test_simulation_preserves_experiment06_short_plan_when_prompt_matching_disabled():
     plan = {
         "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
         "steps": [
@@ -275,5 +319,6 @@ def test_simulation_preserves_experiment06_short_plan():
         "Use Experiment06 as the domain name and run SUMMA from 2023/04/02 to 2023/05/15.",
         workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=False,
     )
     assert out["steps"] == ["acquire_attributes", *plan["steps"]]

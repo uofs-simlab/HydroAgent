@@ -33,6 +33,10 @@ Rules:
    - forcing_dataset
    - discretization
    - routing_model
+   - pet_method
+   - stream_threshold
+   - data_access
+   - num_processes
    - spinup_period
    - calibration_period
    - evaluation_period
@@ -135,12 +139,7 @@ Rules:
     - calibration_period
     - evaluation_period
 
-32. If any of these are missing from the user request:
-    - domain_name
-    - pour_point_coords
-    - experiment_time_start
-    - experiment_time_end
-    then add them to needs_user_input.
+32. If domain_name, experiment_time_start, or experiment_time_end is missing from the user request, add it to needs_user_input. Require pour_point_coords only when the workflow includes create_pour_point. A downstream simulation or postprocessing workflow for an existing domain may leave pour_point_coords null without adding it to needs_user_input.
 
 33. bounding_box_coords is required ONLY when the workflow includes acquire_attributes or acquire_forcings (cloud/MAF downloads over an extent). Do NOT require bounding_box_coords for define_domain, discretize_domain, model_agnostic_preprocessing, model_specific_preprocessing, run_model, or postprocess_results when those download steps are omitted.
 

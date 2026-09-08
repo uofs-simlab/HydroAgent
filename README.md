@@ -165,7 +165,7 @@ Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `gpt-5` | OpenAI model name |
+| `--model` | `gpt-5-mini` | OpenAI model name |
 | `--api-key` | env | Override `OPENAI_API_KEY` |
 | `--json-out` | — | Save plan JSON to file |
 
@@ -293,7 +293,7 @@ Available models by provider:
 
 | Provider | Models |
 |----------|--------|
-| OpenAI (GPT) | GPT-4o, GPT-4o-mini, GPT-5, and others |
+| OpenAI (GPT) | GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, GPT-5 Mini |
 | Google (Gemini) | Gemini 2.5 Flash / Pro (recommended), Gemini 2.0 Flash, Gemini 1.5 (legacy) |
 | Anthropic (Claude) | Sonnet 4, Opus 4 (recommended), Sonnet 3.7, Sonnet 3.5, Haiku 3.5 (legacy) |
 

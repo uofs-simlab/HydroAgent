@@ -199,7 +199,7 @@ def try_restore_local_recovery_plan(
     if not request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir):
         return out
 
-    ordered = extract_ordered_workflow_steps(user_request)
+    ordered = extract_ordered_steps_from_request(user_request)
     if len(ordered) < 3:
         return out
 
@@ -1407,11 +1407,12 @@ def resolve_plan_step_dependencies(
     *,
     catalog: dict,
     data_dir: str | Path | None = None,
+    enable_prompt_matching: bool = True,
 ) -> dict:
     """Infer goals from the prompt, expand catalog dependencies, and refresh needs_user_input."""
     from server.capabilities.resolve_dependencies import resolve_step_dependencies
 
-    user_request = _s(user_request)
+    user_request = _s(user_request) if enable_prompt_matching else ""
     new_plan = dict(plan)
 
     new_plan = normalize_local_workflow_plan(
@@ -1419,6 +1420,7 @@ def resolve_plan_step_dependencies(
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=False,
+        enable_prompt_matching=enable_prompt_matching,
     )
 
     steps = list(new_plan.get("steps") or [])
@@ -1476,6 +1478,7 @@ def resolve_plan_step_dependencies(
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=enable_prompt_matching,
     )
     return new_plan
 
@@ -1669,9 +1672,6 @@ def extract_ordered_workflow_steps(user_request: str) -> list[str]:
     step_lookup.update({k.lower(): v for k, v in _PSEUDO_WORKFLOW_STEP_ALIASES.items()})
     block_patterns = [
         r"workflow_steps\s*:\s*\n(.*?)(?=\n\S|\Z)",
-        r"(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
-        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:\s*\n"
-        r"(.*?)(?=\n\s*(?:do not|this\b|the\b|set\b|use\b|preserve\b|generate\b)|\Z)",
         r"(?:use\s+)?this\s+(?:local[- ]first\s+)?step\s+order\s*:?\s*\n(.*?)(?=\n(?:Do not|Generate\b)|\Z)",
         r"(?:use\s+)?this\s+exact\s+step\s+order\s*:?\s*\n(.*?)(?=\nGenerate\b|\Z)",
     ]
@@ -1713,9 +1713,6 @@ def extract_user_required_steps_from_step_order(user_request: str) -> set[str]:
     step_lookup = {name.lower(): name for name in WORKFLOW_STEP_NAMES}
     block_patterns = (
         r"workflow_steps\s*:\s*\n(.*?)(?=\n\S|\Z)",
-        r"(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
-        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:\s*\n"
-        r"(.*?)(?=\n\s*(?:do not|this\b|the\b|set\b|use\b|preserve\b|generate\b)|\Z)",
         r"(?:use\s+)?this\s+(?:local[- ]first\s+)?step\s+order\s*:?\s*\n(.*?)(?=\n(?:Do not|Generate\b)|\Z)",
         r"(?:use\s+)?this\s+exact\s+step\s+order\s*:?\s*\n(.*?)(?=\nGenerate\b|\Z)",
     )
@@ -1739,6 +1736,36 @@ def extract_user_required_steps_from_step_order(user_request: str) -> set[str]:
         if bare:
             required.add(bare)
     return required
+
+
+def extract_ordered_steps_from_request(user_request: str) -> list[str]:
+    """Parse explicit workflow steps from the prompt, preserving listed order."""
+    ordered_block = extract_ordered_workflow_steps(user_request)
+    if len(ordered_block) >= 3:
+        return ordered_block
+    if not user_request:
+        return []
+
+    step_lookup = {name.lower(): name for name in WORKFLOW_STEP_NAMES}
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in user_request.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        bare = step_lookup.get(line.lower())
+        if bare and bare not in seen:
+            found.append(bare)
+            seen.add(bare)
+            continue
+        for step in WORKFLOW_STEP_NAMES:
+            if step == "dry_run":
+                continue
+            if re.search(rf"\b{re.escape(step)}\b", line, flags=re.IGNORECASE) and step not in seen:
+                found.append(step)
+                seen.add(step)
+                break
+    return found
 
 
 def restore_workflow_steps_from_user_request(
@@ -1950,9 +1977,24 @@ def is_simulation_workflow_plan(plan: dict | None) -> bool:
     return plan_workflow_mode(plan) == WORKFLOW_PLAN_MODE_SIMULATION
 
 
-def planner_mode_instructions(mode: str) -> str:
+def planner_mode_instructions(mode: str, *, enable_prompt_matching: bool = True) -> str:
     mode = _s(mode).lower()
     if mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        if enable_prompt_matching:
+            return (
+                "\n\nWORKFLOW MODE: simulation only.\n"
+                "- Keep the full SUMMA pipeline: validate_config, setup_project, create_pour_point, "
+                "acquire_attributes, define_domain, discretize_domain, acquire_forcings, "
+                "model_agnostic_preprocessing, build_model_ready_store, model_specific_preprocessing, "
+                "and run_model.\n"
+                "- Do not omit those steps when local files already exist; Execute plan reuses artifacts at run time.\n"
+                "- Add postprocess_results only when the user asked for evaluation, metrics, or plots.\n"
+                "- Observed-streamflow processing is valid in simulation mode when requested; in that case "
+                "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
+                "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
+                "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
+                "- Do NOT set calibration_period, evaluation_period, optimization fields, or params_to_calibrate in config.\n"
+            )
         return (
             "\n\nWORKFLOW MODE: simulation only.\n"
             "- Preserve the workflow scope requested by the user.\n"
@@ -2123,20 +2165,6 @@ def restore_simulation_setup_steps_for_calibration(
     if mode not in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
         return plan
 
-    # A closed step list is stronger than the mode's usual full-pipeline default.
-    # This supports domain-definition-only and other deliberately partial workflows.
-    if re.search(
-        r"\b(?:include|run|use)\s+only\s+(?:these\s+)?workflow\s+steps"
-        r"(?:\s*,\s*in\s+(?:this\s+)?order)?\s*:",
-        user_request or "",
-        flags=re.IGNORECASE,
-    ):
-        exact_steps = extract_ordered_workflow_steps(user_request)
-        if exact_steps:
-            out = dict(plan)
-            out["steps"] = exact_steps
-            return with_user_required_steps(out, set(exact_steps))
-
     from server.core.ui_config_fields import is_lumped_workflow
 
     cfg = dict(plan.get("config") or {})
@@ -2249,6 +2277,7 @@ def normalize_local_workflow_plan(
     data_dir: str | Path | None = None,
     skip_workflow_step_restore: bool = False,
     workflow_plan_mode: str | None = None,
+    enable_prompt_matching: bool = True,
 ) -> dict:
     """
     Fix plans for local-data / notebook-style workflows: no bbox gate, restore steps from prompt.
@@ -2256,8 +2285,12 @@ def normalize_local_workflow_plan(
     """
     if not isinstance(plan, dict):
         return plan
+    if not enable_prompt_matching:
+        user_request = ""
     out = dict(plan)
     cfg = dict(out.get("config") or {})
+    if not enable_prompt_matching and _s(cfg.get("domain_name")):
+        cfg = mark_domain_name_confirmed(cfg)
     out["config"] = cfg
     steps = list(out.get("steps") or [])
 
@@ -2303,6 +2336,8 @@ def normalize_local_workflow_plan(
 
     if mode == WORKFLOW_PLAN_MODE_SIMULATION:
         out = strip_calibration_from_plan(out, user_request)
+        if enable_prompt_matching:
+            out = restore_simulation_setup_steps_for_calibration(out, user_request)
     elif mode == WORKFLOW_PLAN_MODE_CALIBRATION:
         out = restore_simulation_setup_steps_for_calibration(out, user_request)
         out = ensure_calibration_workflow_steps(out, user_request)

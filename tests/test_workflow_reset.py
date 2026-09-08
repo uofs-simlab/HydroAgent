@@ -26,6 +26,7 @@ def test_reset_workflow_clears_run_state_and_preserves_preferences():
         "llm_model": "claude-sonnet",
         "langprompt_enrich": False,
         "langprompt_save": False,
+        "enable_prompt_phrase_matching": False,
         "assistant_panel_open": True,
     }
 
@@ -53,6 +54,7 @@ def test_reset_workflow_clears_run_state_and_preserves_preferences():
     assert state["llm_model"] == "claude-sonnet"
     assert state["langprompt_enrich"] is False
     assert state["langprompt_save"] is False
+    assert state["enable_prompt_phrase_matching"] is False
     assert state["assistant_panel_open"] is True
 
 
