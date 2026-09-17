@@ -29,7 +29,7 @@ HydroAgent/
 ├── server/
 │   ├── core/
 │   │   ├── local_domain.py      # Domain artifact copy/restore utilities
-│   │   ├── run_naming.py        # Mac-style duplicate run-folder naming
+│   │   ├── run_naming.py        # Portable duplicate run-folder naming
 │   │   ├── ui_config_fields.py  # Config field registry and chat-edit logic
 │   │   ├── plan_rules.py        # Workflow planning rules
 │   │   ├── template.py          # Config template renderer
@@ -51,7 +51,7 @@ HydroAgent/
 │   ├── extract_discharge.py             # mizuRoute routed-flow extraction
 │   ├── summarize_routed_flow.py         # Flow summarisation
 │   └── restore_local_domain_artifacts.py  # Restore catchment/DEM from semidistributed into/ copies
-├── examples/                # local_settings.example.yaml
+├── examples/                # Local settings and portable CIROH demo plans
 ├── cli.py                   # Headless plan generator (OpenAI)
 ├── run.sh                   # Launch script
 ├── pyproject.toml           # Direct HydroAgent dependencies and project configuration
@@ -149,6 +149,9 @@ Open `http://localhost:8501` in your browser.
 
 Run outputs are saved under `runs/<domain>_<experiment>/`.
 
+For a portable simulation example, see the [Logan River CIROH demo](examples/ciroh_logan_demo.md)
+and its [water-year 2005 plan](examples/logan_river_ciroh_demo.plan.json).
+
 ---
 
 ## CLI
@@ -190,7 +193,7 @@ A radio selector at the top switches between pages:
 | Experiments | Browse and reload previous runs; trigger calibration runs. |
 | Data | Inspect SYMFLUENCE_data domain folders and available shapefiles. |
 | Templates | Reserved for a future template management UI. |
-| Results | Post-processing and routed-flow visualisation across all runs. |
+| Results | Daily hydrographs, evaluation metrics, flow-duration curves, CSV downloads, and saved plots for the active run. Reads postprocessed result tables or routed-flow CSVs and applies evaluation and spin-up periods. |
 | Logs | View raw command logs from past runs. |
 | Settings | Reminder page pointing to path settings (in the sidebar expander below). |
 
@@ -219,9 +222,13 @@ The centre column contains the core workflow controls split across two tabs.
 
 | Option | What it does |
 |--------|-------------|
-| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, `spec.json`, and `chat.json`. If the folder name is already taken, a Finder-style suffix (`(1)`, `(2)`, …) is added automatically to avoid overwriting existing work. |
+| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, `spec.json`, and available prompt/chat history. If the folder name is already taken, a portable suffix (`_1`, `_2`, …) is added automatically. Existing legacy `(1)` folders remain loadable. |
 | Load assistant run | Dropdown of existing folders under `runs/`; loading restores all session fields from the saved plan, config, and chat history. |
-| Load SYMFLUENCE data domain | Dropdown of `domain_*` folders under `SYMFLUENCE_data/`; reads `config.yaml` from the domain and populates the session fields from it. |
+| Load SYMFLUENCE data domain | Dropdown of `domain_*` folders under `SYMFLUENCE_data/`; restores the matching assistant run when its saved config identifies the domain and experiment, otherwise loads the domain config. |
+
+Preview refreshes and plan/chat edits write only to `runs/_preview/`. A saved
+run's metadata is updated when you explicitly create/save or execute a run.
+Results continues to use the selected run's saved configuration while you edit.
 
 **Workflow settings**
 
@@ -242,7 +249,7 @@ The centre column contains the core workflow controls split across two tabs.
 |---------|-------------|
 | Map click mode — Pour point | Click anywhere on the map to drop a pour point marker. Coordinates are captured as `lat/lon` and written to the plan config. |
 | Map click mode — Bounding box | Click two corners of a rectangle on the map. The first click sets corner 1; the second click finalises the box. Clicking again after the box is set starts a new box. |
-| Review layers (expander) | Toggle checkboxes to overlay delineation outputs (DEM, land class, soil class, river basins, HRU/GRU, forcing grid, river network) on the map. Layers appear only when the corresponding shapefiles exist under `SYMFLUENCE_data/domain_<name>/`. |
+| Review layers (expander) | Independently toggle pour point, bounding box, river basins, and river network. Choose one color layer (DEM, land class, soil class, HRU/GRU, or forcing grid), or None for overlays only. Controls use spatial references from the plan and available shapefiles under `SYMFLUENCE_data/domain_<name>/`. |
 | Interactive map | Folium map; pan and zoom normally. Click to set spatial inputs according to the mode above. |
 | Clear pour point | Removes the current pour point from the session and from the active plan. |
 | Clear bounding box | Removes the current bounding box from the session and from the active plan. |
@@ -358,7 +365,9 @@ The Chat tab is a full conversational interface for refining the active plan. Af
 
 The assistant responds with a short explanation and applies any plan changes immediately — the editable plan JSON in the Prompt tab and the Input tab fields both update in real time.
 
-Chat history is saved to `runs/<folder>/chat.json` and is reloaded automatically when you load a run from the Start / load run section.
+Draft chat history is saved to `runs/_preview/chat.json`. Creating/saving or
+executing a run stores the conversation in `runs/<folder>/chat.json`, which is
+restored when you load that run from Start / load run.
 
 ---
 
@@ -421,7 +430,7 @@ uv run --frozen python tools/restore_local_domain_artifacts.py \
 | Plan / LLM errors | Check the API key for the selected provider in the sidebar or config file |
 | Provider not available | Ensure `anthropic` or `google-genai` is installed in the same Python environment running Streamlit |
 | GeoPandas import errors | Confirm Python 3.12.14 is selected, then rerun `uv sync --frozen` |
-| Run folder collision | The app handles this automatically with `(1)`, `(2)` suffixes; if you see unexpected folder names, check `runs/` for pre-existing folders |
+| Run folder collision | The app handles this automatically with `_1`, `_2` suffixes and recognizes existing legacy `(1)`, `(2)` folders; check `runs/` for pre-existing folders |
 
 ---
 

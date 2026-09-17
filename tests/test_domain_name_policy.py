@@ -118,7 +118,7 @@ def test_finalize_run_plan_trusts_structured_plan_when_prompt_matching_disabled(
 
     assert plan["config"]["domain_name"] == "Structured_Basin"
     assert plan["config"].get("pour_point_coords") is None
-    assert plan["config"]["domain_def"] == "lumped"
+    assert plan["config"]["domain_def"] == "delineate"
     assert plan["config"]["data_access"] == "cloud"
     assert plan["steps"] == ["validate_config", "run_model"]
     assert plan["needs_user_input"] == []

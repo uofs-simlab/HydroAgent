@@ -1,11 +1,12 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 import csv
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from server.core.shared_input_cache import shared_input_cache_has_asset
 
 
 def _s(value: Any) -> str:
@@ -1624,6 +1625,15 @@ def ensure_online_data_when_missing(
 
     needs_dem = bool({"define_domain", "discretize_domain"} & set(steps))
     if needs_dem and domain_name and data_dir and not domain_has_local_dem(data_dir, domain_name):
+        extra_raw = cfg.get("extra_config")
+        extra = extra_raw if isinstance(extra_raw, dict) else {}
+        bounding_box = (
+            cfg.get("bounding_box_coords")
+            or cfg.get("BOUNDING_BOX_COORDS")
+            or extra.get("bounding_box_coords")
+            or extra.get("BOUNDING_BOX_COORDS")
+        )
+        cached_dem = shared_input_cache_has_asset(data_dir, bounding_box, "dem")
         out = ensure_cloud_data_access_for_acquire_steps(out, user_request, data_dir=data_dir)
         cfg = dict(out.get("config") or {})
         if "acquire_attributes" not in steps:
@@ -1642,10 +1652,17 @@ def ensure_online_data_when_missing(
                 if "bounding_box_coords" not in needs:
                     needs.append("bounding_box_coords")
                 out["needs_user_input"] = needs
-        _append_plan_note(
-            out,
-            f"Local DEM missing for {domain_name}; using online acquisition (DATA_ACCESS cloud).",
-        )
+        if cached_dem:
+            _append_plan_note(
+                out,
+                "Compatible source inputs are available in the shared cache; acquisition will "
+                "reuse them before contacting cloud services.",
+            )
+        else:
+            _append_plan_note(
+                out,
+                f"Local DEM missing for {domain_name}; using online acquisition (DATA_ACCESS cloud).",
+            )
 
     return out
 
@@ -1883,8 +1900,6 @@ WORKFLOW_PLAN_MODE_CALIBRATION = "calibration"
 _CALIBRATION_PLAN_CONFIG_KEYS = (
     "calibration_period",
     "CALIBRATION_PERIOD",
-    "evaluation_period",
-    "EVALUATION_PERIOD",
     "optimization_metric",
     "OPTIMIZATION_METRIC",
     "optimization_target",
@@ -1993,7 +2008,7 @@ def planner_mode_instructions(mode: str, *, enable_prompt_matching: bool = True)
                 "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
                 "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
                 "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
-                "- Do NOT set calibration_period, evaluation_period, optimization fields, or params_to_calibrate in config.\n"
+                "- Do NOT set calibration_period, optimization fields, or params_to_calibrate in config.\n"
             )
         return (
             "\n\nWORKFLOW MODE: simulation only.\n"
@@ -2003,7 +2018,7 @@ def planner_mode_instructions(mode: str, *, enable_prompt_matching: bool = True)
             "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
             "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
             "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
-            "- Do NOT set calibration_period, evaluation_period, optimization fields, or params_to_calibrate in config.\n"
+            "- Do NOT set calibration_period, optimization fields, or params_to_calibrate in config.\n"
         )
     if mode == WORKFLOW_PLAN_MODE_CALIBRATION:
         return (

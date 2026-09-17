@@ -90,6 +90,7 @@ WORKFLOW_WIDGET_VERSION_KEYS = (
 
 
 WORKFLOW_TRANSIENT_KEYS = (
+    "_explicit_ui_fields",
     "_calib_base_config",
     "calib_agent_last_outcome",
     "_chat_transcribe_ok",

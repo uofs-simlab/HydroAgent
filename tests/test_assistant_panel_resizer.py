@@ -3,6 +3,7 @@ from pathlib import Path
 from app.ui_agent import (
     ASSISTANT_PANEL_WIDTH_STORAGE_KEY,
     assistant_panel_button_css,
+    assistant_panel_resizer_cleanup_html,
     assistant_panel_resizer_html,
     assistant_panel_toggle_css,
     workflow_layout_cleanup_html,
@@ -15,10 +16,10 @@ def test_assistant_panel_resizer_is_draggable_and_keyboard_accessible():
 
     assert ASSISTANT_PANEL_WIDTH_STORAGE_KEY in markup
     assert 'handle.setAttribute("role", "separator")' in markup
-    assert 'doc.addEventListener("pointermove", trackResize, true)' in markup
-    assert 'doc.addEventListener("pointerup", finishResize, true)' in markup
-    assert 'handle.addEventListener("lostpointercapture", finishResize)' in markup
-    assert 'hostWindow.addEventListener("blur", finishResize)' in markup
+    assert 'doc.addEventListener("pointermove", trackResize, pointerOptions)' in markup
+    assert 'doc.addEventListener("pointerup", finishResize, pointerOptions)' in markup
+    assert 'handle.addEventListener("lostpointercapture", finishResize, listenerOptions)' in markup
+    assert 'hostWindow.addEventListener("blur", finishResize, listenerOptions)' in markup
     assert "(event.buttons & 1) === 0" in markup
     assert "hostWindow.requestAnimationFrame(applyPendingPointerWidth)" in markup
     assert "dragStartClientX = event.clientX" in markup
@@ -129,9 +130,42 @@ def test_header_and_panel_dividers_share_light_and_dark_theme_color():
 
 def test_closed_assistant_layout_removes_empty_third_column():
     source = Path("app/ui_agent.py").read_text(encoding="utf-8")
+    cleanup = assistant_panel_resizer_cleanup_html()
 
     assert 'main_col, toggle_col = st.columns([0.98, 0.02], gap="small")' in source
     assert "assistant_col = None" in source
     assert "if assistant_col is not None:" in source
     assert "[0.98, 0.02, 0.001]" not in source
     assert "assistant_panel_resize_version" in source
+    assert "cleanup_assistant_panel_resizer()" in source
+    assert 'querySelectorAll(".sym-assistant-resize-handle")' in cleanup
+    assert 'classList.remove("sym-assistant-resizing")' in cleanup
+    assert 'removeProperty("--sym-assistant-panel-width")' in cleanup
+
+
+def test_resizer_lifecycle_removes_parent_listeners_and_pending_work(tmp_path):
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    engine = shutil.which("node") or shutil.which("jsc")
+    mac_jsc = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    if engine is None and mac_jsc.is_file():
+        engine = str(mac_jsc)
+    if engine is None:
+        pytest.skip("Node.js or JavaScriptCore is needed for the DOM lifecycle test")
+
+    def script(markup):
+        return markup.split("<script>", 1)[1].split("</script>", 1)[0]
+
+    source = "const resizerSource = " + json.dumps(script(assistant_panel_resizer_html())) + ";\n"
+    source += "const cleanupSources = " + json.dumps([
+        script(assistant_panel_resizer_cleanup_html()), script(workflow_layout_cleanup_html()),
+    ]) + ";\n"
+    source += Path(__file__).with_name("resizer_lifecycle.js").read_text()
+    test_script = tmp_path / "resizer-test.js"
+    test_script.write_text(source)
+    result = subprocess.run([engine, str(test_script)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr

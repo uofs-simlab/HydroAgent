@@ -177,7 +177,7 @@ Rules:
 
 45. domain_def should default to "delineate" unless the user clearly specifies another supported option.
 
-46. If the user clearly specifies "point", "lumped", "subset", "semidistributed", or "delineate", use that as domain_def.
+46. If the user clearly specifies "point", "lumped", "subset", or "delineate", use that as domain_def. A semi-distributed domain uses domain_def "delineate" with discretization "GRUs"; it is not a subset unless the user explicitly requests an existing geofabric.
 
 46b. For semi-distributed basin workflows (Tutorial 02b, domain names containing semi_distributed, or delineate + GRUs with define_domain/discretize_domain), preserve in config.extra_config unless the user overrides:
     - DELINEATION_METHOD: stream_threshold

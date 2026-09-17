@@ -1,0 +1,52 @@
+{
+  "config": {
+    "domain_name": "Logan_River_CIROH_demo",
+    "experiment_id": "water_year_2005",
+    "pour_point_coords": "41.74355/-111.78398",
+    "bounding_box_coords": "42.15/-111.87/41.65/-111.42",
+    "hydrological_model": "SUMMA",
+    "domain_def": "delineate",
+    "experiment_time_start": "2003-10-01 01:00",
+    "experiment_time_end": "2005-09-30 23:00",
+    "spinup_period": "2003-10-01, 2004-09-30",
+    "evaluation_period": "2004-10-01, 2005-09-30",
+    "forcing_dataset": "AORC",
+    "discretization": "GRUs",
+    "routing_model": "mizuRoute",
+    "pet_method": "oudin",
+    "stream_threshold": "5000",
+    "data_access": "cloud",
+    "streamflow_data_provider": "USGS",
+    "station_id": "10109000",
+    "mpi_processes": 1,
+    "num_processes": 1,
+    "delineation_method": "stream_threshold",
+    "download_snotel": false,
+    "observations_path": "default",
+    "params_to_calibrate": "tempCritRain,k_soil,vGn_n,theta_sat",
+    "extra_config": {
+      "DELINEATION_METHOD": "stream_threshold",
+      "STREAM_THRESHOLD": 5000,
+      "MIN_HRU_SIZE": 0,
+      "MIN_GRU_SIZE": 0
+    }
+  },
+  "steps": [
+    "validate_config",
+    "setup_project",
+    "create_pour_point",
+    "acquire_attributes",
+    "define_domain",
+    "discretize_domain",
+    "process_observed_data",
+    "acquire_forcings",
+    "model_agnostic_preprocessing",
+    "build_model_ready_store",
+    "model_specific_preprocessing",
+    "run_model",
+    "postprocess_results"
+  ],
+  "needs_user_input": [],
+  "notes": "Semi-distributed SUMMA simulation using AORC forcing, Oudin PET, stream-threshold GRUs, USGS station 10109000 observations, and mizuRoute routing. Water year 2004 is spin-up; evaluation covers water year 2005. Local paths come from HydroAgent settings.",
+  "workflow_plan_mode": "simulation"
+}

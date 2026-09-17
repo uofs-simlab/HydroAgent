@@ -35,6 +35,7 @@ def test_strip_calibration_from_simulation_plan():
             "station_id": "05BB001",
             "streamflow_data_provider": "WSC",
             "calibration_period": "2022-04-01, 2022-05-01",
+            "evaluation_period": "2022-05-02, 2022-06-01",
             "optimization_metric": "KGE",
         },
     }
@@ -45,6 +46,7 @@ def test_strip_calibration_from_simulation_plan():
     assert out["config"]["station_id"] == "05BB001"
     assert out["config"]["streamflow_data_provider"] == "WSC"
     assert "calibration_period" not in out["config"]
+    assert out["config"]["evaluation_period"] == "2022-05-02, 2022-06-01"
 
 
 def test_calibration_plan_adds_steps_and_keeps_station():

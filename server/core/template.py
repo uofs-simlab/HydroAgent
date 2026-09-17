@@ -1,5 +1,4 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +6,7 @@ from typing import Any, Dict
 import yaml
 
 from server.core.plan_rules import domain_has_usable_local_streamflow
+from server.core.shared_input_cache import apply_shared_input_cache
 
 
 # Map normalized assistant/spec fields -> SYMFLUENCE YAML keys
@@ -41,9 +41,6 @@ FIELD_MAP = {
     "station_id": "STATION_ID",
     "routing_model": "ROUTING_MODEL",
     "pet_method": "PET_METHOD",
-    "spinup_period": "SPINUP_PERIOD",
-    "calibration_period": "CALIBRATION_PERIOD",
-    "evaluation_period": "EVALUATION_PERIOD",
 
     # Processing / data access
     "data_access": "DATA_ACCESS",
@@ -276,10 +273,13 @@ def sanitize_observation_config(
 def finalize_symfluence_config(cfg: Dict[str, Any], spec: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Last-mile cleanup before writing config.yaml for SYMFLUENCE CLI validation."""
     _ = spec
+    if isinstance(cfg.get("PET_METHOD"), str):
+        cfg["PET_METHOD"] = cfg["PET_METHOD"].strip().lower()
     cfg = normalize_params_to_calibrate(cfg)
     cfg = sync_legacy_discretization_key(cfg)
     cfg = strip_duplicate_lowercase_keys(cfg)
     cfg = drop_periods_outside_experiment(cfg)
+    cfg = apply_shared_input_cache(cfg)
     cfg = sanitize_observation_config(
         cfg,
         data_dir=cfg.get("SYMFLUENCE_DATA_DIR"),

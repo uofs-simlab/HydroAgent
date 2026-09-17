@@ -1,11 +1,11 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+from server.core.period_utils import normalize_period_text
 from server.core.plan_rules import (
     WORKFLOW_PLAN_MODE_CALIBRATION,
     WORKFLOW_PLAN_MODE_SIMULATION,
@@ -130,14 +130,24 @@ def build_run_plan_schema() -> Dict[str, Any]:
                         "description": (
                             "SYMFLUENCE domain definition method. Use lumped when the user "
                             "requests a lumped basin; use delineate for pour-point delineation "
-                            "unless another supported method is explicit."
+                            "and semi-distributed GRU domains. Use subset only when the user "
+                            "explicitly requests subsetting an existing geofabric."
                         ),
                     },
                     "experiment_time_start": {"type": ["string", "null"]},
                     "experiment_time_end": {"type": ["string", "null"]},
-                    "spinup_period": {"type": ["string", "null"]},
-                    "calibration_period": {"type": ["string", "null"]},
-                    "evaluation_period": {"type": ["string", "null"]},
+                    "spinup_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
+                    "calibration_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
+                    "evaluation_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
                     "forcing_dataset": {"type": ["string", "null"]},
                     "discretization": {"type": ["string", "null"]},
                     "routing_model": {"type": ["string", "null"]},
@@ -259,6 +269,11 @@ def finalize_run_plan(
     if isinstance(bbox, str):
         cfg["bounding_box_coords"] = bbox.replace(",", "/").strip()
 
+    for field in ("spinup_period", "calibration_period", "evaluation_period"):
+        value = cfg.get(field)
+        if isinstance(value, str):
+            cfg[field] = normalize_period_text(value)
+
     if not cfg.get("bounding_box_coords"):
         cfg["bounding_box_coords"] = _extract_bounding_box(user_request)
 
@@ -282,15 +297,6 @@ def finalize_run_plan(
 
     if not cfg.get("domain_def"):
         cfg["domain_def"] = "delineate"
-
-    if not enable_prompt_matching:
-        extra_cfg = cfg.get("extra_config") or {}
-        lumped_settings = {
-            str(extra_cfg.get("ROUTING_DELINEATION", "")).lower(),
-            str(extra_cfg.get("PARAMETER_REGIONALIZATION", "")).lower(),
-        }
-        if "lumped" in lumped_settings:
-            cfg["domain_def"] = "lumped"
 
     explicit_domain = extract_explicit_domain_name_from_request(user_request)
     if explicit_domain:

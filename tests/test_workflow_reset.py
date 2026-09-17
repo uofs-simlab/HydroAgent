@@ -21,6 +21,7 @@ def test_reset_workflow_clears_run_state_and_preserves_preferences():
         "workflow_executing": True,
         "_loaded_config_yaml": "DOMAIN_NAME: Old_Basin",
         "_pending_chat_refinement": "change it",
+        "_explicit_ui_fields": {"forcing_dataset", "streamflow_data_provider"},
         "api_keys": {"openai": "secret"},
         "llm_provider": "claude",
         "llm_model": "claude-sonnet",
@@ -48,6 +49,7 @@ def test_reset_workflow_clears_run_state_and_preserves_preferences():
     assert state["workflow_executing"] is False
     assert "_loaded_config_yaml" not in state
     assert "_pending_chat_refinement" not in state
+    assert "_explicit_ui_fields" not in state
 
     assert state["api_keys"] == {"openai": "secret"}
     assert state["llm_provider"] == "claude"
@@ -84,3 +86,13 @@ def test_assistant_panel_wires_confirmed_new_workflow_control():
     assert 'st.session_state["new_workflow_control_version"] = control_version + 1' in source
     assert "reset_workflow_session_state(st.session_state)" in source
     assert "Saved runs and SYMFLUENCE data will not be deleted." in source
+
+
+def test_prompt_plan_precedence_tracks_only_deliberate_gui_edits():
+    source = Path("app/ui_agent.py").read_text(encoding="utf-8")
+
+    assert "plan = apply_explicit_workflow_ui_overrides(plan)" in source
+    assert "if key not in explicit:" in source
+    assert 'args=("forcing_dataset",)' in source
+    assert "plan_to_save = apply_explicit_workflow_ui_overrides(" in source
+    assert 'st.session_state.want_create_pour_point = "create_pour_point" in set(' in source

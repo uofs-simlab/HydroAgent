@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from server.core.calibration_logs import (
@@ -9,6 +10,7 @@ from server.core.calibration_logs import (
 )
 from server.core.plan_rules import domain_forcing_intersection_path, domain_has_forcing_intersection
 from server.core.routed_flow import ensure_routed_flow_csv, mizu_history_files
+from server.core.workflow_executor import isolated_symfluence_environment
 
 
 def test_forcing_intersection_accepts_csv(tmp_path: Path):
@@ -141,3 +143,24 @@ def test_find_calibration_work_log_skips_simulation_logs(tmp_path: Path):
     stdout = f"Log File: {sim}\nLog File: {cal}\n"
     found = find_symfluence_calibration_work_log(domain_root, stdout=stdout)
     assert found == cal
+
+
+def test_symfluence_environment_does_not_inherit_conda(monkeypatch, tmp_path: Path):
+    conda = tmp_path / "miniconda3"
+    pixi_python = tmp_path / "symfluence" / ".pixi" / "envs" / "build" / "bin" / "python"
+    monkeypatch.setenv("CONDA_PREFIX", str(conda))
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "base")
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((str(conda / "bin"), "/usr/bin")),
+    )
+    monkeypatch.setenv(
+        "DYLD_LIBRARY_PATH",
+        os.pathsep.join((str(conda / "lib"), "/opt/local/lib")),
+    )
+
+    env = isolated_symfluence_environment(pixi_python)
+
+    assert not any(key.startswith("CONDA_") for key in env)
+    assert env["PATH"].split(os.pathsep) == [str(pixi_python.parent), "/usr/bin"]
+    assert env["DYLD_LIBRARY_PATH"] == "/opt/local/lib"

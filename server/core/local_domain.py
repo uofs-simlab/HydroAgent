@@ -1,5 +1,4 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 import re
 import shutil
@@ -122,7 +121,7 @@ def seed_mac_duplicate_domain_from_basin(
     basin_domain: str,
     symfluence_domain: str,
 ) -> list[str]:
-    """When DOMAIN_NAME has a Mac-style (n) suffix, seed artifacts from the base basin domain."""
+    """Seed reusable artifacts when a run uses a distinct duplicate domain."""
     if not basin_domain or not symfluence_domain or basin_domain == symfluence_domain:
         return []
     from server.core.plan_rules import domain_has_complete_local_workflow, domain_has_local_summa_forcing
