@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from server.core.safe_subprocess import launch_detached
+from server.core.shared_input_cache import stage_shared_forcing
 
 from server.core.local_domain import (
     copy_reusable_domain_artifacts,
@@ -27,9 +28,10 @@ from server.core.local_domain import (
     user_request_reuses_local_domain_data,
 )
 from server.core.plan_rules import (
+    basin_pour_point_preflight_error,
     domain_has_complete_local_workflow,
     domain_has_local_era5_raw_forcing,
-    domain_has_local_streamflow,
+    domain_has_usable_local_streamflow,
     domain_has_local_summa_forcing,
     ensure_skip_process_observed_when_local_streamflow,
     plan_user_required_steps,
@@ -48,10 +50,14 @@ STEP_TO_CLI: dict[str, list[str]] = {
     "acquire_forcings": ["workflow", "step", "acquire_forcings"],
     "process_observed_data": ["workflow", "step", "process_observed_data"],
     "model_agnostic_preprocessing": ["workflow", "step", "model_agnostic_preprocessing"],
+    "build_model_ready_store": ["workflow", "step", "build_model_ready_store"],
     "model_specific_preprocessing": ["workflow", "step", "model_specific_preprocessing"],
     "run_model": ["workflow", "step", "run_model"],
-    "calibrate_model": ["workflow", "step", "calibrate_model"],
     "postprocess_results": ["workflow", "step", "postprocess_results"],
+    "calibrate_model": ["workflow", "step", "calibrate_model"],
+    "run_benchmarking": ["workflow", "step", "run_benchmarking"],
+    "run_decision_analysis": ["workflow", "step", "run_decision_analysis"],
+    "run_sensitivity_analysis": ["workflow", "step", "run_sensitivity_analysis"],
 }
 
 SUPPORTED_STEPS = set(STEP_TO_CLI)
@@ -181,9 +187,11 @@ def prepare_execution_log(
 
 
 def run_cmd_to_log(cmd: list[str], cwd: Path, log_path: Path) -> tuple[int, str]:
+    env = isolated_symfluence_environment(Path(cmd[0]))
     p = subprocess.Popen(
         cmd,
         cwd=str(cwd),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -205,6 +213,136 @@ def run_cmd_to_log(cmd: list[str], cwd: Path, log_path: Path) -> tuple[int, str]
     return rc, "".join(collected)
 
 
+def isolated_symfluence_environment(symfluence_python: Path) -> dict[str, str]:
+    """Run SYMFLUENCE from Pixi without inheriting an activated Conda runtime."""
+    env = os.environ.copy()
+    conda_prefixes = {
+        value
+        for key, value in env.items()
+        if (key == "CONDA_PREFIX" or key.startswith("CONDA_PREFIX_")) and value
+    }
+
+    def without_conda_paths(value: str) -> str:
+        kept: list[str] = []
+        for entry in value.split(os.pathsep):
+            if not entry:
+                continue
+            path = Path(entry).expanduser()
+            if any(
+                path == Path(prefix) or Path(prefix) in path.parents
+                for prefix in conda_prefixes
+            ):
+                continue
+            kept.append(entry)
+        return os.pathsep.join(kept)
+
+    for key in tuple(env):
+        if key.startswith("CONDA_"):
+            env.pop(key, None)
+
+    pixi_bin = str(symfluence_python.parent)
+    clean_path = without_conda_paths(env.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(part for part in (pixi_bin, clean_path) if part)
+    for key in ("DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+        cleaned = without_conda_paths(env.get(key, ""))
+        if cleaned:
+            env[key] = cleaned
+        else:
+            env.pop(key, None)
+    return env
+
+
+_INFER_SIM_REACH_ID_SCRIPT = r"""
+import logging
+import sys
+from pathlib import Path
+
+import yaml
+
+from symfluence.reporting.processors.spatial_processor import SpatialProcessor
+
+config_path = Path(sys.argv[1])
+cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+data_dir = Path(cfg["SYMFLUENCE_DATA_DIR"])
+domain_name = str(cfg["DOMAIN_NAME"])
+
+if str(cfg.get("RIVER_NETWORK_SHP_NAME") or "").strip().lower() in {"", "default"}:
+    network_dir = data_dir / f"domain_{domain_name}" / "shapefiles" / "river_network"
+    candidates = sorted(network_dir.glob("*.shp"))
+    method = str(cfg.get("DOMAIN_DEFINITION_METHOD") or "").strip().lower()
+    preferred_label = "lumped" if method == "lumped" else "semidistributed"
+    preferred = [path for path in candidates if preferred_label in path.stem.lower()]
+    if preferred:
+        candidates = preferred
+    if len(candidates) != 1:
+        raise SystemExit(
+            f"Could not identify one river-network shapefile in {network_dir}: "
+            f"found {[path.name for path in candidates]}"
+        )
+    # SpatialProcessor treats a non-default path as the complete file path.
+    cfg["RIVER_NETWORK_SHP_PATH"] = str(candidates[0])
+    cfg["RIVER_NETWORK_SHP_NAME"] = candidates[0].name
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+reach_id = SpatialProcessor(cfg, logging.getLogger("hydroagent.outlet")).update_sim_reach_id(
+    str(config_path)
+)
+if reach_id is None:
+    raise SystemExit("SYMFLUENCE could not infer SIM_REACH_ID from the pour point")
+print(f"Inferred SIM_REACH_ID={int(reach_id)} from the nearest river segment")
+"""
+
+
+def plan_has_explicit_sim_reach_id(plan_cfg: dict) -> bool:
+    """Return whether the planner/user explicitly supplied an outlet reach."""
+    extra = plan_cfg.get("extra_config") if isinstance(plan_cfg.get("extra_config"), dict) else {}
+    for source in (plan_cfg, extra):
+        value = source.get("SIM_REACH_ID", source.get("sim_reach_id"))
+        if value is not None and str(value).strip().lower() not in {"", "default", "none"}:
+            return True
+    return False
+
+
+def infer_sim_reach_id_before_postprocessing(
+    config_path: Path,
+    *,
+    symfluence_python: Path,
+    symfluence_repo: Path,
+    log_path: Path,
+) -> int | None:
+    """Invoke SYMFLUENCE's nearest-segment routine and persist its result."""
+    cmd = [
+        str(symfluence_python),
+        "-c",
+        _INFER_SIM_REACH_ID_SCRIPT,
+        str(config_path),
+    ]
+    completed = subprocess.run(
+        cmd,
+        cwd=str(symfluence_repo),
+        env=isolated_symfluence_environment(symfluence_python),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    output = completed.stdout or ""
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\nInferring routed outlet from the delineated river network.\n")
+        if output:
+            f.write(output)
+            if not output.endswith("\n"):
+                f.write("\n")
+    if completed.returncode != 0:
+        return None
+    updated = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    value = updated.get("SIM_REACH_ID")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _symfluence_domain_name(domain_name: str, experiment_id: str) -> str:
     domain_name = (domain_name or "domain").strip()
     experiment_id = (experiment_id or "exp").strip()
@@ -224,6 +362,8 @@ def run_workflow_job(run_dir: Path) -> int:
     symfluence_data_dir = Path(job["symfluence_data_dir"])
     symfluence_python = Path(job["symfluence_python"])
     user_request = job.get("user_request", "")
+    if not bool(job.get("enable_prompt_matching", True)):
+        user_request = ""
     resume = bool(job.get("resume"))
 
     plan_path = run_dir / "plan.json"
@@ -278,6 +418,47 @@ def run_workflow_job(run_dir: Path) -> int:
 
             routing = routing_delineation_from_config(cfg, plan_cfg)
 
+            if step == "acquire_forcings":
+                staged_forcing = stage_shared_forcing(cfg)
+                if staged_forcing:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write("\n===== STEP: acquire_forcings =====\n")
+                        f.write(
+                            "Satisfied acquire_forcings using compatible shared cached "
+                            f"{cfg.get('FORCING_DATASET', 'forcing')} data "
+                            f"({len(staged_forcing)} file(s) staged in the domain).\n"
+                        )
+                        f.write("\n[STEP acquire_forcings] return code: 0\n")
+                    completed.add(step)
+                    continue
+
+            if step in ("define_domain", "discretize_domain") and not user_requires_fresh_cloud_workflow(
+                user_request, plan_cfg
+            ) and step not in plan_user_required_steps(plan):
+                check_domains = [symfluence_domain, basin_domain, domain_name]
+                seen_domains: set[str] = set()
+                skip_reason = ""
+                for check_domain in check_domains:
+                    if not check_domain or check_domain in seen_domains:
+                        continue
+                    seen_domains.add(check_domain)
+                    if domain_has_complete_local_workflow(
+                        symfluence_data_dir, check_domain, experiment_id
+                    ):
+                        skip_reason = (
+                            f"Skipped {step}; reusing existing local catchment and forcing "
+                            f"under domain_{check_domain} "
+                            "(re-delineation would break HRU ID alignment)."
+                        )
+                        break
+                if skip_reason:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(f"\n===== STEP: {step} =====\n")
+                        f.write(skip_reason + "\n")
+                        f.write(f"\n[STEP {step}] return code: 0\n")
+                    completed.add(step)
+                    continue
+
             if step == "acquire_forcings" and not user_requires_fresh_cloud_workflow(
                 user_request, plan_cfg
             ) and "acquire_forcings" not in plan_user_required_steps(plan):
@@ -315,6 +496,32 @@ def run_workflow_job(run_dir: Path) -> int:
                     completed.add(step)
                     continue
 
+            if step == "model_agnostic_preprocessing" and not user_requires_fresh_cloud_workflow(
+                user_request, plan_cfg
+            ) and "model_agnostic_preprocessing" not in plan_user_required_steps(plan):
+                basin = _symfluence_domain_name(domain_name, experiment_id)
+                sym_domain = str(cfg.get("DOMAIN_NAME") or basin)
+                check_domains = [sym_domain, basin, domain_name]
+                seen_domains: set[str] = set()
+                skip_reason = ""
+                for check_domain in check_domains:
+                    if not check_domain or check_domain in seen_domains:
+                        continue
+                    seen_domains.add(check_domain)
+                    if domain_has_local_summa_forcing(symfluence_data_dir, check_domain):
+                        skip_reason = (
+                            f"Skipped model_agnostic_preprocessing; reusing existing local "
+                            f"SUMMA forcing input under domain_{check_domain}."
+                        )
+                        break
+                if skip_reason:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(f"\n===== STEP: {step} =====\n")
+                        f.write(skip_reason + "\n")
+                        f.write(f"\n[STEP {step}] return code: 0\n")
+                    completed.add(step)
+                    continue
+
             if step == "process_observed_data" and not user_requires_fresh_cloud_workflow(
                 user_request, plan_cfg
             ) and not workflow_step_user_required(plan, "process_observed_data", user_request):
@@ -327,10 +534,10 @@ def run_workflow_job(run_dir: Path) -> int:
                     if not check_domain or check_domain in seen_domains:
                         continue
                     seen_domains.add(check_domain)
-                    if domain_has_local_streamflow(symfluence_data_dir, check_domain):
+                    if domain_has_usable_local_streamflow(symfluence_data_dir, check_domain, cfg):
                         skip_reason = (
                             f"Skipped process_observed_data; reusing local preprocessed "
-                            f"streamflow under domain_{check_domain}."
+                            f"streamflow under domain_{check_domain} (overlaps experiment window)."
                         )
                         break
                 if skip_reason:
@@ -384,6 +591,47 @@ def run_workflow_job(run_dir: Path) -> int:
                             experiment_id,
                         )
 
+            pour_coords = str(
+                cfg.get("POUR_POINT_COORDS") or plan_cfg.get("pour_point_coords") or ""
+            ).strip()
+            basin_preflight = basin_pour_point_preflight_error(
+                step,
+                pour_coords,
+                symfluence_data_dir,
+                symfluence_domain,
+            )
+            if basin_preflight:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n===== STEP: {step} =====\n")
+                    f.write(f"Preflight failed: {basin_preflight}\n")
+                    f.write(f"\n[STEP {step}] return code: 1\n")
+                    f.write("Stopping due to failure.\n")
+                return 1
+
+            if step == "postprocess_results" and not plan_has_explicit_sim_reach_id(plan_cfg):
+                mizu_dir = (
+                    symfluence_data_dir
+                    / f"domain_{symfluence_domain}"
+                    / "simulations"
+                    / experiment_id
+                    / "mizuRoute"
+                )
+                if mizu_dir.is_dir() and any(mizu_dir.rglob("*.nc")):
+                    reach_id = infer_sim_reach_id_before_postprocessing(
+                        config_path,
+                        symfluence_python=symfluence_python,
+                        symfluence_repo=symfluence_repo,
+                        log_path=log_path,
+                    )
+                    if reach_id is not None:
+                        cfg["SIM_REACH_ID"] = reach_id
+                    else:
+                        with log_path.open("a", encoding="utf-8") as f:
+                            f.write(
+                                "Could not infer SIM_REACH_ID; continuing with "
+                                "SYMFLUENCE's existing postprocessing fallback.\n"
+                            )
+
             cmd = build_symfluence_step_cmd(step, config_path, symfluence_python)
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(f"\n===== STEP: {step} =====\n")
@@ -398,6 +646,37 @@ def run_workflow_job(run_dir: Path) -> int:
                 )
                 with log_path.open("a", encoding="utf-8") as f:
                     f.write(mismatch_msg)
+
+            if step in {"run_model", "postprocess_results"} and rc == 0:
+                from server.core.routed_flow import ensure_routed_flow_csv
+
+                mizu_dir = (
+                    Path(symfluence_data_dir)
+                    / f"domain_{symfluence_domain}"
+                    / "simulations"
+                    / experiment_id
+                    / "mizuRoute"
+                )
+                try:
+                    csv_path = ensure_routed_flow_csv(mizu_dir, cfg.get("SIM_REACH_ID"))
+                except Exception as exc:
+                    csv_path = None
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(f"\nCould not extract routed_flow.csv: {exc}\n")
+                if csv_path is not None:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(f"\nExtracted routed discharge: {csv_path}\n")
+
+            if step == "calibrate_model":
+                from server.core.calibration_logs import persist_calibration_logs
+
+                persist_calibration_logs(
+                    run_dir,
+                    Path(symfluence_data_dir) / f"domain_{symfluence_domain}",
+                    experiment_id=experiment_id,
+                    stdout=out,
+                    log_path=log_path,
+                )
 
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(f"\n[STEP {step}] return code: {rc}\n")

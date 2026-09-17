@@ -1,5 +1,4 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 import re
 import shutil
@@ -122,7 +121,7 @@ def seed_mac_duplicate_domain_from_basin(
     basin_domain: str,
     symfluence_domain: str,
 ) -> list[str]:
-    """When DOMAIN_NAME is a duplicate (``Basin (2)`` or ``Basin_2``), seed from the base basin."""
+    """Seed reusable artifacts when a run uses a distinct duplicate domain."""
     if not basin_domain or not symfluence_domain or basin_domain == symfluence_domain:
         return []
     from server.core.plan_rules import domain_has_complete_local_workflow, domain_has_local_summa_forcing
@@ -272,6 +271,61 @@ def _parse_bbox_nwse(value: str) -> tuple[float, float, float, float] | None:
         return north, west, south, east
     except ValueError:
         return None
+
+
+def domain_river_basins_shapefiles(
+    data_dir: str | Path | None,
+    domain_name: str,
+) -> list[Path]:
+    """Return on-disk river_basins shapefiles produced by define_domain."""
+    name = (domain_name or "").strip()
+    if not data_dir or not name:
+        return []
+    basins_dir = Path(data_dir) / f"domain_{name}" / "shapefiles" / "river_basins"
+    if not basins_dir.is_dir():
+        return []
+    return sorted(basins_dir.glob(f"{name}_riverBasins_*.shp"))
+
+
+def pour_point_inside_delineated_basin(
+    pour_coords: str,
+    data_dir: str | Path | None,
+    domain_name: str,
+) -> tuple[bool, str]:
+    """Return (ok, message). Skip when no basin shapefile exists yet."""
+    pour = _parse_lat_lon_pair(pour_coords)
+    if pour is None:
+        return True, ""
+    shapefiles = domain_river_basins_shapefiles(data_dir, domain_name)
+    if not shapefiles:
+        return True, ""
+
+    lat, lon = pour
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Point
+
+        point = Point(lon, lat)
+        for shapefile in shapefiles:
+            gdf = gpd.read_file(shapefile)
+            if gdf.empty or gdf.geometry.isna().all():
+                continue
+            if gdf.crs is not None:
+                point_gdf = gpd.GeoDataFrame(geometry=[point], crs="EPSG:4326")
+                point_gdf = point_gdf.to_crs(gdf.crs)
+                test_point = point_gdf.geometry.iloc[0]
+            else:
+                test_point = point
+            if gdf.geometry.contains(test_point).any() or gdf.geometry.covers(test_point).any():
+                return True, ""
+        return (
+            False,
+            f"Pour point {lat:.7f}/{lon:.7f} lies outside the watershed polygon(s) under "
+            f"{shapefiles[0].parent}. Re-run define_domain with a pour point on the river "
+            "network inside the study area.",
+        )
+    except Exception:
+        return True, ""
 
 
 def pour_point_inside_bounding_box(pour_coords: str, bbox_coords: str) -> tuple[bool, str]:

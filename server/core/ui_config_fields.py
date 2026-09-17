@@ -334,8 +334,6 @@ def normalize_discretization_value(raw: str) -> str:
         return "lumped"
     if lower == "elevation":
         return "elevation"
-    if lower in {"e", "elev"} or lower.startswith("elev"):
-        return "elevation"
     return raw
 
 
@@ -487,7 +485,9 @@ def _coerce_field_value(field: dict[str, Any], raw: str) -> Any:
     if field.get("key") == "discretization":
         return normalize_discretization_value(raw)
     if field_type == "period":
-        return re.sub(r"\s*,\s*", ", ", raw)
+        from server.core.period_utils import normalize_period_text
+
+        return normalize_period_text(raw)
     if field_type in {"coords_bbox", "coords_pp"}:
         return _normalize_coord_token(raw)
     options = field.get("options") or []
@@ -518,12 +518,12 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
         changed = True
 
     patterns_str: list[tuple[str, str]] = [
-        ("domain_name", r"\bdomain_name\s+([A-Za-z0-9_\-]+)"),
-        ("experiment_id", r"\bexperiment_id\s+([A-Za-z0-9_\-]+)"),
-        ("forcing_dataset", r"\bforcing_dataset\s+([A-Za-z0-9_\-]+)"),
-        ("domain_def", r"\bdomain_def\s+([A-Za-z0-9_\-]+)"),
-        ("discretization", r"\bdiscretization\s+([A-Za-z0-9_\-]+)"),
-        ("data_access", r"\bdata_access\s+([A-Za-z0-9_]+)"),
+        ("domain_name", r"\bdomain_name(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("experiment_id", r"\bexperiment_id(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("forcing_dataset", r"\bforcing_dataset(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("domain_def", r"\bdomain_def(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("discretization", r"\bdiscretization(?:\s*[:=]\s*|\s+)([A-Za-z0-9_\-]+)"),
+        ("data_access", r"\bdata_access(?:\s*[:=]\s*|\s+)([A-Za-z0-9_]+)"),
         ("routing_model", r"\brouting\s+model\s+([A-Za-z0-9_\-]+)"),
         ("station_id", r"\b(?:WSC\s+)?station\s+ID\s*[`'\"]?\s*(\d{2}[A-Z]{2}\d{3})[`'\"]?"),
         ("delineation_method", r"\bdelineation\s+method\s+([A-Za-z0-9_]+)"),
@@ -576,6 +576,22 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
     if forcing_match:
         set_field("forcing_dataset", normalize_forcing_dataset(forcing_match.group(1)))
 
+    range_match = re.search(
+        r"\bfrom\s+(\d{4}[-/]\d{2}[-/]\d{2})(?:\s+\d{1,2}:\d{2})?\s+to\s+"
+        r"(\d{4}[-/]\d{2}[-/]\d{2})(?:\s+\d{1,2}:\d{2})?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if range_match:
+        set_field(
+            "experiment_time_start",
+            _normalize_chat_datetime(range_match.group(1).replace("/", "-"), default_hm="01:00"),
+        )
+        set_field(
+            "experiment_time_end",
+            _normalize_chat_datetime(range_match.group(2).replace("/", "-"), default_hm="23:00"),
+        )
+
     coord_patterns: list[tuple[str, str]] = [
         ("pour_point_coords", r"\bpour\s+point(?:\s+coords|\s+coordinates)?\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
         (
@@ -583,10 +599,10 @@ def apply_prompt_literal_config_edits(plan: dict, prompt_text: str) -> dict:
             r"\bbounding\s+box(?:\s+coords|\s+coordinates)?\s+"
             r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
         ),
-        ("pour_point_coords", r"\bpour_point_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
+        ("pour_point_coords", r"\bpour_point_coords(?:\s*[:=]\s*|\s+)(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)"),
         (
             "bounding_box_coords",
-            r"\bbounding_box_coords\s+(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
+            r"\bbounding_box_coords(?:\s*[:=]\s*|\s+)(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?)",
         ),
     ]
     for key, pat in coord_patterns:

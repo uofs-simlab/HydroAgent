@@ -86,6 +86,44 @@ def test_finalize_run_plan_preserves_steps_when_only_bbox_missing(tmp_path, monk
     assert plan.get("needs_user_input") == ["bounding_box_coords"]
 
 
+def test_finalize_run_plan_trusts_structured_plan_when_prompt_matching_disabled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "server.llm.plan_shared.default_symfluence_data_dir",
+        lambda: tmp_path,
+    )
+    plan = finalize_run_plan(
+        {
+            "config": {
+                "domain_name": "Structured_Basin",
+                "experiment_time_start": "2025-01-10 01:00",
+                "experiment_time_end": "2025-02-15 23:00",
+                "hydrological_model": "SUMMA",
+                "experiment_id": "exp_001",
+                "domain_def": "delineate",
+                "data_access": "cloud",
+                "extra_config": {
+                    "ROUTING_DELINEATION": "lumped",
+                    "PARAMETER_REGIONALIZATION": "lumped",
+                },
+            },
+            "steps": ["validate_config", "run_model"],
+            "needs_user_input": [],
+            "notes": "",
+        },
+        "Use local recovery and change the domain to Prompt_Basin.",
+        enable_prompt_matching=False,
+    )
+
+    assert plan["config"]["domain_name"] == "Structured_Basin"
+    assert plan["config"].get("pour_point_coords") is None
+    assert plan["config"]["domain_def"] == "delineate"
+    assert plan["config"]["data_access"] == "cloud"
+    assert plan["steps"] == ["validate_config", "run_model"]
+    assert plan["needs_user_input"] == []
+
+
 def test_existing_domain_folder_accepted(tmp_path: Path):
     domain_dir = tmp_path / "domain_Bow_at_Banff_semi_distributed"
     domain_dir.mkdir()
@@ -133,12 +171,18 @@ def test_chat_config_edit_confirms_weak_domain_name():
 
 
 def test_confirm_domain_from_chat_message_helper():
+    import streamlit as st
+
     from app.ui_agent import _confirm_domain_from_chat_message
 
-    plan = _confirm_domain_from_chat_message(
-        {"config": {"domain_name": "BOWRiver2"}, "steps": ["validate_config"], "needs_user_input": [], "notes": ""},
-        "I set domain_name to BOWRiver2",
-    )
+    st.session_state.enable_prompt_phrase_matching = True
+    try:
+        plan = _confirm_domain_from_chat_message(
+            {"config": {"domain_name": "BOWRiver2"}, "steps": ["validate_config"], "needs_user_input": [], "notes": ""},
+            "I set domain_name to BOWRiver2",
+        )
+    finally:
+        st.session_state.enable_prompt_phrase_matching = False
     assert not domain_name_needs_user_input(plan.get("config") or {}, "I set domain_name to BOWRiver2")
 
 

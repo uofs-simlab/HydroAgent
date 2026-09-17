@@ -1,36 +1,28 @@
-import glob
+import argparse
+import sys
 from pathlib import Path
-from netCDF4 import Dataset, num2date
-import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from server.core.routed_flow import ensure_routed_flow_csv
+
 
 def main():
-    # assumes you run from a domain's mizuRoute output folder
-    files = sorted(glob.glob("*.h.*.nc") or glob.glob("exp_*.h.*.nc"))
-    if not files:
-        raise SystemExit("No mizuRoute history files found (exp_*.h.*.nc).")
+    parser = argparse.ArgumentParser(description="Extract one configured mizuRoute reach.")
+    parser.add_argument("--mizu-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--reach-id", type=int, help="SIM_REACH_ID (required for multi-reach output)")
+    args = parser.parse_args()
+    try:
+        csv_path = ensure_routed_flow_csv(args.mizu_dir, args.reach_id)
+    except (OSError, ValueError, ImportError) as exc:
+        parser.exit(1, f"Cannot extract routed discharge: {exc}\n")
+    if csv_path is None:
+        raise SystemExit("No mizuRoute history files found, or could not extract routed_flow.csv.")
+    print("Saved:", csv_path.resolve())
+    print(csv_path.read_text(encoding="utf-8").splitlines()[:6])
 
-    out_csv = Path("routed_flow.csv")
-
-    # concatenate all time chunks
-    rows = []
-    for f in files:
-        with Dataset(f) as ds:
-            if "IRFroutedRunoff" not in ds.variables:
-                raise SystemExit(f"Missing IRFroutedRunoff in {f}")
-            q = ds.variables["IRFroutedRunoff"][:]  # (time, seg)
-            t = ds.variables["time"]
-            tt = num2date(t[:], units=t.units, calendar=getattr(t, "calendar", "standard"))
-
-            # seg=0 since you have one segment/outlet
-            for i in range(len(tt)):
-                rows.append((pd.to_datetime(str(tt[i])), float(q[i, 0])))
-
-    df = pd.DataFrame(rows, columns=["time", "IRFroutedRunoff"])
-    df["time"] = df["time"].dt.round("s")
-    df.sort_values("time", inplace=True)
-    df.to_csv(out_csv, index=False)
-    print("Saved:", out_csv.resolve())
-    print(df.head())
 
 if __name__ == "__main__":
     main()

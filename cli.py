@@ -11,7 +11,7 @@ def main() -> None:
 
     run_parser = subparsers.add_parser("run", help="Generate a SYMFLUENCE run plan from a natural-language request")
     run_parser.add_argument("request", type=str, help="Natural-language modeling request")
-    run_parser.add_argument("--model", default="gpt-5", help="Model name to use")
+    run_parser.add_argument("--model", default="gpt-5-mini", help="Model name to use")
     run_parser.add_argument("--api-key", default=None, help="OpenAI API key (optional if OPENAI_API_KEY is set)")
     run_parser.add_argument("--json-out", default=None, help="Optional path to save the generated plan JSON")
 

@@ -1,14 +1,14 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+from server.core.period_utils import normalize_period_text
 from server.core.plan_rules import (
-    apply_explicit_step_constraints,
-    apply_workflow_config_policies,
+    WORKFLOW_PLAN_MODE_CALIBRATION,
+    WORKFLOW_PLAN_MODE_SIMULATION,
     default_symfluence_data_dir,
     domain_name_needs_user_input,
     ensure_domain_name_user_input,
@@ -16,14 +16,10 @@ from server.core.plan_rules import (
     extract_ordered_steps_from_request,
     mark_domain_name_confirmed,
     normalize_local_workflow_plan,
+    plan_workflow_mode,
     plan_requires_bounding_box,
     pour_point_workflow_skips_bbox,
     request_indicates_local_data_reuse,
-    request_forbids_calibrate,
-    request_forbids_postprocess,
-    request_forbids_run_model,
-    request_requests_validation_dry_run_only,
-    sanitize_planner_experiment_dates,
     sort_plan_steps_by_workflow_order,
     try_restore_local_recovery_plan,
 )
@@ -44,27 +40,6 @@ def _normalize_domain_name_for_config(name: str | None):
 def _extract_domain_name(text: str):
     """Deprecated loose extractor — use extract_explicit_domain_name_from_request."""
     return extract_explicit_domain_name_from_request(text) or None
-
-
-def _apply_negative_step_constraints(steps: list[str], user_request: str) -> list[str]:
-    """Remove steps the user explicitly forbade and unrequested calibrate_model."""
-    if not steps or not user_request:
-        return steps
-    if request_requests_validation_dry_run_only(user_request):
-        return ["validate_config", "dry_run"]
-
-    remove: set[str] = set()
-    if request_forbids_run_model(user_request):
-        remove.update({"run_model", "calibrate_model"})
-    if request_forbids_calibrate(user_request) or not re.search(
-        r"\bcalibrat", user_request.lower()
-    ):
-        remove.add("calibrate_model")
-    if request_forbids_postprocess(user_request):
-        remove.add("postprocess_results")
-    if not remove:
-        return steps
-    return [step for step in steps if step not in remove]
 
 
 def _compact_plan_config(cfg: dict) -> dict:
@@ -152,15 +127,36 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "domain_def": {
                         "type": ["string", "null"],
                         "enum": ["lumped", "point", "subset", "delineate", None],
+                        "description": (
+                            "SYMFLUENCE domain definition method. Use lumped when the user "
+                            "requests a lumped basin; use delineate for pour-point delineation "
+                            "and semi-distributed GRU domains. Use subset only when the user "
+                            "explicitly requests subsetting an existing geofabric."
+                        ),
                     },
                     "experiment_time_start": {"type": ["string", "null"]},
                     "experiment_time_end": {"type": ["string", "null"]},
-                    "spinup_period": {"type": ["string", "null"]},
-                    "calibration_period": {"type": ["string", "null"]},
-                    "evaluation_period": {"type": ["string", "null"]},
+                    "spinup_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
+                    "calibration_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
+                    "evaluation_period": {
+                        "type": ["string", "null"],
+                        "description": "Date range formatted as YYYY-MM-DD, YYYY-MM-DD.",
+                    },
                     "forcing_dataset": {"type": ["string", "null"]},
                     "discretization": {"type": ["string", "null"]},
                     "routing_model": {"type": ["string", "null"]},
+                    "pet_method": {"type": ["string", "null"]},
+                    "stream_threshold": {"type": ["string", "number", "null"]},
+                    "data_access": {"type": ["string", "null"]},
+                    "num_processes": {"type": ["integer", "null"]},
+                    "streamflow_data_provider": {"type": ["string", "null"]},
+                    "station_id": {"type": ["string", "null"]},
                     "DOWNLOAD_SNOTEL": {"type": ["boolean", "null"]},
                     "SNOTEL_STATION": {"type": ["string", "null"]},
                     "observations_path": {"type": ["string", "null"]},
@@ -196,6 +192,12 @@ def build_run_plan_schema() -> Dict[str, Any]:
                     "forcing_dataset",
                     "discretization",
                     "routing_model",
+                    "pet_method",
+                    "stream_threshold",
+                    "data_access",
+                    "num_processes",
+                    "streamflow_data_provider",
+                    "station_id",
                     "DOWNLOAD_SNOTEL",
                     "SNOTEL_STATION",
                     "observations_path",
@@ -249,7 +251,11 @@ def finalize_run_plan(
     user_request: str,
     *,
     skip_workflow_step_restore: bool = False,
+    enable_prompt_matching: bool = True,
+    workflow_plan_mode: str | None = None,
 ) -> Dict[str, Any]:
+    if not enable_prompt_matching:
+        user_request = ""
     cfg = plan.get("config", {}) or {}
 
     if cfg.get("extra_config") is not None and not isinstance(cfg.get("extra_config"), dict):
@@ -262,6 +268,11 @@ def finalize_run_plan(
     bbox = cfg.get("bounding_box_coords")
     if isinstance(bbox, str):
         cfg["bounding_box_coords"] = bbox.replace(",", "/").strip()
+
+    for field in ("spinup_period", "calibration_period", "evaluation_period"):
+        value = cfg.get(field)
+        if isinstance(value, str):
+            cfg[field] = normalize_period_text(value)
 
     if not cfg.get("bounding_box_coords"):
         cfg["bounding_box_coords"] = _extract_bounding_box(user_request)
@@ -281,9 +292,6 @@ def finalize_run_plan(
     if isinstance(end, str) and len(end.strip()) == 10:
         cfg["experiment_time_end"] = end.strip() + " 23:00"
 
-    cfg = sanitize_planner_experiment_dates(cfg, user_request)
-    cfg = apply_workflow_config_policies(cfg, user_request)
-
     if not cfg.get("experiment_id"):
         cfg["experiment_id"] = "exp_001"
 
@@ -296,7 +304,9 @@ def finalize_run_plan(
         cfg = mark_domain_name_confirmed(cfg)
     elif cfg.get("domain_name"):
         cfg["domain_name"] = _normalize_domain_name_for_config(cfg["domain_name"])
-        if explicit_domain and explicit_domain.lower() == _s(cfg["domain_name"]).lower():
+        if not enable_prompt_matching:
+            cfg = mark_domain_name_confirmed(cfg)
+        elif explicit_domain and explicit_domain.lower() == _s(cfg["domain_name"]).lower():
             cfg = mark_domain_name_confirmed(cfg)
 
     plan["config"] = cfg
@@ -308,7 +318,6 @@ def finalize_run_plan(
     required_user_fields = [
         "domain_name",
         "hydrological_model",
-        "pour_point_coords",
         "experiment_time_start",
         "experiment_time_end",
     ]
@@ -319,6 +328,9 @@ def finalize_run_plan(
     ordered_steps = extract_ordered_steps_from_request(user_request)
     if len(ordered_steps) >= 3:
         steps_for_validation = ordered_steps
+
+    if "create_pour_point" in steps_for_validation:
+        required_user_fields.append("pour_point_coords")
 
     if (
         not pour_point_workflow_skips_bbox(
@@ -354,24 +366,12 @@ def finalize_run_plan(
     bbox_missing = "bounding_box_coords" in missing
 
     if missing_core:
-        if (
-            missing_core == ["pour_point_coords"]
-            and request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir)
-        ):
-            plan["needs_user_input"] = ["pour_point_coords"]
-            from server.core.plan_rules import _append_plan_note
-
-            _append_plan_note(
-                plan,
-                "Missing pour_point_coords. Workflow steps preserved for local-data reuse.",
-            )
-        else:
-            plan["needs_user_input"] = missing
-            plan["steps"] = ["validate_config", "dry_run"]
-            plan["notes"] = (
-                f"Missing required inputs: {', '.join(missing)}. "
-                "Returning a safe validation/dry-run plan until those values are provided."
-            )
+        plan["needs_user_input"] = missing
+        plan["steps"] = ["validate_config", "dry_run"]
+        plan["notes"] = (
+            f"Missing required inputs: {', '.join(missing)}. "
+            "Returning a safe validation/dry-run plan until those values are provided."
+        )
     elif bbox_missing:
         plan["needs_user_input"] = ["bounding_box_coords"]
         from server.core.plan_rules import _append_plan_note
@@ -394,11 +394,26 @@ def finalize_run_plan(
         plan["needs_user_input"] = []
 
     plan = ensure_domain_name_user_input(plan, user_request, data_dir=data_dir)
+    request_text = (user_request or "").lower()
+    workflow_plan_mode = s(workflow_plan_mode).lower() or None
+    if workflow_plan_mode not in {
+        WORKFLOW_PLAN_MODE_CALIBRATION,
+        WORKFLOW_PLAN_MODE_SIMULATION,
+    }:
+        workflow_plan_mode = None
+    if workflow_plan_mode is None and "workflow mode: calibration" in request_text:
+        workflow_plan_mode = WORKFLOW_PLAN_MODE_CALIBRATION
+    elif workflow_plan_mode is None and "workflow mode: simulation" in request_text:
+        workflow_plan_mode = WORKFLOW_PLAN_MODE_SIMULATION
+    if workflow_plan_mode and not plan.get("workflow_plan_mode"):
+        plan["workflow_plan_mode"] = workflow_plan_mode
     plan = normalize_local_workflow_plan(
         plan,
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=skip_workflow_step_restore,
+        workflow_plan_mode=workflow_plan_mode,
+        enable_prompt_matching=enable_prompt_matching,
     )
     cfg = dict(plan.get("config") or {})
 
@@ -428,8 +443,6 @@ def finalize_run_plan(
     ordered_steps = sort_plan_steps_by_workflow_order(current_steps)
     if ordered_steps:
         plan["steps"] = ordered_steps
-
-    plan["steps"] = _apply_negative_step_constraints(plan.get("steps", []), user_request)
 
     extracted_fields = []
     for k in [
@@ -499,6 +512,7 @@ def finalize_plan_refinement(
     conversation_text: str,
     data_dir: Path | None = None,
     preserve_workflow_steps: bool = False,
+    enable_prompt_matching: bool = True,
 ) -> tuple[str, Dict[str, Any], bool]:
     reply = s(result.get("reply")) or "Done."
     update_plan = bool(result.get("update_plan"))
@@ -529,6 +543,8 @@ def finalize_plan_refinement(
         new_plan,
         conversation_text,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=enable_prompt_matching,
+        workflow_plan_mode=plan_workflow_mode(current_plan) or None,
     )
 
     if preserve_workflow_steps:
@@ -552,6 +568,7 @@ def finalize_plan_refinement(
                 conversation_text,
                 data_dir=data_dir,
                 skip_workflow_step_restore=True,
+                enable_prompt_matching=enable_prompt_matching,
             )
 
     return reply, new_plan, True

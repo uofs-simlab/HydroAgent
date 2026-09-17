@@ -1,0 +1,4 @@
+[submodule "symfluence"]
+	path = symfluence
+	url = https://github.com/tristanmontoya/SYMFLUENCE.git
+	branch = ciroh-asm-2026

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the HydroAgent Streamlit UI from this folder.
+# Launch the HydroAgent Streamlit UI from the frozen project environment.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -12,11 +12,13 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-PYTHON="${PYTHON:-python3}"
-if [[ -x "${VENV:-}/bin/python" ]]; then
-  PYTHON="${VENV}/bin/python"
-elif [[ -x "$ROOT/.venv/bin/python" ]]; then
-  PYTHON="$ROOT/.venv/bin/python"
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --frozen streamlit run app/ui_agent.py --server.headless true "$@"
 fi
 
-exec "$PYTHON" -m streamlit run app/ui_agent.py --server.headless true "$@"
+if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
+  echo "HydroAgent environment is missing. Install uv, then run: uv sync --frozen" >&2
+  exit 1
+fi
+
+exec "$ROOT/.venv/bin/python" -m streamlit run app/ui_agent.py --server.headless true "$@"
