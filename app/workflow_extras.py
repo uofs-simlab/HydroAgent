@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +18,7 @@ ADVANCED_SESSION_FIELDS = [
     ("station_id", "STATION_ID", "Gauging station ID"),
     ("routing_model", "ROUTING_MODEL", "Routing model"),
     ("pet_method", "PET_METHOD", "PET method"),
+    ("stream_threshold", "STREAM_THRESHOLD", "TauDEM stream threshold (flow accumulation)"),
     ("spinup_period", "SPINUP_PERIOD", "Spinup period (YYYY-MM-DD, YYYY-MM-DD)"),
     ("calibration_period", "CALIBRATION_PERIOD", "Calibration period"),
     ("evaluation_period", "EVALUATION_PERIOD", "Evaluation period"),
@@ -51,6 +51,12 @@ from server.core.symfluence_options import (
     CALIBRATION_TARGETS,
     CALIBRATION_TIMESTEPS,
 )
+from server.core.run_naming import symfluence_domain_for_run_folder
+from server.core.ui_field_precedence import (
+    explicit_ui_fields,
+    mark_ui_fields_explicit,
+    ui_field_is_explicit,
+)
 
 PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"}
 
@@ -65,6 +71,10 @@ def s(value) -> str:
     return str(value).strip()
 
 
+def _mark_ui_field_explicit(field: str) -> None:
+    mark_ui_fields_explicit(st.session_state, field)
+
+
 def workflow_context(
     *,
     runs_dir: Path,
@@ -72,15 +82,39 @@ def workflow_context(
     domain_name: str | None = None,
     experiment_id: str | None = None,
     run_folder: str | None = None,
+    prefer_saved_run: bool = False,
 ) -> dict:
     domain_name = s(domain_name or st.session_state.get("domain_name"))
     experiment_id = s(experiment_id or st.session_state.get("experiment_id"))
     run_folder = s(run_folder or st.session_state.get("run_folder"))
     combined = f"{domain_name}_{experiment_id}".strip("_") if domain_name and experiment_id else run_folder
+    if domain_name and experiment_id and run_folder:
+        domain_name = symfluence_domain_for_run_folder(
+            run_folder,
+            domain_name,
+            experiment_id,
+        )
+    assistant_run = runs_dir / run_folder if run_folder else None
+    saved_cfg = None
+    if prefer_saved_run:
+        run_dir = assistant_run or (runs_dir / combined if combined else None)
+        if run_dir is not None and (run_dir / "config.yaml").is_file():
+            saved_cfg = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
+            if not isinstance(saved_cfg, dict):
+                raise ValueError("Saved run configuration must be a mapping.")
+            domain_name = s(saved_cfg.get("DOMAIN_NAME"))
+            experiment_id = s(saved_cfg.get("EXPERIMENT_ID"))
+            if not domain_name or not experiment_id:
+                raise ValueError("The saved run configuration is missing DOMAIN_NAME or EXPERIMENT_ID.")
+            saved_data_dir = s(saved_cfg.get("SYMFLUENCE_DATA_DIR"))
+            if saved_data_dir and saved_data_dir.lower() != "default":
+                symfluence_data_dir = Path(saved_data_dir).expanduser()
+            assistant_run = run_dir
+            combined = f"{domain_name}_{experiment_id}"
+
     domain_root = symfluence_data_dir / f"domain_{domain_name}" if domain_name else None
     sim_dir = domain_root / "simulations" / experiment_id if domain_root and experiment_id else None
     mizu_dir = sim_dir / "mizuRoute" if sim_dir else None
-    assistant_run = runs_dir / run_folder if run_folder else None
     return {
         "domain_name": domain_name,
         "experiment_id": experiment_id,
@@ -90,6 +124,7 @@ def workflow_context(
         "sim_dir": sim_dir,
         "mizu_dir": mizu_dir,
         "assistant_run": assistant_run,
+        "saved_config": saved_cfg,
     }
 
 
@@ -132,7 +167,22 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
         add("River basins", layer_paths.get("riverbasins"), "geospatial")
         add("HRUs / GRUs", layer_paths.get("hrugru"), "geospatial")
         add("River network", layer_paths.get("rivernetwork"), "geospatial")
-        add("ERA5 intersection", layer_paths.get("forcing"), "geospatial")
+        forcing_hint = layer_paths.get("forcing")
+        forcing_path = None
+        if forcing_hint:
+            hinted = Path(forcing_hint)
+            forcing_path = _first_existing_artifact(
+                [hinted, hinted.with_suffix(".csv"), hinted.with_suffix(".shp")]
+            )
+        if forcing_path is None and domain_root:
+            from server.core.plan_rules import domain_forcing_intersection_path
+
+            forcing_path = domain_forcing_intersection_path(
+                domain_root.parent,
+                s(ctx.get("domain_name")),
+                forcing_dataset=s(ctx.get("forcing_dataset")) or "ERA5",
+            )
+        add("ERA5 intersection", forcing_path or forcing_hint, "geospatial")
 
     if domain_root and domain_root.exists():
         file_manager = _first_existing_artifact(
@@ -196,14 +246,74 @@ def scan_run_artifacts(ctx: dict, layer_paths: dict[str, str] | None = None) -> 
                 ),
             }
         )
-    add("routed_flow.csv", mizu_dir / "routed_flow.csv" if mizu_dir else None, "simulation")
+        from server.core.routed_flow import ensure_routed_flow_csv
+
+        try:
+            saved_cfg = ctx.get("saved_config") or {}
+            if not saved_cfg and assistant_run and (assistant_run / "config.yaml").is_file():
+                saved_cfg = yaml.safe_load((assistant_run / "config.yaml").read_text(encoding="utf-8"))
+                if not isinstance(saved_cfg, dict):
+                    raise ValueError("Saved run configuration must be a mapping.")
+                # Chat can scan a new draft while a different saved run is selected.
+                if any(saved_cfg.get(key) and s(saved_cfg[key]) != s(ctx.get(field))
+                       for key, field in (("DOMAIN_NAME", "domain_name"), ("EXPERIMENT_ID", "experiment_id"))):
+                    saved_cfg = {}
+            routed_csv = ensure_routed_flow_csv(mizu_dir, saved_cfg.get("SIM_REACH_ID"))
+        except (OSError, ValueError, ImportError, yaml.YAMLError) as exc:
+            rows.append({"artifact": "routed_flow.csv", "category": "simulation",
+                         "status": "unavailable", "path": str(mizu_dir / "routed_flow.csv"),
+                         "detail": str(exc)})
+        else:
+            rows.append({"artifact": "routed_flow.csv", "category": "simulation",
+                         "status": "found" if routed_csv else "missing",
+                         "path": str(mizu_dir / "routed_flow.csv")})
+    else:
+        add("routed_flow.csv", mizu_dir / "routed_flow.csv" if mizu_dir else None, "simulation")
 
     if data_dir and domain_root:
         from server.core.plan_rules import domain_streamflow_processed_path
+        from server.core.calibration_logs import (
+            calibration_log_path,
+            find_symfluence_calibration_work_log,
+            iter_calibration_result_dirs,
+            worklog_dir,
+        )
 
         domain_name = s(ctx.get("domain_name"))
+        exp_id = s(ctx.get("experiment_id"))
         obs_path = domain_streamflow_processed_path(data_dir, domain_name)
         add("Observed streamflow (processed)", obs_path, "evaluation")
+        calib_dirs = iter_calibration_result_dirs(domain_root, exp_id)
+        for calib_dir in calib_dirs:
+            add(f"Calibration results ({calib_dir.name})", calib_dir, "calibration")
+            best_params = _first_existing_artifact(sorted(calib_dir.glob("*_best_params.json")))
+            add(
+                f"Best parameters ({calib_dir.name})",
+                best_params or (calib_dir / f"{exp_id}_best_params.json"),
+                "calibration",
+            )
+            iter_csv = _first_existing_artifact(
+                sorted(calib_dir.glob("*iteration_results.csv"))
+            )
+            add(
+                f"Iteration results ({calib_dir.name})",
+                iter_csv or (calib_dir / f"{exp_id}_parallel_iteration_results.csv"),
+                "calibration",
+            )
+            add(f"Final evaluation ({calib_dir.name})", calib_dir / "final_evaluation", "calibration")
+        work_log = find_symfluence_calibration_work_log(domain_root)
+        if calib_dirs or work_log:
+            add(
+                "SYMFLUENCE calibration work log",
+                work_log or worklog_dir(domain_root),
+                "calibration",
+            )
+            if assistant_run:
+                add(
+                    "HydroAgent calibration.log",
+                    calibration_log_path(assistant_run),
+                    "calibration",
+                )
 
     add("Assistant run folder", assistant_run, "assistant")
     add("Assistant config.yaml", assistant_run / "config.yaml" if assistant_run else None, "assistant")
@@ -228,41 +338,6 @@ def resolve_observed_streamflow_path(ctx: dict, data_dir: Path) -> Path | None:
 
     path = domain_streamflow_processed_path(data_dir, domain_name)
     return path if path.is_file() else None
-
-
-def resolve_simulated_flow_path(ctx: dict) -> Path | None:
-    mizu_dir = ctx.get("mizu_dir")
-    if not mizu_dir:
-        return None
-    csv_path = mizu_dir / "routed_flow.csv"
-    return csv_path if csv_path.exists() else None
-
-
-def load_aligned_hydrograph_frames(ctx: dict, data_dir: Path) -> tuple[pd.DataFrame | None, str]:
-    obs_path = resolve_observed_streamflow_path(ctx, data_dir)
-    sim_path = resolve_simulated_flow_path(ctx)
-    if obs_path is None and sim_path is None:
-        return None, "No observed or simulated streamflow files found."
-    frames: dict[str, pd.Series] = {}
-    if obs_path:
-        obs_df = pd.read_csv(obs_path, parse_dates=["time"] if "time" in pd.read_csv(obs_path, nrows=0).columns else None)
-        time_col = "time" if "time" in obs_df.columns else obs_df.columns[0]
-        val_cols = [c for c in obs_df.columns if c != time_col]
-        if not val_cols:
-            return None, f"No value column in {obs_path.name}"
-        obs_df[time_col] = pd.to_datetime(obs_df[time_col])
-        frames["observed"] = obs_df.set_index(time_col)[val_cols[0]].astype(float)
-    if sim_path:
-        sim_df = pd.read_csv(sim_path, parse_dates=["time"])
-        qcol = "IRFroutedRunoff" if "IRFroutedRunoff" in sim_df.columns else [c for c in sim_df.columns if c.lower() != "time"][0]
-        sim_df["time"] = pd.to_datetime(sim_df["time"])
-        frames["simulated"] = sim_df.set_index("time")[qcol].astype(float)
-    if not frames:
-        return None, "Could not load hydrograph data."
-    merged = pd.DataFrame(frames).dropna(how="all")
-    if merged.empty:
-        return None, "No overlapping or available time steps."
-    return merged, ""
 
 
 def nse(obs: pd.Series, sim: pd.Series) -> float:
@@ -294,15 +369,18 @@ def kge(obs: pd.Series, sim: pd.Series) -> float:
 
 
 def compute_quick_metrics(merged: pd.DataFrame) -> dict[str, float | int | str]:
+    merged = merged.replace([float("inf"), float("-inf")], float("nan"))
     out: dict[str, float | int | str] = {"n_points": int(len(merged))}
     if "observed" in merged.columns and "simulated" in merged.columns:
         both = merged[["observed", "simulated"]].dropna()
+        out["n_points"] = int(len(both))
         out["NSE"] = nse(both["observed"], both["simulated"])
         out["KGE"] = kge(both["observed"], both["simulated"])
         out["bias_m3s"] = float((both["simulated"] - both["observed"]).mean())
         out["rmse_m3s"] = float(((both["simulated"] - both["observed"]) ** 2).mean() ** 0.5)
     elif "simulated" in merged.columns:
         q = merged["simulated"].dropna()
+        out["n_points"] = int(len(q))
         out["sim_mean_m3s"] = float(q.mean())
         out["sim_max_m3s"] = float(q.max())
     return out
@@ -315,7 +393,7 @@ def get_calibration_config_values(plan_cfg: dict | None = None) -> dict[str, str
     values: dict[str, str] = {}
     for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
         val = s(lookup_plan_config(plan_cfg, session_key, yaml_key))
-        if not val:
+        if not val and ui_field_is_explicit(st.session_state, session_key):
             raw = st.session_state.get(session_key)
             val = s(str(raw)) if session_key in ("iterations", "population_size") and raw is not None else s(raw)
         if val:
@@ -344,14 +422,33 @@ def sync_calibration_config_to_plan() -> None:
     plan.setdefault("config", {})
     cfg = plan["config"]
     extra = dict(cfg.get("extra_config") or {}) if isinstance(cfg.get("extra_config"), dict) else {}
+    explicit = explicit_ui_fields(st.session_state)
     for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
+        if session_key not in explicit:
+            continue
         raw = st.session_state.get(session_key)
         if raw is None or raw == "":
+            cfg.pop(session_key, None)
+            cfg.pop(yaml_key, None)
+            extra.pop(session_key, None)
+            extra.pop(yaml_key, None)
             continue
-        val = str(int(raw)) if session_key in ("iterations", "population_size") else s(raw)
+        if session_key in ("iterations", "population_size"):
+            try:
+                numeric = int(raw)
+            except (TypeError, ValueError):
+                continue
+            cfg[session_key] = str(numeric)
+            cfg[yaml_key] = numeric
+            extra[session_key] = str(numeric)
+            extra[yaml_key] = numeric
+            continue
+        val = s(raw)
         if val:
             cfg[session_key] = val
+            cfg[yaml_key] = val
             extra[session_key] = val
+            extra[yaml_key] = val
     if extra:
         cfg["extra_config"] = extra
     st.session_state.run_plan = plan
@@ -363,7 +460,7 @@ def merge_calibration_into_spec(spec: dict, plan_cfg: dict | None = None) -> dic
     if isinstance((plan_cfg or {}).get("extra_config"), dict):
         extra.update((plan_cfg or {}).get("extra_config"))
     for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
-        raw = values.get(session_key) or st.session_state.get(session_key)
+        raw = values.get(session_key)
         if raw is None or raw == "":
             continue
         if session_key in ("iterations", "population_size"):
@@ -384,22 +481,20 @@ def get_advanced_config_values(plan_cfg: dict | None = None) -> dict[str, str]:
     plan_cfg = plan_cfg or {}
     values: dict[str, str] = {}
     for session_key, yaml_key, _ in ADVANCED_SESSION_FIELDS:
-        val = s(lookup_plan_config(plan_cfg, session_key, yaml_key)) or s(st.session_state.get(session_key))
+        val = s(lookup_plan_config(plan_cfg, session_key, yaml_key))
+        if not val and ui_field_is_explicit(st.session_state, session_key):
+            val = s(st.session_state.get(session_key))
         if val:
             values[session_key] = val
     return values
 
 
 def apply_advanced_config_from_plan(cfg: dict) -> None:
-    from server.core.ui_config_fields import user_forbids_mizuroute
-
     extra = cfg.get("extra_config") if isinstance(cfg.get("extra_config"), dict) else {}
     for session_key, yaml_key, _ in ADVANCED_SESSION_FIELDS:
         val = s(cfg.get(session_key)) or s(cfg.get(yaml_key)) or s(extra.get(session_key)) or s(extra.get(yaml_key))
         if val:
             st.session_state[session_key] = val
-    if user_forbids_mizuroute(_user_request_for_advanced_sync()):
-        st.session_state.routing_model = ""
     apply_calibration_config_from_plan(cfg)
 
 
@@ -419,42 +514,32 @@ def merge_advanced_into_spec(spec: dict, plan_cfg: dict | None = None) -> dict:
     return merge_calibration_into_spec(spec, plan_cfg)
 
 
-def _user_request_for_advanced_sync() -> str:
-    return s(st.session_state.get("user_prompt")) or s(st.session_state.get("nl_request"))
-
-
 def sync_advanced_config_to_plan() -> None:
-    from server.core.ui_config_fields import user_forbids_mizuroute
-
     if not st.session_state.get("run_plan"):
         return
     plan = st.session_state.run_plan
     plan.setdefault("config", {})
-    values = get_advanced_config_values()
-    user_request = _user_request_for_advanced_sync()
-    if user_forbids_mizuroute(user_request):
-        values.pop("routing_model", None)
-        st.session_state.routing_model = ""
-        plan["config"].pop("routing_model", None)
-        plan["config"].pop("ROUTING_MODEL", None)
-    extra = {k: v for k, v in values.items() if v}
-    existing_extra = plan["config"].get("extra_config")
-    if isinstance(existing_extra, dict):
-        merged_extra = dict(existing_extra)
-        merged_extra.update(extra)
-        if user_forbids_mizuroute(user_request):
-            merged_extra.pop("routing_model", None)
-            merged_extra.pop("ROUTING_MODEL", None)
-        extra = {k: v for k, v in merged_extra.items() if v}
+    cfg = plan["config"]
+    extra = dict(cfg.get("extra_config") or {}) if isinstance(cfg.get("extra_config"), dict) else {}
+    explicit = explicit_ui_fields(st.session_state)
+    for session_key, yaml_key, _ in ADVANCED_SESSION_FIELDS:
+        if session_key not in explicit:
+            continue
+        val = s(st.session_state.get(session_key))
+        if val:
+            cfg[session_key] = val
+            cfg.pop(yaml_key, None)
+            extra[session_key] = val
+            extra.pop(yaml_key, None)
+        else:
+            cfg.pop(session_key, None)
+            cfg.pop(yaml_key, None)
+            extra.pop(session_key, None)
+            extra.pop(yaml_key, None)
     if extra:
-        plan["config"]["extra_config"] = extra
-        for k, v in extra.items():
-            plan["config"][k] = v
-    elif "extra_config" in plan["config"] and user_forbids_mizuroute(user_request):
-        extra_cfg = plan["config"].get("extra_config")
-        if isinstance(extra_cfg, dict):
-            extra_cfg.pop("routing_model", None)
-            extra_cfg.pop("ROUTING_MODEL", None)
+        cfg["extra_config"] = extra
+    else:
+        cfg.pop("extra_config", None)
     st.session_state.run_plan = plan
 
 
@@ -479,23 +564,45 @@ def render_advanced_config_section() -> None:
                 if st.session_state.get("streamflow_data_provider", "WSC") in ["WSC", "USGS", "VI", "NIWA"]
                 else 0,
                 key=input_panel_widget_key("adv_streamflow_data_provider"),
+                on_change=_mark_ui_field_explicit,
+                args=("streamflow_data_provider",),
             )
             st.session_state.station_id = st.text_input(
                 "Station ID",
                 value=s(st.session_state.get("station_id")),
+                placeholder="Leave blank to auto-pick nearest gauge from pour point",
+                help="Optional. WSC example: 05BB001. Blank + WSC provider auto-selects the nearest Environment Canada gauge.",
                 key=input_panel_widget_key("adv_station_id"),
-            )
-            from server.core.ui_config_fields import user_forbids_mizuroute
-
-            routing_default = (
-                ""
-                if user_forbids_mizuroute(_user_request_for_advanced_sync())
-                else "mizuRoute"
+                on_change=_mark_ui_field_explicit,
+                args=("station_id",),
             )
             st.session_state.routing_model = st.text_input(
                 "Routing model",
-                value=s(st.session_state.get("routing_model")) or routing_default,
+                value=s(st.session_state.get("routing_model")) or "mizuRoute",
                 key=input_panel_widget_key("adv_routing_model"),
+                on_change=_mark_ui_field_explicit,
+                args=("routing_model",),
+            )
+            stream_threshold_raw = st.session_state.get("stream_threshold")
+            stream_threshold_default = 1000
+            if stream_threshold_raw not in (None, ""):
+                try:
+                    stream_threshold_default = int(float(stream_threshold_raw))
+                except (TypeError, ValueError):
+                    pass
+            st.session_state.stream_threshold = st.number_input(
+                "Stream threshold",
+                min_value=100,
+                max_value=50000,
+                value=stream_threshold_default,
+                step=100,
+                help=(
+                    "TauDEM flow-accumulation cutoff for stream delineation. "
+                    "Use a lower value for small domains (e.g. 1000); 5000 can yield no streams."
+                ),
+                key=input_panel_widget_key("adv_stream_threshold"),
+                on_change=_mark_ui_field_explicit,
+                args=("stream_threshold",),
             )
         with c2:
             pet_value = coerce_selectbox_value(
@@ -508,33 +615,45 @@ def render_advanced_config_section() -> None:
                 options=PET_METHOD_OPTIONS,
                 index=PET_METHOD_OPTIONS.index(pet_value),
                 key=input_panel_widget_key("adv_pet_method"),
+                on_change=_mark_ui_field_explicit,
+                args=("pet_method",),
             )
-            st.session_state.spinup_period = st.text_input(
-                "Spinup period",
-                value=s(st.session_state.get("spinup_period")),
-                placeholder="2004-01-01, 2004-01-04",
-                key=input_panel_widget_key("adv_spinup_period"),
+            from server.core.period_utils import normalize_period_text
+
+            st.session_state.spinup_period = normalize_period_text(
+                st.text_input(
+                    "Spinup period",
+                    value=s(st.session_state.get("spinup_period")),
+                    placeholder="2004-01-01, 2004-01-04",
+                    key=input_panel_widget_key("adv_spinup_period"),
+                    on_change=_mark_ui_field_explicit,
+                    args=("spinup_period",),
+                )
             )
-            st.session_state.calibration_period = st.text_input(
-                "Calibration period",
-                value=s(st.session_state.get("calibration_period")),
-                key=input_panel_widget_key("adv_calibration_period"),
+            st.session_state.calibration_period = normalize_period_text(
+                st.text_input(
+                    "Calibration period",
+                    value=s(st.session_state.get("calibration_period")),
+                    key=input_panel_widget_key("adv_calibration_period"),
+                    on_change=_mark_ui_field_explicit,
+                    args=("calibration_period",),
+                )
             )
-            st.session_state.evaluation_period = st.text_input(
-                "Evaluation period",
-                value=s(st.session_state.get("evaluation_period")),
-                key=input_panel_widget_key("adv_evaluation_period"),
+            st.session_state.evaluation_period = normalize_period_text(
+                st.text_input(
+                    "Evaluation period",
+                    value=s(st.session_state.get("evaluation_period")),
+                    key=input_panel_widget_key("adv_evaluation_period"),
+                    on_change=_mark_ui_field_explicit,
+                    args=("evaluation_period",),
+                )
             )
         sync_advanced_config_to_plan()
 
 
 def augment_request_with_advanced(lines: list[str]) -> list[str]:
-    from server.core.ui_config_fields import user_forbids_mizuroute
-
-    user_request = _user_request_for_advanced_sync()
-    forbid_mizu = user_forbids_mizuroute(user_request)
     for session_key, _, label in ADVANCED_SESSION_FIELDS:
-        if session_key == "routing_model" and forbid_mizu:
+        if not ui_field_is_explicit(st.session_state, session_key):
             continue
         val = s(st.session_state.get(session_key))
         if val:
@@ -542,8 +661,19 @@ def augment_request_with_advanced(lines: list[str]) -> list[str]:
     return lines
 
 
-def augment_request_with_calibration(lines: list[str]) -> list[str]:
-    for session_key, yaml_key in CALIBRATION_SESSION_FIELDS:
+def augment_request_with_calibration(lines: list[str], nl_request: str = "") -> list[str]:
+    """Only pass calibration widget values that the user named in the main prompt."""
+    from server.core.calibration_prompt_fields import explicit_calibration_fields_in_prompt
+
+    explicit = explicit_calibration_fields_in_prompt(nl_request)
+    extra_fields = [
+        ("params_to_calibrate", "PARAMS_TO_CALIBRATE"),
+        ("basin_params_to_calibrate", "BASIN_PARAMS_TO_CALIBRATE"),
+    ]
+    all_fields = list(CALIBRATION_SESSION_FIELDS) + extra_fields
+    for session_key, yaml_key in all_fields:
+        if session_key not in explicit:
+            continue
         raw = st.session_state.get(session_key)
         if raw is None or raw == "":
             continue
@@ -629,10 +759,9 @@ def render_saved_plots_browser(ctx: dict, *, key_prefix: str = "plots") -> None:
     df = pd.DataFrame(plots)
     st.dataframe(df[["name", "relative", "modified", "size_kb"]], width="stretch", hide_index=True)
 
-    names = [p["name"] for p in plots]
-    default_idx = 0
-    selected_name = st.selectbox("Preview plot", names, index=default_idx, key=f"{key_prefix}_select")
-    selected = next(p for p in plots if p["name"] == selected_name)
+    relatives = [p["relative"] for p in plots]
+    selected_relative = st.selectbox("Preview plot", relatives, key=f"{key_prefix}_select")
+    selected = next(p for p in plots if p["relative"] == selected_relative)
     path = Path(selected["path"])
     st.caption(f"`{selected['path']}`")
     if path.suffix.lower() == ".pdf":
@@ -643,53 +772,35 @@ def render_saved_plots_browser(ctx: dict, *, key_prefix: str = "plots") -> None:
         st.image(str(path), width="stretch")
 
 
-def render_flow_duration_tab(ctx: dict, symfluence_data_dir: Path) -> None:
-    st.caption("Flow duration curves (exceedance % vs discharge). Uses observed and/or simulated daily series.")
-    merged, err = load_aligned_hydrograph_frames(ctx, symfluence_data_dir)
-    sim_path = resolve_simulated_flow_path(ctx)
-    if merged is None and sim_path is None:
-        st.info(err or "Load routed_flow.csv or observed streamflow first.")
-        return
-
-    fdc_frames: dict[str, pd.DataFrame] = {}
-    if merged is not None:
-        if "observed" in merged.columns:
-            fdc_frames["observed"] = flow_duration_curve(merged["observed"])
-        if "simulated" in merged.columns:
-            fdc_frames["simulated"] = flow_duration_curve(merged["simulated"])
-    elif sim_path and sim_path.exists():
-        sim_df = pd.read_csv(sim_path, parse_dates=["time"])
-        qcol = "IRFroutedRunoff" if "IRFroutedRunoff" in sim_df.columns else [c for c in sim_df.columns if c.lower() != "time"][0]
-        fdc_frames["simulated"] = flow_duration_curve(sim_df[qcol])
-
-    if not fdc_frames:
-        st.info("No flow series available for FDC.")
-        return
-
-    chart_df = pd.DataFrame(
-        {
-            name: fdc.set_index("exceedance_pct")["flow_m3s"]
-            for name, fdc in fdc_frames.items()
-        }
-    )
-    st.line_chart(chart_df)
-    for name, fdc in fdc_frames.items():
-        with st.expander(f"FDC table — {name}", expanded=False):
-            st.dataframe(fdc, width="stretch", hide_index=True)
-
-
-def render_calibration_section(
+def render_calibration_agent_section(
     *,
-    execute_calibrate_fn,
+    run_agent_fn,
     location: str = "assistant",
 ) -> None:
+    """Calibration UI wired to CalibHydroAgent (design → validate → run → interpret)."""
     from widget_keys import input_panel_widget_key
+    from server.calibration.agent_integration import calib_agent_available, calib_agent_import_error
 
-    prefix = f"calibration_{location}"
-    with st.expander("Calibration", expanded=False):
+    prefix = f"calib_agent_{location}"
+    with st.expander(
+        "Calibration agent (CalibHydroAgent)",
+        expanded=False,
+        key=f"{prefix}_expander",
+    ):
+        if not calib_agent_available():
+            st.warning(
+                "CalibHydroAgent not found. Install sibling repo or set "
+                "`CALIB_HYDRO_AGENT_REPO` to `/path/to/CalibHydroAgent`."
+            )
+            err = calib_agent_import_error()
+            if err:
+                st.caption(err)
+            return
+
         st.caption(
-            "Optimization settings synced to plan/config. Running calibration requires "
-            "**Allow dangerous run steps** and a prepared model setup."
+            "Workflow steps come from the **calibration plan**. Algorithm, metric, parameters, and periods "
+            "are chosen by the agent from your **main prompt** (and SUMMA defaults) unless you name them "
+            "explicitly there — dropdowns update after **Design & validate**."
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -702,6 +813,8 @@ def render_calibration_section(
                 if st.session_state.get("iterative_optimization_algorithm", "DE") in CALIBRATION_ALGORITHMS
                 else 0,
                 key=input_panel_widget_key(f"{prefix}_algorithm"),
+                on_change=_mark_ui_field_explicit,
+                args=("iterative_optimization_algorithm",),
             )
             st.session_state.optimization_metric = st.selectbox(
                 "Metric",
@@ -710,6 +823,8 @@ def render_calibration_section(
                 if st.session_state.get("optimization_metric", "KGE") in CALIBRATION_METRICS
                 else 0,
                 key=input_panel_widget_key(f"{prefix}_metric"),
+                on_change=_mark_ui_field_explicit,
+                args=("optimization_metric",),
             )
             st.session_state.optimization_target = st.selectbox(
                 "Target",
@@ -720,6 +835,8 @@ def render_calibration_section(
                 if st.session_state.get("optimization_target", "streamflow") in CALIBRATION_TARGETS
                 else 0,
                 key=input_panel_widget_key(f"{prefix}_target"),
+                on_change=_mark_ui_field_explicit,
+                args=("optimization_target",),
             )
         with c2:
             st.session_state.calibration_timestep = st.selectbox(
@@ -731,14 +848,18 @@ def render_calibration_section(
                 if st.session_state.get("calibration_timestep", "daily") in CALIBRATION_TIMESTEPS
                 else 2,
                 key=input_panel_widget_key(f"{prefix}_timestep"),
+                on_change=_mark_ui_field_explicit,
+                args=("calibration_timestep",),
             )
             st.session_state.iterations = int(
                 st.number_input(
                     "Iterations",
                     min_value=1,
                     max_value=5000,
-                    value=int(st.session_state.get("iterations", 50) or 50),
+                    value=int(st.session_state.get("iterations", 20) or 20),
                     key=input_panel_widget_key(f"{prefix}_iterations"),
+                    on_change=_mark_ui_field_explicit,
+                    args=("iterations",),
                 )
             )
             st.session_state.population_size = int(
@@ -748,167 +869,318 @@ def render_calibration_section(
                     max_value=500,
                     value=int(st.session_state.get("population_size", 10) or 10),
                     key=input_panel_widget_key(f"{prefix}_population"),
+                    on_change=_mark_ui_field_explicit,
+                    args=("population_size",),
                 )
             )
-        st.session_state.calibration_period = st.text_input(
-            "Calibration period",
-            value=s(st.session_state.get("calibration_period")),
-            placeholder="2004-01-05, 2004-01-19",
-            key=input_panel_widget_key(f"{prefix}_calibration_period"),
+        from server.core.period_utils import normalize_period_text
+
+        st.session_state.calibration_period = normalize_period_text(
+            st.text_input(
+                "Calibration period",
+                value=s(st.session_state.get("calibration_period")),
+                placeholder="2004-01-05, 2004-01-19",
+                help="Format: YYYY-MM-DD, YYYY-MM-DD (dates only — no HH:MM).",
+                key=input_panel_widget_key(f"{prefix}_calibration_period"),
+                on_change=_mark_ui_field_explicit,
+                args=("calibration_period",),
+            )
         )
         sync_calibration_config_to_plan()
         sync_advanced_config_to_plan()
 
+        auto_replan = st.checkbox(
+            "Suggest replan after run",
+            value=st.session_state.get("calib_agent_auto_replan", False),
+            key=input_panel_widget_key(f"{prefix}_auto_replan"),
+        )
+        st.session_state.calib_agent_auto_replan = auto_replan
+
+        st.markdown("**Sensitivity-guided parameters**")
+        sensitivity_guided = st.checkbox(
+            "Screen → sensitivity → top N → calibrate",
+            value=bool(st.session_state.get("calib_agent_sensitivity_guided", False)),
+            help=(
+                "Run a short screening calibration on the full default parameter set, "
+                "rank parameters with Symfluence sensitivity analysis, keep the top N, "
+                "then run the final calibration."
+            ),
+            key=input_panel_widget_key(f"{prefix}_sensitivity_guided"),
+        )
+        st.session_state.calib_agent_sensitivity_guided = sensitivity_guided
+        s1, s2 = st.columns(2)
+        with s1:
+            st.session_state.calib_agent_top_n_params = int(
+                st.number_input(
+                    "Top N parameters",
+                    min_value=1,
+                    max_value=20,
+                    value=int(st.session_state.get("calib_agent_top_n_params", 4) or 4),
+                    disabled=not sensitivity_guided,
+                    key=input_panel_widget_key(f"{prefix}_top_n"),
+                )
+            )
+        with s2:
+            st.session_state.calib_agent_screening_iterations = int(
+                st.number_input(
+                    "Screening iterations",
+                    min_value=10,
+                    max_value=500,
+                    value=int(st.session_state.get("calib_agent_screening_iterations", 30) or 30),
+                    disabled=not sensitivity_guided,
+                    help="Short calibration used to sample the parameter space for sensitivity (minimum 10).",
+                    key=input_panel_widget_key(f"{prefix}_screening_iters"),
+                )
+            )
+
+        b1, b2 = st.columns(2)
         disabled = not st.session_state.get("allow_run")
-        if st.button(
-            "Run calibration",
-            key=f"{prefix}_run_calibrate",
-            width="stretch",
-            disabled=disabled,
-        ):
-            execute_calibrate_fn()
+        with b1:
+            if st.button(
+                "Design & validate config",
+                key=f"{prefix}_design",
+                width="stretch",
+            ):
+                run_agent_fn(mode="design")
+        with b2:
+            if st.button(
+                "Run calibration (agent)",
+                key=f"{prefix}_run",
+                width="stretch",
+                disabled=disabled,
+            ):
+                run_agent_fn(mode="run")
         if disabled:
-            st.caption("Enable **Allow dangerous run steps** to run calibration.")
+            st.caption("Enable **Allow dangerous run steps** to execute calibration.")
+
+        last = st.session_state.get("calib_agent_last_outcome")
+        if isinstance(last, dict):
+            st.markdown("**Last agent outcome**")
+            stopped = last.get("stopped")
+            if stopped:
+                st.info(f"Stopped: `{stopped}`")
+            spec = last.get("spec") or {}
+            if spec:
+                st.caption(
+                    f"Model `{spec.get('model')}` · {spec.get('algorithm')} · "
+                    f"{spec.get('optimization_metric')} · {spec.get('number_of_iterations')} iter"
+                )
+            validation = last.get("validation") or {}
+            for issue in validation.get("issues") or []:
+                if issue.get("severity") == "error":
+                    st.error(issue.get("message"))
+                elif issue.get("severity") == "warning":
+                    st.warning(issue.get("message"))
+            prereq = last.get("prerequisites") or {}
+            if prereq.get("missing_steps"):
+                st.warning("Missing steps: " + ", ".join(prereq["missing_steps"]))
+            for note in prereq.get("notes") or []:
+                st.caption(note)
+            interp = last.get("interpretation")
+            if isinstance(interp, dict) and interp.get("summary"):
+                st.success(interp["summary"])
+                for fm in interp.get("failure_modes") or []:
+                    st.error(fm)
+            replan = last.get("replan")
+            if isinstance(replan, dict) and replan.get("action"):
+                st.info(f"Replan: **{replan['action']}** — {replan.get('rationale')}")
+            sensitivity = last.get("sensitivity")
+            if isinstance(sensitivity, dict) and sensitivity.get("enabled"):
+                st.markdown("**Sensitivity guidance**")
+                if sensitivity.get("message"):
+                    st.caption(sensitivity["message"])
+                selected = (sensitivity.get("selected_params") or []) + (
+                    sensitivity.get("selected_basin_params") or []
+                )
+                if selected:
+                    st.success("Selected parameters: " + ", ".join(selected))
+                elif sensitivity_guided := sensitivity.get("top_n"):
+                    st.caption(
+                        f"Will pick top {sensitivity_guided} after screening "
+                        f"({sensitivity.get('screening_iterations', '?')} iter)."
+                    )
 
 
 def render_results_page(*, symfluence_data_dir: Path, runs_dir: Path) -> None:
-    st.subheader("Results")
-    st.caption("Saved plots and figures for the active domain/experiment.")
-    ctx = workflow_context(runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir)
+    from server.core.postprocessing import (
+        configured_period,
+        discharge_output_paths,
+        load_daily_discharge,
+        prepare_daily_comparison,
+    )
+    from server.core.ui_config_fields import lookup_plan_config
+
+    try:
+        ctx = workflow_context(
+            runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir, prefer_saved_run=True,
+        )
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        st.error(f"Could not read the saved run configuration: {exc}")
+        return
+    saved_cfg = ctx["saved_config"]
+    if ctx["domain_root"] is not None:
+        symfluence_data_dir = ctx["domain_root"].parent
+
     if not ctx.get("domain_name") or not ctx.get("experiment_id"):
         st.info("Set domain and experiment on **Workflows → Input**, or load a run from **Experiments**.")
         return
-    render_saved_plots_browser(ctx, key_prefix="results_page")
+    st.caption(f"Domain: {ctx['domain_name']} · Experiment: {ctx['experiment_id']}")
+    st.button("Refresh results", key="results_refresh")
 
-
-def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    from server.core.safe_subprocess import run_command
-
-    cmd = [sys.executable, script_path] + args
-    return run_command(cmd, cwd=cwd)
-
-
-def render_run_results_section(
-    *,
-    cfg: dict,
-    runs_dir: Path,
-    symfluence_data_dir: Path,
-    layer_paths_fn,
-    default_postprocess_domain_dir_fn,
-    run_py_tool_fn=run_py_tool,
-) -> None:
-    st.subheader("Run results")
-    ctx = workflow_context(runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir)
-    layer_paths = layer_paths_fn() if ctx.get("domain_name") and ctx.get("experiment_id") else {}
-
-    hdr1, hdr2 = st.columns([1, 3])
-    with hdr1:
-        if st.button("Refresh scan", key="run_results_refresh", width="stretch"):
-            st.session_state.run_results_scan_at = dt.datetime.now().isoformat(timespec="seconds")
-            st.rerun()
-    with hdr2:
-        scanned = st.session_state.get("run_results_scan_at", "not yet")
-        st.caption(f"Last scan: {scanned} — Domain `{ctx.get('domain_name') or '?'}` / Experiment `{ctx.get('experiment_id') or '?'}`")
-
-    if not ctx.get("domain_name") or not ctx.get("experiment_id"):
-        st.info("Set **Domain name** and **Experiment ID** on the Input tab to scan run artifacts.")
-        return
-
-    artifacts = scan_run_artifacts(ctx, layer_paths)
-    found_n = sum(1 for a in artifacts if a["status"] == "found")
-    st.caption(f"{found_n} of {len(artifacts)} artifacts found on disk.")
-
-    tab_overview, tab_routed, tab_hydro, tab_metrics, tab_fdc, tab_plots = st.tabs(
-        ["Overview", "Routed flow", "Hydrograph", "Metrics", "Flow duration", "Saved plots"]
-    )
-
-    with tab_overview:
-        df_art = pd.DataFrame(artifacts)
-        st.dataframe(
-            df_art[["category", "artifact", "status", "path"]],
-            width="stretch",
-            hide_index=True,
+    def matches_run(config: dict) -> bool:
+        return all(
+            s(lookup_plan_config(config, field, field.upper())) == ctx[field]
+            for field in ("domain_name", "experiment_id")
         )
 
-    mizu_dir = ctx.get("mizu_dir")
-    domain_dir = default_postprocess_domain_dir_fn(cfg)
-    exp_id = ctx.get("experiment_id") or s(st.session_state.experiment_id)
-    csv_path = (mizu_dir / "routed_flow.csv") if mizu_dir else Path(domain_dir) / "simulations" / exp_id / "mizuRoute" / "routed_flow.csv"
+    cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    if not matches_run(cfg):
+        cfg = {}
+    # Evaluate saved outputs against the configuration used to produce them.
+    if saved_cfg is not None and matches_run(saved_cfg):
+        cfg = saved_cfg
 
-    with tab_routed:
-        st.caption("Extract routed discharge from mizuRoute NetCDF, then inspect `routed_flow.csv`.")
-        st.text_input("Domain path", value=domain_dir, disabled=True, key="run_results_domain_dir_display")
-        col_e, col_s = st.columns(2)
-        with col_e:
-            if st.button("Extract discharge → CSV", key="run_results_extract_routed"):
-                if not mizu_dir or not mizu_dir.exists():
-                    st.error("mizuRoute folder not found. Run the model with routing first.")
-                else:
-                    tool = str(ASSISTANT_BASE / "tools" / "extract_discharge.py")
-                    rc, out, err = run_py_tool_fn(tool, [], cwd=mizu_dir)
-                    if rc == 0:
-                        st.success("Extract completed.")
-                        if out.strip():
-                            st.code(out)
-                        st.rerun()
-                    else:
-                        st.error("Extract failed.")
-                        if err.strip():
-                            st.code(err)
-        with col_s:
-            if st.button("Summarize routed_flow.csv", key="run_results_summarize_routed"):
-                if not csv_path.exists():
-                    st.error("routed_flow.csv not found.")
-                else:
-                    tool = str(ASSISTANT_BASE / "tools" / "summarize_routed_flow.py")
-                    rc, out, err = run_py_tool_fn(tool, ["--csv", str(csv_path)])
-                    if rc == 0 and out.strip():
-                        st.code(out)
-                    elif err.strip():
-                        st.code(err)
-        if csv_path.exists():
-            st.write(f"`{csv_path}`")
-            df = pd.read_csv(csv_path, parse_dates=["time"])
-            st.dataframe(df.head(50), width="stretch")
-            qcol = [c for c in df.columns if c.lower() != "time"][0]
-            st.line_chart(df.set_index("time")[qcol])
-        else:
-            st.info("No routed_flow.csv yet.")
+    routed_errors: list[str] = []
+    sources = discharge_output_paths(
+        ctx["domain_root"], ctx["experiment_id"],
+        sim_reach_id=lookup_plan_config(cfg, "sim_reach_id", "SIM_REACH_ID"),
+        routed_flow_errors=routed_errors,
+    )
+    for error in routed_errors:
+        st.warning(f"Routed flow is unavailable: {error}")
+    tab_hydro, tab_metrics, tab_fdc, tab_plots = st.tabs(
+        ["Hydrograph", "Metrics", "Flow duration", "Saved plots"]
+    )
+    with tab_plots:
+        st.caption("Saved figures across the domain; relative paths identify each experiment.")
+        render_saved_plots_browser(ctx, key_prefix="results_page")
+    if not sources:
+        with tab_hydro:
+            st.info(
+                "No postprocessed discharge table or routed_flow.csv exists for this experiment yet. "
+                "Run the model and postprocess_results from Workflows."
+            )
+        with tab_metrics:
+            st.info("Metrics will appear when simulated discharge is available.")
+        with tab_fdc:
+            st.info("Flow-duration curves will appear when simulated discharge is available.")
+        return
 
+    prefix = f"results_{ctx['domain_name']}_{ctx['experiment_id']}"
     with tab_hydro:
-        merged, err = load_aligned_hydrograph_frames(ctx, symfluence_data_dir)
-        if merged is None:
-            st.info(err)
+        source = st.selectbox(
+            "Discharge output",
+            sources,
+            format_func=lambda path: str(path.relative_to(ctx["domain_root"])),
+            key=f"{prefix}_source",
+        )
+        try:
+            simulated = load_daily_discharge(source)
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            st.error(f"Could not load simulated discharge: {exc}")
+            return
+        columns = list(simulated.columns)
+        model = s(lookup_plan_config(cfg, "hydrological_model", "HYDROLOGICAL_MODEL"))
+        default_column = next((col for col in columns if col.lower() == f"{model.lower()}_discharge_cms"), columns[0])
+        selected_column = st.selectbox(
+            "Simulated series", columns, index=columns.index(default_column), key=f"{prefix}_series"
+        )
+        try:
+            evaluation_period = configured_period(cfg, "evaluation_period")
+            spinup_period = configured_period(cfg, "spinup_period")
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        period = st.radio(
+            "Period",
+            ["Evaluation period", "Full simulation"] if evaluation_period else ["Full simulation"],
+            horizontal=True,
+            key=f"{prefix}_period",
+            help="This period applies to the hydrograph, metrics, and flow-duration curves.",
+        )
+        observed = None
+        obs_path = resolve_observed_streamflow_path(ctx, symfluence_data_dir)
+        if obs_path:
+            try:
+                observed = load_daily_discharge(obs_path, observed=True)
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                st.warning(f"Could not load observed discharge: {exc}")
+        try:
+            merged = prepare_daily_comparison(
+                simulated[selected_column], observed, cfg, evaluation=period == "Evaluation period"
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+        if merged.empty:
+            st.info("No discharge samples fall within the selected period.")
         else:
-            st.line_chart(merged)
-            st.caption(f"{len(merged)} time steps loaded.")
-            st.dataframe(merged.head(30), width="stretch")
+            st.line_chart(merged, x_label="Date", y_label="Discharge (m³/s)")
+            st.caption(
+                f"Daily mean discharge · {merged.index.min():%Y-%m-%d} to {merged.index.max():%Y-%m-%d}. "
+                "Missing samples are not interpolated."
+            )
+            if spinup_period and period == "Evaluation period":
+                st.caption(f"Spin-up excluded: {spinup_period[0]:%Y-%m-%d} to {spinup_period[1]:%Y-%m-%d}.")
+            st.download_button(
+                "Download daily discharge", merged.to_csv(index_label="time").encode("utf-8"),
+                file_name=f"{ctx['experiment_id']}_daily_discharge.csv", mime="text/csv", key=f"{prefix}_daily_csv",
+            )
+            with st.expander("Daily discharge table"):
+                st.dataframe(merged, width="stretch")
+        st.caption(f"Simulation source: {source.relative_to(ctx['domain_root'])}")
+        if obs_path:
+            st.caption(f"Observation source: {obs_path.relative_to(ctx['domain_root'])}")
 
     with tab_metrics:
-        merged, err = load_aligned_hydrograph_frames(ctx, symfluence_data_dir)
-        if merged is None:
-            st.info(err)
+        metric_scope = (
+            "excluding configured spin-up dates"
+            if period == "Evaluation period"
+            else "including the configured spin-up period"
+        )
+        st.caption(f"Metrics use paired daily means in the selected period, {metric_scope}.")
+        if merged.empty:
+            st.info("No data in the selected period.")
+        elif "observed" not in merged or merged["observed"].dropna().empty:
+            st.info("Observed discharge is unavailable in this period. Showing simulation statistics.")
+            summary = merged["simulated"].agg(["count", "mean", "min", "max"]).rename("Simulated discharge (m³/s)")
+            st.dataframe(summary, width="stretch")
         else:
             metrics = compute_quick_metrics(merged)
-            mcols = st.columns(min(len(metrics), 4))
-            for i, (k, v) in enumerate(metrics.items()):
-                with mcols[i % len(mcols)]:
-                    if isinstance(v, float):
-                        st.metric(k, f"{v:.4f}" if v == v else "n/a")
-                    else:
-                        st.metric(k, str(v))
-            if csv_path.exists():
-                tool = str(ASSISTANT_BASE / "tools" / "summarize_routed_flow.py")
-                rc, out, err = run_py_tool_fn(tool, ["--csv", str(csv_path)])
-                if rc == 0 and out.strip():
-                    st.markdown("**Routed-flow summary**")
-                    st.code(out)
+            if metrics["n_points"] == 0:
+                st.info("No paired observed and simulated days in this period; evaluation metrics are unavailable.")
+            else:
+                labels = {"n_points": "Paired days", "NSE": "NSE", "KGE": "KGE", "bias_m3s": "Bias (m³/s)", "rmse_m3s": "RMSE (m³/s)"}
+                metric_columns = st.columns(3)
+                for index, (key, value) in enumerate(metrics.items()):
+                    with metric_columns[index % len(metric_columns)]:
+                        display = str(value) if isinstance(value, int) else f"{value:.4f}" if pd.notna(value) else "n/a"
+                        st.metric(labels[key], display)
+                st.caption("NSE and KGE have an ideal value of 1. Bias is simulated minus observed; RMSE has an ideal value of 0. Undefined metrics appear as n/a.")
+                st.download_button(
+                    "Download metrics", pd.DataFrame([metrics]).to_csv(index=False).encode("utf-8"),
+                    file_name=f"{ctx['experiment_id']}_metrics.csv", mime="text/csv", key=f"{prefix}_metrics_csv",
+                )
 
     with tab_fdc:
-        render_flow_duration_tab(ctx, symfluence_data_dir)
-
-    with tab_plots:
-        render_saved_plots_browser(ctx, key_prefix="run_results_plots")
+        curves = []
+        # Use paired days when observations are available so both curves share a sample period.
+        has_observed = "observed" in merged and merged["observed"].notna().any()
+        paired = merged.dropna() if has_observed else merged[["simulated"]]
+        if has_observed:
+            st.caption("Observed and simulated curves use the same paired days in the selected period.")
+        else:
+            st.caption("Simulated daily mean discharge in the selected period.")
+        for name in paired.columns:
+            curve = flow_duration_curve(paired[name])
+            if not curve.empty:
+                curves.append(curve.assign(series=name))
+        if curves:
+            fdc = pd.concat(curves, ignore_index=True)
+            st.line_chart(fdc, x="exceedance_pct", y="flow_m3s", color="series", x_label="Exceedance (%)", y_label="Discharge (m³/s)")
+        else:
+            st.info("No discharge samples available for flow-duration curves in this period.")
 
 
 def render_data_page(
@@ -917,17 +1189,34 @@ def render_data_page(
     symfluence_data_dir: Path,
     layer_paths_fn,
 ) -> None:
-    st.subheader("Data")
     st.caption("Artifact checklist for the current domain and experiment.")
-    ctx = workflow_context(runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir)
+    try:
+        ctx = workflow_context(
+            runs_dir=runs_dir, symfluence_data_dir=symfluence_data_dir, prefer_saved_run=True,
+        )
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        st.error(f"Could not read the saved run configuration: {exc}")
+        return
     if not ctx.get("domain_name") or not ctx.get("experiment_id"):
         st.info("Configure domain and experiment on **Workflows → Input** first.")
         return
-    layer_paths = layer_paths_fn()
+    assistant_run = ctx.get("assistant_run")
+    if assistant_run:
+        from server.core.calibration_logs import persist_calibration_logs_for_run
+
+        persist_calibration_logs_for_run(assistant_run)
+    # Map layer discovery follows the editable draft. Do not show its files as
+    # artifacts of a different saved run.
+    layer_paths = {
+        key: value for key, value in layer_paths_fn().items()
+        if value and Path(value).resolve().is_relative_to(ctx["domain_root"].resolve())
+    }
     artifacts = scan_run_artifacts(ctx, layer_paths)
     for row in artifacts:
         icon = "✅" if row["status"] == "found" else "❌" if row["status"] == "missing" else "⚪"
         st.markdown(f"{icon} **{row['artifact']}** — `{row['path']}`")
+        if row.get("detail"):
+            st.caption(row["detail"])
 
 
 def tail_file(path: Path, n_lines: int = 80) -> str:
@@ -938,7 +1227,6 @@ def tail_file(path: Path, n_lines: int = 80) -> str:
 
 
 def render_logs_page(*, runs_dir: Path, run_folder_skip: set[str]) -> None:
-    st.subheader("Logs")
     runs = sorted(
         p
         for p in runs_dir.iterdir()
@@ -952,14 +1240,23 @@ def render_logs_page(*, runs_dir: Path, run_folder_skip: set[str]) -> None:
     idx = names.index(default) if default in names else 0
     selected = st.selectbox("Run folder", names, index=idx, key="logs_run_select")
     run_dir = runs_dir / selected
-    log_path = run_dir / "logs" / "execution.log"
+    from server.core.calibration_logs import persist_calibration_logs_for_run
+
+    persist_calibration_logs_for_run(run_dir)
+    logs_dir = run_dir / "logs"
+    log_files = sorted(p for p in logs_dir.glob("*.log") if p.is_file()) if logs_dir.is_dir() else []
     st.markdown(f"**Run directory:** `{run_dir}`")
-    if log_path.exists():
-        st.caption(f"Log file: `{log_path}` ({log_path.stat().st_size} bytes)")
-        n_tail = st.slider("Lines to show", 20, 1000, 120, key="logs_tail_lines")
-        st.code(tail_file(log_path, n_tail) or "(empty log)")
+    if not log_files:
+        st.warning("No log files for this run yet.")
     else:
-        st.warning("No execution.log for this run yet.")
+        log_names = [p.name for p in log_files]
+        default_log = "calibration.log" if "calibration.log" in log_names else "execution.log"
+        log_idx = log_names.index(default_log) if default_log in log_names else 0
+        chosen = st.selectbox("Log file", log_names, index=log_idx, key="logs_file_select")
+        log_path = logs_dir / chosen
+        st.caption(f"Log file: `{log_path}` ({log_path.stat().st_size} bytes)")
+        n_tail = st.slider("Lines to show", 20, 5000, 400, key="logs_tail_lines")
+        st.code(tail_file(log_path, n_tail) or "(empty log)")
     if (run_dir / "config.yaml").exists():
         with st.expander("config.yaml"):
             st.code((run_dir / "config.yaml").read_text(encoding="utf-8")[:12000])
@@ -974,7 +1271,6 @@ def render_dashboard_page(
     render_workflow_progress_fn,
     run_folder_skip: set[str],
 ) -> None:
-    st.subheader("Dashboard")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
@@ -1044,9 +1340,7 @@ def render_experiments_page(
     runs_dir: Path,
     run_folder_skip: set[str],
     load_run_fn=None,
-    execute_calibrate_fn=None,
 ) -> None:
-    st.subheader("Experiments")
     st.caption("Past assistant runs under the local `runs/` folder.")
     flash = st.session_state.pop("_experiments_load_flash", None)
     if flash:
@@ -1116,14 +1410,6 @@ def render_experiments_page(
             else:
                 st.session_state["_experiments_load_flash"] = ("success", pick)
             st.rerun()
-
-    if execute_calibrate_fn:
-        cal_out = st.empty()
-        render_calibration_section(
-            execute_calibrate_fn=lambda: execute_calibrate_fn(cal_out),
-            location="experiments",
-        )
-
 
 def render_run_shortcuts_section(
     *,

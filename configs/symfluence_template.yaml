@@ -50,7 +50,7 @@ GEOFABRIC_TYPE: na                                             # Source geofabri
 DELINEATION_METHOD: stream_threshold                           # Method for stream identification, options: stream_threshold, curvature, slope_area, multi_scale (02b semi-distributed default) 
 CURVATURE_THRESHOLD: 0.0                                       # Profile curvature threshold for curvature method
 MIN_SOURCE_THRESHOLD: 100                                      # Minimum contributing area for stream sources in curvature method
-STREAM_THRESHOLD: 5000                                         # Threshold flow accumulation for stream vectorisation
+STREAM_THRESHOLD: 1000                                         # Threshold flow accumulation for stream vectorisation
 SLOPE_AREA_THRESHOLD: 100.0                                    # Combined slope-area threshold
 SLOPE_AREA_EXPONENT: 2.0                                       # Exponent for slope (m in S^m * A^n)
 AREA_EXPONENT: 1.0                                             # Exponent for area (n in S^m * A^n)
@@ -251,7 +251,7 @@ FLUXNET_PATH: /path/to/data/data/geospatial-data/fluxnet       # Path to directo
 
 # USGS GW data settings
 DOWNLOAD_USGS_GW: false                                        # Download USGS groundwater data, options: 'true' or 'false'
-USGS_STATION:  06306300                                        # USGS   station ID (numeric)
+USGS_STATION: '06306300'                                       # USGS station ID (string)
 
 # Remote sensing data settings 
 DOWNLOAD_SMAP: false                                           # Download SMAP soil moisture data

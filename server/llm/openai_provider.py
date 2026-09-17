@@ -203,7 +203,14 @@ class OpenAIProvider:
         text = getattr(result, "text", None) or ""
         return text.strip()
 
-    def generate_run_plan(self, *, model: str, user_request: str) -> Dict[str, Any]:
+    def generate_run_plan(
+        self,
+        *,
+        model: str,
+        user_request: str,
+        enable_prompt_matching: bool = False,
+        workflow_plan_mode: str | None = None,
+    ) -> Dict[str, Any]:
         planner_prompt = PLANNER_PROMPT_PATH.read_text(encoding="utf-8")
         schema = build_run_plan_schema()
 
@@ -215,7 +222,12 @@ class OpenAIProvider:
             user_prompt=user_request,
             max_output_tokens=2500,
         )
-        return finalize_run_plan(plan, user_request)
+        return finalize_run_plan(
+            plan,
+            user_request,
+            enable_prompt_matching=enable_prompt_matching,
+            workflow_plan_mode=workflow_plan_mode,
+        )
 
     def refine_run_plan(
         self,
@@ -227,6 +239,7 @@ class OpenAIProvider:
         context_text: str = "",
         data_dir: Path | None = None,
         preserve_workflow_steps: bool = False,
+        enable_prompt_matching: bool = False,
     ) -> tuple[str, Dict[str, Any], bool]:
         refinement_prompt = PLAN_REFINEMENT_PROMPT_PATH.read_text(encoding="utf-8")
         schema = build_plan_refinement_schema()
@@ -250,4 +263,5 @@ class OpenAIProvider:
             conversation_text=conversation_text or user_message,
             data_dir=data_dir,
             preserve_workflow_steps=preserve_workflow_steps,
+            enable_prompt_matching=enable_prompt_matching,
         )

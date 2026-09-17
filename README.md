@@ -1,6 +1,6 @@
 # HydroAgent
 
-A natural-language assistant and Streamlit UI for planning and executing [SYMFLUENCE](https://github.com/your-org/SYMFLUENCE) hydrological modelling workflows. Describe a modelling run in plain English — HydroAgent generates a structured step-by-step plan, resolves inter-step dependencies, writes the SYMFLUENCE `config.yaml`, and executes each step with live log output.
+A natural-language assistant and Streamlit UI for planning and executing [SYMFLUENCE](https://github.com/uofs-simlab/SYMFLUENCE-HydroAgent) hydrological modelling workflows. Describe a modelling run in plain English — HydroAgent generates a structured step-by-step plan, resolves inter-step dependencies, writes the SYMFLUENCE `config.yaml`, and executes each step with live log output.
 
 ---
 
@@ -23,19 +23,20 @@ A natural-language assistant and Streamlit UI for planning and executing [SYMFLU
 HydroAgent/
 ├── app/
 │   ├── ui_agent.py          # Main Streamlit application
-│   ├── workflow_extras.py   # Results, maps, calibration shortcuts
+│   ├── workflow_extras.py   # Results, maps, calibration shortcuts + calibration agent UI
 │   ├── input_panel_sync.py  # Syncs plan config into session state and Input widgets
 │   └── widget_keys.py       # Versioned Streamlit widget key helpers
 ├── server/
 │   ├── core/
 │   │   ├── local_domain.py      # Domain artifact copy/restore utilities
-│   │   ├── run_naming.py        # Mac-style duplicate run-folder naming
+│   │   ├── run_naming.py        # Portable duplicate run-folder naming
 │   │   ├── ui_config_fields.py  # Config field registry and chat-edit logic
 │   │   ├── plan_rules.py        # Workflow planning rules
 │   │   ├── template.py          # Config template renderer
 │   │   ├── validate.py          # Config validation
 │   │   └── parameter_registry.py
 │   ├── capabilities/        # Operation catalog, dependency resolution, proven-status flags
+│   └── calibration/         # CalibHydroAgent integration (agent_integration.py)
 │   └── llm/
 │       ├── plan_shared.py       # Shared schema and plan utilities across providers
 │       ├── openai_provider.py   # OpenAI (GPT) provider
@@ -50,10 +51,14 @@ HydroAgent/
 │   ├── extract_discharge.py             # mizuRoute routed-flow extraction
 │   ├── summarize_routed_flow.py         # Flow summarisation
 │   └── restore_local_domain_artifacts.py  # Restore catchment/DEM from semidistributed into/ copies
-├── examples/                # local_settings.example.yaml
+├── examples/                # Local settings and portable CIROH demo plans
 ├── cli.py                   # Headless plan generator (OpenAI)
 ├── run.sh                   # Launch script
-├── requirements.txt
+├── pyproject.toml           # Direct HydroAgent dependencies and project configuration
+├── uv.lock                  # Exact locked HydroAgent dependency graph
+├── .python-version          # Pinned Python version
+├── requirements*.txt        # Generated pip-compatible dependency exports
+├── symfluence/              # Supported SYMFLUENCE backend submodule
 └── runs/                    # Per-run output folders (config.yaml, plan.json, chat.json, logs)
 ```
 
@@ -63,29 +68,35 @@ HydroAgent/
 
 | Requirement | Notes |
 |-------------|-------|
-| Python 3.11+ | 3.12 or 3.13 tested |
-| [SYMFLUENCE](https://github.com/your-org/SYMFLUENCE) | Installed and working |
+| Python 3.12.14 | Selected by `.python-version`; exact packages are pinned in `uv.lock` |
+| [uv](https://docs.astral.sh/uv/) | Manages the HydroAgent UI and test environment |
+| [Pixi](https://pixi.sh/) | Manages the separate SYMFLUENCE backend environment |
+| [SYMFLUENCE](https://github.com/uofs-simlab/SYMFLUENCE-HydroAgent) | Included as the `symfluence/` Git submodule |
 | SYMFLUENCE_data | Geospatial cache, model installs, domain data |
 | LLM API key | OpenAI, Google Gemini, or Anthropic — at least one required for plan generation |
 
-### Geospatial stack
+### Reproducible environment
 
-GeoPandas and Folium require GDAL. On Linux/macOS, conda-forge is the easiest path:
-
-```bash
-conda create -n hydroagent python=3.12
-conda activate hydroagent
-conda install -c conda-forge geopandas folium pyyaml pandas
-pip install -r requirements.txt
-```
-
-Alternatively, use a plain venv if GDAL is already available system-wide:
+HydroAgent and its SYMFLUENCE backend use separate environments. From the
+HydroAgent repository root, install the locked UI and test environment:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync --frozen
+uv run --frozen pytest
 ```
+
+Then install the locked SYMFLUENCE backend environment:
+
+```bash
+cd symfluence
+pixi install --frozen -e build
+cd ..
+```
+
+No manually managed Conda environment is required. `pyproject.toml` declares the
+HydroAgent dependencies; `uv.lock` records their exact resolved versions. Commit
+both files. The `requirements*.txt` files are generated compatibility exports and
+should not be edited directly.
 
 ---
 
@@ -100,9 +111,9 @@ cp examples/local_settings.example.yaml ~/.symfluence_assistant/config.yaml
 
 ```yaml
 # ~/.symfluence_assistant/config.yaml
-symfluence_repo:    /path/to/SYMFLUENCE
+symfluence_repo:    /path/to/HydroAgent/symfluence
 symfluence_data_dir: /path/to/SYMFLUENCE_data
-symfluence_python:  /path/to/SYMFLUENCE/venv/bin/python
+symfluence_python:  /path/to/HydroAgent/symfluence/.pixi/envs/build/bin/python
 
 # Add whichever LLM key(s) you have — at least one is needed for plan generation
 openai_api_key:     sk-...
@@ -110,7 +121,8 @@ gemini_api_key:     AIza...
 claude_api_key:     sk-ant-...
 ```
 
-API keys can also be entered directly in the UI sidebar and saved from there. For OpenAI only, you can use `.env`:
+HydroAgent automatically uses `OPENAI_API_KEY` from the environment. You can
+export it in your shell or put it in the ignored `.env` file:
 
 ```bash
 cp .env.example .env
@@ -122,7 +134,6 @@ cp .env.example .env
 ## Quick start
 
 ```bash
-chmod +x run.sh
 ./run.sh
 ```
 
@@ -131,12 +142,15 @@ Open `http://localhost:8501` in your browser.
 ### Typical workflow
 
 1. **Workflows → Input** — Set domain, experiment ID, pour point, model, and date range (or click **Load data domain**).
-2. **Workflows → Prompt** — Select a provider, enter your API key, describe the run in plain English, then click **Generate plan**.
+2. **Workflows → Prompt** — Select a provider, confirm its API key is loaded, describe the run in plain English, then click **Generate plan**.
 3. Review the plan JSON; use the **Chat** tab to refine it conversationally if needed.
 4. Click **Resolve dependencies**, then **Execute plan** (confirm `RUN` for `run_model` / `calibrate_model` steps).
 5. **Output / Results** — Inspect logs and artifacts; use the Results tab for routed-flow plots.
 
 Run outputs are saved under `runs/<domain>_<experiment>/`.
+
+For a portable simulation example, see the [Logan River CIROH demo](examples/ciroh_logan_demo.md)
+and its [water-year 2005 plan](examples/logan_river_ciroh_demo.plan.json).
 
 ---
 
@@ -146,7 +160,7 @@ Generate a plan without the UI (OpenAI only):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-python cli.py run "Lumped SUMMA workflow for Bow River at Banff, 2010-2015" \
+uv run --frozen python cli.py run "Lumped SUMMA workflow for Bow River at Banff, 2010-2015" \
     --json-out runs/bow_river_plan.json
 ```
 
@@ -154,7 +168,7 @@ Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `gpt-5` | OpenAI model name |
+| `--model` | `gpt-5-mini` | OpenAI model name |
 | `--api-key` | env | Override `OPENAI_API_KEY` |
 | `--json-out` | — | Save plan JSON to file |
 
@@ -179,7 +193,7 @@ A radio selector at the top switches between pages:
 | Experiments | Browse and reload previous runs; trigger calibration runs. |
 | Data | Inspect SYMFLUENCE_data domain folders and available shapefiles. |
 | Templates | Reserved for a future template management UI. |
-| Results | Post-processing and routed-flow visualisation across all runs. |
+| Results | Daily hydrographs, evaluation metrics, flow-duration curves, CSV downloads, and saved plots for the active run. Reads postprocessed result tables or routed-flow CSVs and applies evaluation and spin-up periods. |
 | Logs | View raw command logs from past runs. |
 | Settings | Reminder page pointing to path settings (in the sidebar expander below). |
 
@@ -208,9 +222,13 @@ The centre column contains the core workflow controls split across two tabs.
 
 | Option | What it does |
 |--------|-------------|
-| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, `spec.json`, and `chat.json`. If the folder name is already taken, a Finder-style suffix (`(1)`, `(2)`, …) is added automatically to avoid overwriting existing work. |
+| Start new run | Uses the Domain name and Experiment ID fields below to create `runs/<domain>_<experiment>/` containing `config.yaml`, `plan.json`, `spec.json`, and available prompt/chat history. If the folder name is already taken, a portable suffix (`_1`, `_2`, …) is added automatically. Existing legacy `(1)` folders remain loadable. |
 | Load assistant run | Dropdown of existing folders under `runs/`; loading restores all session fields from the saved plan, config, and chat history. |
-| Load SYMFLUENCE data domain | Dropdown of `domain_*` folders under `SYMFLUENCE_data/`; reads `config.yaml` from the domain and populates the session fields from it. |
+| Load SYMFLUENCE data domain | Dropdown of `domain_*` folders under `SYMFLUENCE_data/`; restores the matching assistant run when its saved config identifies the domain and experiment, otherwise loads the domain config. |
+
+Preview refreshes and plan/chat edits write only to `runs/_preview/`. A saved
+run's metadata is updated when you explicitly create/save or execute a run.
+Results continues to use the selected run's saved configuration while you edit.
 
 **Workflow settings**
 
@@ -231,7 +249,7 @@ The centre column contains the core workflow controls split across two tabs.
 |---------|-------------|
 | Map click mode — Pour point | Click anywhere on the map to drop a pour point marker. Coordinates are captured as `lat/lon` and written to the plan config. |
 | Map click mode — Bounding box | Click two corners of a rectangle on the map. The first click sets corner 1; the second click finalises the box. Clicking again after the box is set starts a new box. |
-| Review layers (expander) | Toggle checkboxes to overlay delineation outputs (DEM, land class, soil class, river basins, HRU/GRU, forcing grid, river network) on the map. Layers appear only when the corresponding shapefiles exist under `SYMFLUENCE_data/domain_<name>/`. |
+| Review layers (expander) | Independently toggle pour point, bounding box, river basins, and river network. Choose one color layer (DEM, land class, soil class, HRU/GRU, or forcing grid), or None for overlays only. Controls use spatial references from the plan and available shapefiles under `SYMFLUENCE_data/domain_<name>/`. |
 | Interactive map | Folium map; pan and zoom normally. Click to set spatial inputs according to the mode above. |
 | Clear pour point | Removes the current pour point from the session and from the active plan. |
 | Clear bounding box | Removes the current bounding box from the session and from the active plan. |
@@ -274,7 +292,7 @@ The right column contains the LLM assistant split across two tabs.
 | Control | What it does |
 |---------|-------------|
 | Provider | Selects the LLM backend: **OpenAI (GPT)**, **Google (Gemini)**, or **Anthropic (Claude)**. Switching providers changes the model list and which API key is active. |
-| Your API key | Paste the key for the selected provider. Keys are stored per-provider and never leave your machine. |
+| Your API key | Paste the key for the selected provider. A saved key is stored locally and used only to authenticate requests to that provider. |
 | Save key | Saves the key for the active provider to `~/.symfluence_assistant/config.yaml` so it persists across sessions. |
 | Model | Dropdown of available models for the selected provider. Defaults to the recommended model for each provider. |
 
@@ -282,7 +300,7 @@ Available models by provider:
 
 | Provider | Models |
 |----------|--------|
-| OpenAI (GPT) | GPT-4o, GPT-4o-mini, GPT-5, and others |
+| OpenAI (GPT) | GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, GPT-5 Mini |
 | Google (Gemini) | Gemini 2.5 Flash / Pro (recommended), Gemini 2.0 Flash, Gemini 1.5 (legacy) |
 | Anthropic (Claude) | Sonnet 4, Opus 4 (recommended), Sonnet 3.7, Sonnet 3.5, Haiku 3.5 (legacy) |
 
@@ -293,6 +311,15 @@ Available models by provider:
 Type a plain-English description of the modelling run — basin name, pour point, model type, date range, and any special requirements. Example:
 
 > *"Lumped SUMMA workflow for Bow River at Banff, 2010–2015, using local domain data."*
+
+**Prompt library (optional)**
+
+| Control | What it does |
+|---------|-------------|
+| Find similar prompts | Searches the local prompt history using OpenAI embeddings. Runs only when clicked. |
+| Use prompt-library examples when generating plan | When enabled, retrieves similar prompts and adds close matches to the planner request. Off by default. |
+| Save generated requests to prompt history | When enabled, saves the input after plan generation. Off by default; saved entries are not validated prompt-config pairs. |
+| Rebuild | Regenerates the searchable embedding cache after the library is edited. |
 
 **Voice input**
 
@@ -322,7 +349,8 @@ Inspects the current plan against the SYMFLUENCE operation catalog and inserts a
 | Allow dangerous run steps | Must be enabled before any step that runs or calibrates a model (`run_model`, `calibrate_model`). These steps can take a long time and consume significant compute. |
 | Type RUN to allow dangerous execution | Safety confirmation field. Type `RUN` (exact) to unlock the Execute plan button when dangerous steps are present. |
 | **Execute plan** | Runs every step in the plan sequentially. Disabled until all required inputs are filled and any dangerous-step confirmation is complete. Output streams live to the Output tab. |
-| **Clear plan** | Discards the current plan and resets the assistant panel so you can start fresh. |
+| **Clear plan** | Discards the generated plan and conversation while retaining the current configuration and active run. |
+| **New workflow** | Clears the current prompt, plan, configuration, map selections, and active-run association. Saved runs and SYMFLUENCE data are not deleted. |
 
 #### Chat tab
 
@@ -337,7 +365,9 @@ The Chat tab is a full conversational interface for refining the active plan. Af
 
 The assistant responds with a short explanation and applies any plan changes immediately — the editable plan JSON in the Prompt tab and the Input tab fields both update in real time.
 
-Chat history is saved to `runs/<folder>/chat.json` and is reloaded automatically when you load a run from the Start / load run section.
+Draft chat history is saved to `runs/_preview/chat.json`. Creating/saving or
+executing a run stores the conversation in `runs/<folder>/chat.json`, which is
+restored when you load that run from Start / load run.
 
 ---
 
@@ -383,7 +413,7 @@ Set `domain_name` and `experiment_id` as separate plan fields (do not merge them
 If catchment shapefiles or DEM are missing from a semidistributed domain, the `restore_local_domain_artifacts.py` tool can rebuild them from the `into/` copies created during domain delineation:
 
 ```bash
-python tools/restore_local_domain_artifacts.py \
+uv run --frozen python tools/restore_local_domain_artifacts.py \
     --data-dir /path/to/SYMFLUENCE_data \
     --domain-name Bow_at_Banff_semi_distributed \
     --experiment-id run_1
@@ -399,8 +429,8 @@ python tools/restore_local_domain_artifacts.py \
 | DEM / shapefile missing | Verify `DOMAIN_NAME` matches a `SYMFLUENCE_data/domain_*` folder; run `restore_local_domain_artifacts.py` if delineation outputs are present but legacy paths are missing |
 | Plan / LLM errors | Check the API key for the selected provider in the sidebar or config file |
 | Provider not available | Ensure `anthropic` or `google-genai` is installed in the same Python environment running Streamlit |
-| GeoPandas import errors | Install GDAL via conda-forge (see Prerequisites) |
-| Run folder collision | The app handles this automatically with `(1)`, `(2)` suffixes; if you see unexpected folder names, check `runs/` for pre-existing folders |
+| GeoPandas import errors | Confirm Python 3.12.14 is selected, then rerun `uv sync --frozen` |
+| Run folder collision | The app handles this automatically with `_1`, `_2` suffixes and recognizes existing legacy `(1)`, `(2)` folders; check `runs/` for pre-existing folders |
 
 ---
 

@@ -1,5 +1,4 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
 from pathlib import Path
 import re
@@ -16,12 +15,14 @@ import traceback
 import json
 import html
 import hashlib
+import importlib
+import math
 import datetime as dt
 import pandas as pd
 import folium
 import streamlit.components.v1 as components
 from streamlit_folium import st_folium
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -54,6 +55,7 @@ from input_panel_sync import sync_plan_config_to_session  # noqa: E402
 from widget_keys import (  # noqa: E402
     bump_all_input_widget_versions,
     bump_config_preview_version,
+    bump_input_panel_widget_version,
     bump_spatial_input_widget_version,
     config_preview_widget_key,
     experiment_datetime_widget_key,
@@ -87,7 +89,13 @@ from server.core.template import (
     spec_key_to_yaml_key,
 )
 from server.core.validate import validate_spec  # noqa: E402
-from server.core.safe_subprocess import run_command, run_command_stream  # noqa: E402
+from server.core.safe_subprocess import run_command_stream  # noqa: E402
+from server.core.api_keys import load_api_keys_from_environment  # noqa: E402
+from server.core.prompt_library_policy import (  # noqa: E402
+    DEFAULT_SAVE_PROMPT_HISTORY,
+    DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+    prompt_library_action_enabled,
+)
 from server.core.workflow_executor import (  # noqa: E402
     completed_steps_from_log,
     execution_log_path,
@@ -95,6 +103,14 @@ from server.core.workflow_executor import (  # noqa: E402
     prepare_execution_log,
     sync_workflow_execution_state,
     workflow_is_running,
+)
+from server.core.workflow_session import reset_workflow_session_state  # noqa: E402
+from server.core.ui_field_precedence import (  # noqa: E402
+    clear_explicit_ui_fields,
+    explicit_ui_fields,
+    mark_ui_fields_explicit,
+    select_explicit_ui_values,
+    ui_field_is_explicit,
 )
 
 from server.core.parameter_registry import (
@@ -122,6 +138,7 @@ from server.core.local_domain import (
 from server.core.run_naming import (
     allocate_unique_run_folder,
     assistant_run_is_established,
+    basin_domain_for_run_folder,
     parse_mac_duplicate_suffix,
     placeholder_run_needs_rename,
     preview_run_folder_name,
@@ -131,6 +148,8 @@ from server.core.run_naming import (
     symfluence_domain_for_run_folder,
     symfluence_domain_mac_suffix,
 )
+import server.core.plan_rules as _plan_rules_module
+importlib.reload(_plan_rules_module)
 from server.core.plan_rules import (
     apply_chat_config_edits,
     apply_chat_step_edits,
@@ -139,24 +158,33 @@ from server.core.plan_rules import (
     domain_catchment_hru_count,
     domain_has_local_dem,
     domain_has_local_era5_raw_forcing,
-    domain_has_local_streamflow,
+    domain_has_usable_local_streamflow,
     domain_has_local_summa_forcing,
+    domain_forcing_intersection_path,
     domain_has_forcing_intersection,
+    domain_has_remapped_forcing,
     domain_has_local_discretization,
+    basin_pour_point_preflight_error,
     domain_has_local_river_basins,
     domain_has_complete_local_workflow,
     domain_name_needs_user_input,
     ensure_skip_acquire_forcings_when_local_forcing,
     ensure_skip_model_agnostic_when_local_preprocessing,
     ensure_skip_process_observed_when_local_streamflow,
-    ensure_create_pour_point_before_define_domain,
     extract_explicit_domain_name_from_request,
     extract_station_id_from_request,
+    is_calibration_workflow_plan,
+    planner_mode_instructions,
+    plan_workflow_mode,
     resolve_station_id_from_plan,
+    WORKFLOW_PLAN_MODE_CALIBRATION,
+    WORKFLOW_PLAN_MODE_SIMULATION,
     infer_goal_steps_from_request,
     is_weak_domain_name,
     apply_user_provided_domain_name,
     merge_step_dependencies_preserving_order,
+    merge_domain_config_from_simulation_plan,
+    merge_simulation_steps_into_calibration_plan,
     normalize_committed_plan_config,
     normalize_local_workflow_plan,
     plan_requires_bounding_box,
@@ -166,6 +194,7 @@ from server.core.plan_rules import (
     should_reuse_existing_symfluence_domain,
     sort_plan_steps_by_workflow_order,
     strip_user_forbidden_download_steps,
+    strip_agent_calibration_config_unless_in_prompt,
     user_requires_fresh_cloud_workflow,
 )
 
@@ -341,6 +370,7 @@ RUN_FOLDER_SKIP = {"_preview"}
 DEFAULT_SYMFLUENCE_REPO = USER_HOME / "installs" / "SYMFLUENCE"
 DEFAULT_SYMFLUENCE_DATA_DIR = USER_HOME / "installs" / "SYMFLUENCE_data"
 DEFAULT_SYMFLUENCE_PYTHON = USER_HOME / "installs" / "SYMFLUENCE" / "venv" / "bin" / "python"
+DEFAULT_CALIB_HYDRO_AGENT_REPO = USER_HOME / "Desktop" / "CalibHydroAgent"
 
 LOCAL_SETTINGS = load_local_settings()
 
@@ -367,6 +397,16 @@ def s(value) -> str:
     return str(value).strip()
 
 
+def mark_workflow_ui_fields_explicit(*fields: str) -> None:
+    """Mark fields changed by a user-operated widget as plan overrides."""
+    mark_ui_fields_explicit(st.session_state, *fields)
+
+
+def session_state_snapshot() -> dict[str, Any]:
+    """Plain dict copy of Streamlit session state for typed server/bridge calls."""
+    return {str(k): v for k, v in st.session_state.items()}
+
+
 def parse_datetime_value(value: str, fallback: dt.datetime) -> dt.datetime:
     value = s(value)
     if not value:
@@ -382,56 +422,104 @@ def parse_datetime_value(value: str, fallback: dt.datetime) -> dt.datetime:
     return fallback
 
 
-def format_datetime_value(date_value, time_value) -> str:
-    return f"{date_value:%Y-%m-%d} {time_value:%H:%M}"
-
-
-def _is_ui_placeholder_experiment_date(value: str, *, which: str) -> bool:
-    from server.core.plan_rules import UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_START
-
+def parse_datetime_value_optional(value: str) -> dt.datetime | None:
     value = s(value)
-    if which == "start":
-        return value in {UI_DEFAULT_EXPERIMENT_START, UI_DEFAULT_EXPERIMENT_START[:10]}
-    return value in {UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_END[:10]}
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+            if fmt == "%Y-%m-%d":
+                return parsed.replace(hour=0, minute=0)
+            return parsed
+        except Exception:
+            pass
+    return None
+
+
+_DEFAULT_EXPERIMENT_START = dt.datetime(2001, 1, 1, 1, 0)
+_DEFAULT_EXPERIMENT_END = dt.datetime(2001, 1, 10, 23, 0)
+EXPERIMENT_DATE_MIN = dt.date(1950, 1, 1)
+EXPERIMENT_DATE_MAX = dt.date(2030, 12, 31)
+_EXPERIMENT_DATE_HELP = f"Selectable range: {EXPERIMENT_DATE_MIN:%Y-%m-%d} to {EXPERIMENT_DATE_MAX:%Y-%m-%d}."
+
+
+def _clamp_experiment_date(value: dt.date, *, min_date: dt.date | None = None) -> dt.date:
+    lower = min_date or EXPERIMENT_DATE_MIN
+    if value < lower:
+        return lower
+    if value > EXPERIMENT_DATE_MAX:
+        return EXPERIMENT_DATE_MAX
+    return value
+
+
+def _experiment_time_plan_keys(kind: str) -> tuple[str, str, str]:
+    if kind == "start":
+        return "tstart", "experiment_time_start", "EXPERIMENT_TIME_START"
+    return "tend", "experiment_time_end", "EXPERIMENT_TIME_END"
+
+
+def resolve_experiment_datetime(kind: str) -> dt.datetime:
+    """Session → plan.config → UI placeholder (never write placeholder back to plan)."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    fallback = _DEFAULT_EXPERIMENT_START if kind == "start" else _DEFAULT_EXPERIMENT_END
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    for raw in (
+        st.session_state.get(session_key),
+        lookup_plan_config(plan_cfg, plan_key, yaml_key),
+    ):
+        parsed = parse_datetime_value_optional(s(raw))
+        if parsed is not None:
+            return parsed
+    return fallback
+
+
+def effective_experiment_time_string(kind: str) -> str:
+    """Authoritative start/end for plan sync — never the Input-tab placeholder."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    for raw in (
+        st.session_state.get(session_key),
+        lookup_plan_config(plan_cfg, plan_key, yaml_key),
+    ):
+        val = s(raw)
+        if val:
+            return val
+    return ""
 
 
 def commit_experiment_datetime_from_widgets(
     *,
-    prev_value: str,
-    widget_value: str,
-    which: str,
-) -> str:
-    """Keep Input-tab placeholder dates out of session/plan until the user or plan sets them."""
-    prev_value = s(prev_value)
-    widget_value = s(widget_value)
-    if prev_value:
-        return widget_value
-    if widget_value and not _is_ui_placeholder_experiment_date(widget_value, which=which):
-        return widget_value
-    return ""
+    kind: str,
+    date_value,
+    time_value,
+) -> None:
+    """Persist widget output; skip writing UI-only placeholder defaults."""
+    session_key, plan_key, yaml_key = _experiment_time_plan_keys(kind)
+    fallback = _DEFAULT_EXPERIMENT_START if kind == "start" else _DEFAULT_EXPERIMENT_END
+    normalized_time = time_value.replace(second=0, microsecond=0)
+    formatted = format_datetime_value(date_value, normalized_time)
+    fallback_formatted = format_datetime_value(fallback.date(), fallback.time())
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    has_authoritative = any(
+        s(v)
+        for v in (
+            st.session_state.get(session_key),
+            lookup_plan_config(plan_cfg, plan_key, yaml_key),
+        )
+    )
+    if has_authoritative or formatted != fallback_formatted:
+        st.session_state[session_key] = formatted
 
 
-def ui_experiment_dates_for_plan() -> tuple[str, str]:
-    """Return dates to write into the plan, omitting uncommitted UI placeholders."""
-    from server.core.plan_rules import request_mentions_experiment_dates
+def mark_experiment_datetime_explicit(kind: str) -> None:
+    """Mark a date/time widget edit without treating its placeholder as input."""
+    _, plan_key, _ = _experiment_time_plan_keys(kind)
+    mark_workflow_ui_fields_explicit(plan_key)
 
-    tstart = s(st.session_state.tstart)
-    tend = s(st.session_state.tend)
-    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
-    prompt_has_dates = request_mentions_experiment_dates(prompt)
-    if tstart and (
-        prompt_has_dates or not _is_ui_placeholder_experiment_date(tstart, which="start")
-    ):
-        pass
-    else:
-        tstart = ""
-    if tend and (
-        prompt_has_dates or not _is_ui_placeholder_experiment_date(tend, which="end")
-    ):
-        pass
-    else:
-        tend = ""
-    return tstart, tend
+
+def format_datetime_value(date_value, time_value) -> str:
+    return f"{date_value:%Y-%m-%d} {time_value:%H:%M}"
 
 
 def bump_input_panel_widget_versions() -> None:
@@ -444,13 +532,80 @@ def plan_cfg_lookup(cfg: dict, *keys: str):
 
 
 def sync_mpi_to_run_plan() -> None:
-    if not st.session_state.get("run_plan"):
+    if not st.session_state.get("run_plan") or not ui_field_is_explicit(
+        st.session_state, "num_processes"
+    ):
         return
     plan = st.session_state.run_plan
     plan.setdefault("config", {})
     mpi_val = int(st.session_state.mpi)
     plan["config"]["num_processes"] = mpi_val
     plan["config"].pop("NUM_PROCESSES", None)
+
+
+def explicit_workflow_ui_config_values() -> dict[str, Any]:
+    """Return only values deliberately entered through workflow widgets."""
+    values: dict[str, Any] = {
+        "domain_name": s(st.session_state.get("domain_name")),
+        "experiment_id": s(st.session_state.get("experiment_id")),
+        "hydrological_model": current_hydrological_model(),
+        "domain_def": s(st.session_state.get("domain_def")),
+        "forcing_dataset": s(st.session_state.get("forcing_dataset")),
+        "experiment_time_start": effective_experiment_time_string("start"),
+        "experiment_time_end": effective_experiment_time_string("end"),
+        "pour_point_coords": s(st.session_state.get("selected_pour_point"))
+        or pour_point_input_value(),
+        "bounding_box_coords": s(st.session_state.get("selected_bounding_box"))
+        or bounding_box_input_value(),
+        "num_processes": int(st.session_state.get("mpi", 1) or 1),
+    }
+    for session_key, _, _ in wx.ADVANCED_SESSION_FIELDS:
+        values[session_key] = st.session_state.get(session_key)
+    for session_key, _ in wx.CALIBRATION_SESSION_FIELDS:
+        values[session_key] = st.session_state.get(session_key)
+    return select_explicit_ui_values(st.session_state, values)
+
+
+def apply_explicit_workflow_ui_overrides(plan: dict) -> dict:
+    """Apply user-operated GUI fields after planning; untouched defaults never win."""
+    out = dict(plan or {})
+    cfg = dict(out.get("config") or {})
+    extra = (
+        dict(cfg.get("extra_config") or {})
+        if isinstance(cfg.get("extra_config"), dict)
+        else {}
+    )
+    advanced_keys = {key for key, _, _ in wx.ADVANCED_SESSION_FIELDS}
+    calibration_keys = {key for key, _ in wx.CALIBRATION_SESSION_FIELDS}
+
+    for key, raw in explicit_workflow_ui_config_values().items():
+        value = raw if isinstance(raw, (int, float, bool)) else s(raw)
+        yaml_key = spec_key_to_yaml_key(key)
+        if value in (None, ""):
+            cfg.pop(key, None)
+            if yaml_key:
+                cfg.pop(yaml_key, None)
+            extra.pop(key, None)
+            if yaml_key:
+                extra.pop(yaml_key, None)
+            continue
+        if key == "domain_name":
+            cfg = apply_user_provided_domain_name(cfg, str(value))
+        else:
+            cfg[key] = value
+            if yaml_key and yaml_key != key:
+                cfg.pop(yaml_key, None)
+        if key in advanced_keys or key in calibration_keys:
+            extra[key] = value
+            if yaml_key and yaml_key != key:
+                extra.pop(yaml_key, None)
+
+    if extra:
+        cfg["extra_config"] = extra
+    elif "extra_config" in cfg:
+        cfg.pop("extra_config", None)
+    out["config"] = cfg
+    return out
 
 
 def resolve_num_processes_from_plan_cfg(plan_cfg: dict | None) -> int | None:
@@ -538,11 +693,16 @@ ASSISTANT_PANEL_BUTTON_KEYS = (
 )
 
 ASSISTANT_PANEL_TOGGLE_KEY = "assistant_panel_toggle"
+ASSISTANT_PANEL_WIDTH_STORAGE_KEY = "hydroagent-assistant-panel-width"
+ASSISTANT_PANEL_MIN_WIDTH_PX = 240
+WORKFLOW_MAIN_MIN_WIDTH_PX = 420
 
 # Middle workflow column: scroll region height (px) and map iframe height inside it.
 WORKFLOW_PANEL_HEIGHT = 720
 WORKFLOW_MAP_HEIGHT = 520
+WORKFLOW_MAP_CENTER = [51.0, -115.5]
 WORKFLOW_MAP_ZOOM = 2
+WORKFLOW_MAP_MIN_ZOOM = 2
 WORKFLOW_SECTION_KEY = "workflow_section"
 EXECUTION_LOG_TAIL_CHARS = 120_000
 
@@ -573,37 +733,25 @@ def assistant_panel_button_css() -> str:
         for prefix in MAIN_PANEL_GREY_BUTTON_KEY_PREFIXES
     )
     panel_scoped = (
-        ".sym-assistant-styled button",
         ".sym-assistant-styled [data-testid='stButton'] button",
-        ".sym-assistant-styled [data-testid='stTabs'] button",
-        ".sym-main-styled button",
         ".sym-main-styled [data-testid='stButton'] button",
-        ".sym-main-styled [data-testid='stTabs'] button",
     )
     scoped = panel_scoped + (key_btns, prefix_btns)
     scoped_hover = (
-        ".sym-assistant-styled button:hover:not(:disabled)",
         ".sym-assistant-styled [data-testid='stButton'] button:hover:not(:disabled)",
-        ".sym-assistant-styled [data-testid='stTabs'] button:hover:not(:disabled)",
-        ".sym-main-styled button:hover:not(:disabled)",
         ".sym-main-styled [data-testid='stButton'] button:hover:not(:disabled)",
-        ".sym-main-styled [data-testid='stTabs'] button:hover:not(:disabled)",
         key_btns_hover,
         prefix_btns_hover,
     )
     scoped_disabled = (
-        ".sym-assistant-styled button:disabled",
         ".sym-assistant-styled [data-testid='stButton'] button:disabled",
-        ".sym-main-styled button:disabled",
         ".sym-main-styled [data-testid='stButton'] button:disabled",
         key_btns_disabled,
         prefix_btns_disabled,
     )
     label_scoped = (
         ".sym-assistant-styled [data-testid='stButton'] button p",
-        ".sym-assistant-styled [data-testid='stTabs'] button p",
         ".sym-main-styled [data-testid='stButton'] button p",
-        ".sym-main-styled [data-testid='stTabs'] button p",
     )
     return f"""
     {", ".join(scoped)} {{
@@ -648,7 +796,7 @@ def panel_edge_toggle_css(key: str, *, edge: str) -> str:
         align-items: center !important;
         justify-content: center !important;
         height: 100% !important;
-        min-height: calc(100dvh - 10.5rem) !important;
+        min-height: var(--sym-workflow-panel-height, 720px) !important;
         max-width: 1.75rem !important;
         width: 1.75rem !important;
         padding: 0 !important;
@@ -681,53 +829,392 @@ def panel_edge_toggle_css(key: str, *, edge: str) -> str:
 
 
 def assistant_panel_toggle_css() -> str:
-    return panel_edge_toggle_css(ASSISTANT_PANEL_TOGGLE_KEY, edge="right")
+    return (
+        panel_edge_toggle_css(ASSISTANT_PANEL_TOGGLE_KEY, edge="right")
+        + """
+    div.st-key-assistant_panel_toggle {
+        position: relative !important;
+        z-index: 2 !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-main-column {
+        flex: 1 1 0px !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-toggle-column {
+        flex: 0 0 28px !important;
+        width: 28px !important;
+        min-width: 28px !important;
+        position: relative !important;
+        overflow: visible !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > .sym-workflow-assistant-column {
+        flex: 0 0 var(--sym-assistant-panel-width, 28%) !important;
+        width: var(--sym-assistant-panel-width, 28%) !important;
+        min-width: 0 !important;
+    }
+    div.st-key-assistant_panel_toggle::before {
+        content: "";
+        position: absolute;
+        inset: 0 auto 0 50%;
+        width: 1px;
+        transform: translateX(-50%);
+        background: var(--sym-divider-color, rgba(49, 51, 63, 0.18));
+        pointer-events: none;
+    }
+    div.st-key-assistant_panel_toggle button {
+        position: absolute !important;
+        top: 50% !important;
+        right: 50% !important;
+        transform: translateY(-50%) !important;
+        z-index: 3 !important;
+    }
+    .sym-assistant-resize-handle {
+        position: absolute;
+        inset: 0 auto 0 50%;
+        width: 0.75rem;
+        transform: translateX(-50%);
+        z-index: 1;
+        cursor: col-resize;
+        touch-action: none;
+        outline: none;
+    }
+    .sym-assistant-resize-handle::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 0 50%;
+        width: 1px;
+        transform: translateX(-50%);
+        background: transparent;
+        transition: background-color 120ms ease;
+    }
+    .sym-assistant-resize-handle:hover::before,
+    .sym-assistant-resize-handle:focus-visible::before,
+    .sym-assistant-resize-handle[data-resizing="true"]::before {
+        background: #94a3b8;
+    }
+    body.sym-assistant-resizing,
+    body.sym-assistant-resizing * {
+        cursor: col-resize !important;
+        user-select: none !important;
+    }
+    """
+    )
+
+
+def assistant_panel_resizer_html(render_version: int = 0) -> str:
+    """Parent-page resize handle for the Streamlit workflow columns."""
+    storage_key = json.dumps(ASSISTANT_PANEL_WIDTH_STORAGE_KEY)
+    return f"""
+        <script>
+        (function () {{
+            const doc = window.parent.document;
+            const hostWindow = window.parent;
+            const storageKey = {storage_key};
+            const minAssistantWidth = {ASSISTANT_PANEL_MIN_WIDTH_PX};
+            const minMainWidth = {WORKFLOW_MAIN_MIN_WIDTH_PX};
+            const toggleWidth = 28;
+            const defaultRatio = 0.28;
+            const renderVersion = {int(render_version)};
+            // Rerenders replace the iframe, but parent-document listeners survive it.
+            if (hostWindow.__hydroagentAssistantResizeCleanup) {{
+                hostWindow.__hydroagentAssistantResizeCleanup();
+            }}
+            const controller = new hostWindow.AbortController();
+            const listenerOptions = {{ signal: controller.signal }};
+            const pointerOptions = {{ capture: true, signal: controller.signal }};
+            let retryTimer = null;
+            let disposeHandle = () => {{}};
+            function cleanup() {{
+                if (controller.signal.aborted) return;
+                controller.abort();
+                if (retryTimer !== null) window.clearTimeout(retryTimer);
+                disposeHandle();
+                if (hostWindow.__hydroagentAssistantResizeCleanup === cleanup) {{
+                    delete hostWindow.__hydroagentAssistantResizeCleanup;
+                }}
+            }}
+            hostWindow.__hydroagentAssistantResizeCleanup = cleanup;
+            window.addEventListener("beforeunload", cleanup, {{ once: true, signal: controller.signal }});
+
+            function columnFor(node) {{
+                let current = node;
+                for (let i = 0; i < 20 && current; i += 1) {{
+                    const testId = current.getAttribute && current.getAttribute("data-testid");
+                    if (testId === "column" || testId === "stColumn") return current;
+                    current = current.parentElement;
+                }}
+                return null;
+            }}
+
+            function install(attempt) {{
+                if (controller.signal.aborted) return;
+                const toggleColumn = columnFor(window.frameElement);
+                const row = toggleColumn && toggleColumn.parentElement;
+                if (!toggleColumn || !row) {{
+                    if (attempt < 30) retryTimer = window.setTimeout(() => install(attempt + 1), 50);
+                    return;
+                }}
+
+                const columns = Array.from(row.children).filter((element) => {{
+                    const testId = element.getAttribute && element.getAttribute("data-testid");
+                    return testId === "column" || testId === "stColumn";
+                }});
+                const toggleIndex = columns.indexOf(toggleColumn);
+                const mainColumn = columns[toggleIndex - 1];
+                const assistantColumn = columns[toggleIndex + 1];
+                if (!mainColumn || !assistantColumn) return;
+
+                mainColumn.classList.add("sym-workflow-main-column");
+                toggleColumn.classList.add("sym-workflow-toggle-column");
+                assistantColumn.classList.add("sym-workflow-assistant-column");
+                for (const column of [mainColumn, toggleColumn, assistantColumn]) {{
+                    column.style.removeProperty("flex");
+                    column.style.removeProperty("width");
+                    column.style.removeProperty("min-width");
+                }}
+                let handle = toggleColumn.querySelector(".sym-assistant-resize-handle");
+                if (handle) handle.remove();
+                toggleColumn.style.removeProperty("position");
+                toggleColumn.style.removeProperty("overflow");
+
+                handle = doc.createElement("div");
+                handle.className = "sym-assistant-resize-handle";
+                handle.dataset.renderVersion = String(renderVersion);
+                handle.setAttribute("role", "separator");
+                handle.setAttribute("aria-label", "Resize assistant panel");
+                handle.setAttribute("aria-orientation", "vertical");
+                handle.setAttribute("aria-valuemin", "0");
+                handle.setAttribute("aria-valuemax", "100");
+                handle.setAttribute("title", "Drag to resize assistant panel");
+                handle.tabIndex = 0;
+                toggleColumn.appendChild(handle);
+
+                function measurements() {{
+                    const rowStyle = hostWindow.getComputedStyle(row);
+                    const gap = Number.parseFloat(rowStyle.columnGap || rowStyle.gap) || 0;
+                    const usable = Math.max(1, row.getBoundingClientRect().width - toggleWidth - (2 * gap));
+                    const maxAssistantWidth = Math.max(160, usable - minMainWidth);
+                    const effectiveMinimum = Math.min(minAssistantWidth, maxAssistantWidth);
+                    return {{ usable, maxAssistantWidth, effectiveMinimum }};
+                }}
+
+                function applyWidth(requestedWidth, persist, minimumOverride) {{
+                    const sizes = measurements();
+                    const minimumWidth = Number.isFinite(minimumOverride)
+                        ? Math.min(minimumOverride, sizes.maxAssistantWidth)
+                        : sizes.effectiveMinimum;
+                    const width = Math.min(
+                        sizes.maxAssistantWidth,
+                        Math.max(minimumWidth, requestedWidth),
+                    );
+                    row.style.setProperty("--sym-assistant-panel-width", `${{width}}px`);
+                    handle.setAttribute("aria-valuenow", String(Math.round((100 * width) / sizes.usable)));
+                    if (persist) {{
+                        hostWindow.sessionStorage.setItem(storageKey, String(width / sizes.usable));
+                    }}
+                }}
+
+                function applySavedWidth() {{
+                    const ratio = Number.parseFloat(hostWindow.sessionStorage.getItem(storageKey));
+                    if (Number.isFinite(ratio) && ratio > 0 && ratio < 1) {{
+                        applyWidth(ratio * measurements().usable, false);
+                    }}
+                }}
+
+                let resizing = false;
+                let activePointerId = null;
+                let dragStartClientX = 0;
+                let dragStartAssistantWidth = 0;
+                let dragMinimumAssistantWidth = 0;
+                let pendingClientX = null;
+                let resizeFrame = null;
+                disposeHandle = () => {{
+                    finishResize();
+                    handle.remove();
+                    doc.body.classList.remove("sym-assistant-resizing");
+                }};
+
+                function applyPendingPointerWidth() {{
+                    resizeFrame = null;
+                    if (!resizing || pendingClientX === null) return;
+                    const pointerDelta = dragStartClientX - pendingClientX;
+                    applyWidth(
+                        dragStartAssistantWidth + pointerDelta,
+                        false,
+                        dragMinimumAssistantWidth,
+                    );
+                    pendingClientX = null;
+                }}
+
+                function queuePointerWidth(clientX) {{
+                    pendingClientX = clientX;
+                    if (resizeFrame === null) {{
+                        resizeFrame = hostWindow.requestAnimationFrame(applyPendingPointerWidth);
+                    }}
+                }}
+
+                handle.addEventListener("pointerdown", (event) => {{
+                    if (event.button !== 0) return;
+                    resizing = true;
+                    activePointerId = event.pointerId;
+                    dragStartClientX = event.clientX;
+                    dragStartAssistantWidth = assistantColumn.getBoundingClientRect().width;
+                    dragMinimumAssistantWidth = Math.min(
+                        measurements().effectiveMinimum,
+                        dragStartAssistantWidth,
+                    );
+                    handle.dataset.resizing = "true";
+                    doc.body.classList.add("sym-assistant-resizing");
+                    try {{
+                        handle.setPointerCapture(event.pointerId);
+                    }} catch (_error) {{
+                        // Parent-document listeners still keep the drag reliable.
+                    }}
+                    event.preventDefault();
+                }}, listenerOptions);
+                function trackResize(event) {{
+                    if (!resizing || event.pointerId !== activePointerId) return;
+                    if ((event.buttons & 1) === 0) {{
+                        finishResize(event);
+                        return;
+                    }}
+                    queuePointerWidth(event.clientX);
+                    if (event.cancelable) event.preventDefault();
+                }}
+                function finishResize(event) {{
+                    if (!resizing) return;
+                    if (
+                        event
+                        && Number.isInteger(event.pointerId)
+                        && activePointerId !== null
+                        && event.pointerId !== activePointerId
+                    ) return;
+
+                    if (resizeFrame !== null) {{
+                        hostWindow.cancelAnimationFrame(resizeFrame);
+                        resizeFrame = null;
+                    }}
+                    if (pendingClientX !== null) {{
+                        const pointerDelta = dragStartClientX - pendingClientX;
+                        applyWidth(
+                            dragStartAssistantWidth + pointerDelta,
+                            false,
+                            dragMinimumAssistantWidth,
+                        );
+                        pendingClientX = null;
+                    }}
+
+                    const pointerId = activePointerId;
+                    resizing = false;
+                    activePointerId = null;
+                    delete handle.dataset.resizing;
+                    doc.body.classList.remove("sym-assistant-resizing");
+                    try {{
+                        if (pointerId !== null && handle.hasPointerCapture(pointerId)) {{
+                            handle.releasePointerCapture(pointerId);
+                        }}
+                    }} catch (_error) {{
+                        // Capture may already be gone after pointercancel or window blur.
+                    }}
+                    applyWidth(
+                        assistantColumn.getBoundingClientRect().width,
+                        true,
+                        dragMinimumAssistantWidth,
+                    );
+                }}
+                doc.addEventListener("pointermove", trackResize, pointerOptions);
+                doc.addEventListener("pointerup", finishResize, pointerOptions);
+                doc.addEventListener("pointercancel", finishResize, pointerOptions);
+                handle.addEventListener("lostpointercapture", finishResize, listenerOptions);
+                hostWindow.addEventListener("blur", finishResize, listenerOptions);
+                handle.addEventListener("keydown", (event) => {{
+                    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                    const direction = event.key === "ArrowLeft" ? 1 : -1;
+                    applyWidth(assistantColumn.getBoundingClientRect().width + (direction * 24), true);
+                    event.preventDefault();
+                }}, listenerOptions);
+                handle.addEventListener("dblclick", () => {{
+                    applyWidth(defaultRatio * measurements().usable, true);
+                }}, listenerOptions);
+
+                applySavedWidth();
+                hostWindow.addEventListener("resize", applySavedWidth, listenerOptions);
+            }}
+
+            install(0);
+        }})();
+        </script>
+    """
+
+
+def render_assistant_panel_resizer() -> None:
+    render_version = int(st.session_state.get("assistant_panel_resize_version", 0))
+    components.html(
+        assistant_panel_resizer_html(render_version),
+        height=0,
+        width=0,
+    )
+
+
+def assistant_panel_resizer_cleanup_html() -> str:
+    """Remove parent-DOM resize state after the Assistant column is closed."""
+    return """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            if (window.parent.__hydroagentAssistantResizeCleanup) {
+                window.parent.__hydroagentAssistantResizeCleanup();
+            }
+            doc.querySelectorAll(".sym-assistant-resize-handle").forEach((node) => node.remove());
+            doc.body.classList.remove("sym-assistant-resizing");
+            doc.querySelectorAll(
+                ".sym-workflow-main-column, .sym-workflow-toggle-column, " +
+                ".sym-workflow-assistant-column"
+            ).forEach((column) => {
+                const row = column.parentElement;
+                if (row) row.style.removeProperty("--sym-assistant-panel-width");
+                column.classList.remove(
+                    "sym-workflow-main-column",
+                    "sym-workflow-toggle-column",
+                    "sym-workflow-assistant-column"
+                );
+            });
+        })();
+        </script>
+    """
+
+
+def cleanup_assistant_panel_resizer() -> None:
+    components.html(assistant_panel_resizer_cleanup_html(), height=0, width=0)
 
 
 def spatial_input_css() -> str:
-    """Fixed-width pour point / bounding box fields on one row."""
+    """Keep spatial inputs and clear buttons within their responsive columns."""
     return """
-    div[class*="st-key-pour_point_input"] {
-        max-width: 24rem !important;
-        width: 24rem !important;
-    }
-    div[class*="st-key-bounding_box_input"] {
-        max-width: 24rem !important;
-        width: 24rem !important;
-    }
+    div[class*="st-key-pour_point_input"],
+    div[class*="st-key-bounding_box_input"],
     div.st-key-clear_selected_pour_point,
     div.st-key-clear_selected_bbox {
-        max-width: 24rem !important;
-        width: 24rem !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        box-sizing: border-box;
     }
     div[class*="st-key-pour_point_input"] [data-testid="stTextInputRootElement"],
-    div[class*="st-key-bounding_box_input"] [data-testid="stTextInputRootElement"] {
-        max-width: 100% !important;
-    }
+    div[class*="st-key-bounding_box_input"] [data-testid="stTextInputRootElement"],
     div.st-key-clear_selected_pour_point [data-testid="stButton"],
     div.st-key-clear_selected_bbox [data-testid="stButton"] {
         width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
     }
     """
 
 
 def workflow_panel_surface_css() -> str:
-    """Grey workflow column surfaces (match Streamlit sidebar tone)."""
+    """Workflow panel containment and stacking rules."""
     return """
-    .sym-assistant-styled,
-    .sym-main-styled,
-    .sym-assistant-styled [data-testid="stVerticalBlock"],
-    .sym-main-styled [data-testid="stVerticalBlock"] {
-        background-color: #f0f2f6 !important;
-    }
-    @media (prefers-color-scheme: dark) {
-        .sym-assistant-styled,
-        .sym-main-styled,
-        .sym-assistant-styled [data-testid="stVerticalBlock"],
-        .sym-main-styled [data-testid="stVerticalBlock"] {
-            background-color: #262730 !important;
-        }
-    }
     .right-panel {
         border: none;
         border-radius: 0;
@@ -752,60 +1239,236 @@ def workflow_panel_surface_css() -> str:
         position: relative !important;
         z-index: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > [data-testid="column"]:last-child {
         position: relative !important;
         z-index: 5 !important;
     }
     """
 
 
-def render_workflow_panel_dom_hooks() -> None:
-    """Tag workflow scroll panels for button styling and grey backgrounds."""
-    components.html(
-        """
+def workflow_panel_dom_hooks_html() -> str:
+    """Parent-page hooks for workflow styling and nested-scroll handoff."""
+    return """
         <script>
         (function () {
             const doc = window.parent.document;
-            function panelBg() {
-                const sidebar = doc.querySelector('[data-testid="stSidebar"]');
-                return sidebar
-                    ? getComputedStyle(sidebar).backgroundColor
-                    : "rgb(240, 242, 246)";
+            const hostWindow = doc.defaultView;
+            const hookHost = window.frameElement && window.frameElement.closest(
+                '[data-testid="stElementContainer"]'
+            );
+            if (hookHost) {
+                hookHost.style.setProperty("position", "absolute", "important");
+                hookHost.style.setProperty("width", "0", "important");
+                hookHost.style.setProperty("height", "0", "important");
+                hookHost.style.setProperty("overflow", "hidden", "important");
             }
-            function paintColumnAncestors(node, bg) {
-                let parent = node ? node.parentElement : null;
-                for (let i = 0; i < 12 && parent; i += 1) {
-                    const testId = parent.getAttribute && parent.getAttribute("data-testid");
-                    if (testId === "column" || testId === "stColumn") {
-                        parent.style.setProperty("background-color", bg, "important");
-                        return;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-            function markPanel(markerClass, styledClass) {
+            function panelForMarker(markerClass) {
                 const marker = doc.querySelector("." + markerClass);
-                if (!marker) return;
-                const bg = panelBg();
+                if (!marker) return null;
                 let el = marker.parentElement;
                 for (let i = 0; i < 40 && el; i += 1) {
-                    if (el.getAttribute && el.getAttribute("data-testid") === "stVerticalBlockBorderWrapper") {
-                        el.classList.add(styledClass);
-                        el.style.setProperty("background-color", bg, "important");
-                        paintColumnAncestors(el, bg);
-                        return;
+                    const testId = el.getAttribute && el.getAttribute("data-testid");
+                    const isBorderWrapper = testId === "stVerticalBlockBorderWrapper";
+                    const isScrollableBlock = testId === "stVerticalBlock"
+                        && /(auto|scroll)/.test(hostWindow.getComputedStyle(el).overflowY);
+                    if (isBorderWrapper || isScrollableBlock) {
+                        return el;
                     }
                     el = el.parentElement;
                 }
+                return null;
+            }
+            function markPanel(markerClass, styledClass) {
+                const panel = panelForMarker(markerClass);
+                if (!panel) return null;
+                panel.classList.add(styledClass);
+                return panel;
             }
             function refreshPanels() {
-                markPanel("sym-main-panel", "sym-main-styled");
-                markPanel("sym-assistant-panel", "sym-assistant-styled");
+                doc.querySelectorAll('[data-sym-workflow-painted="true"]').forEach((element) => {
+                    element.style.removeProperty("background-color");
+                    delete element.dataset.symWorkflowPainted;
+                });
+                doc.querySelectorAll(".sym-main-styled, .sym-assistant-styled").forEach((panel) => {
+                    panel.style.removeProperty("background-color");
+                });
+                const mainPanel = markPanel("sym-main-panel", "sym-main-styled");
+                const assistantPanel = markPanel("sym-assistant-panel", "sym-assistant-styled");
+                sizeWorkflowPanels(mainPanel, assistantPanel);
             }
+
+            function layoutForPanel(panel) {
+                let current = panel ? panel.parentElement : null;
+                for (let i = 0; i < 6 && current; i += 1) {
+                    const testId = current.getAttribute && current.getAttribute("data-testid");
+                    if (testId === "stLayoutWrapper") return current;
+                    if (testId === "column" || testId === "stColumn") return null;
+                    current = current.parentElement;
+                }
+                return null;
+            }
+
+            function sizeWorkflowPanels(
+                mainPanel = panelForMarker("sym-main-panel"),
+                assistantPanel = panelForMarker("sym-assistant-panel")
+            ) {
+                if (!mainPanel) return;
+                const row = mainPanel.closest('[data-testid="stHorizontalBlock"]');
+                if (!row) return;
+                const rowRect = row.getBoundingClientRect();
+                const rowTop = rowRect.top;
+                const availableHeight = Math.max(
+                    320,
+                    Math.floor(hostWindow.innerHeight - rowTop - 8)
+                );
+                row.style.setProperty(
+                    "--sym-workflow-panel-height",
+                    availableHeight + "px"
+                );
+                const columns = Array.from(row.children).filter((element) => {
+                    const testId = element.getAttribute && element.getAttribute("data-testid");
+                    return testId === "column" || testId === "stColumn";
+                });
+                const columnBlocks = columns.flatMap((column) =>
+                    Array.from(column.children).filter(
+                        (element) => element.getAttribute
+                            && element.getAttribute("data-testid") === "stVerticalBlock"
+                    )
+                );
+                const sizedElements = new Set([row, ...columns, ...columnBlocks]);
+                for (const panel of [mainPanel, assistantPanel]) {
+                    if (!panel) continue;
+                    const layout = layoutForPanel(panel);
+                    sizedElements.add(panel);
+                    if (layout) sizedElements.add(layout);
+                }
+                for (const element of sizedElements) {
+                    element.style.setProperty("height", availableHeight + "px", "important");
+                    element.style.setProperty("max-height", availableHeight + "px", "important");
+                    element.dataset.symWorkflowSized = "true";
+                }
+            }
+
+            function workflowPanelFor(target) {
+                if (!(target instanceof hostWindow.Element)) return null;
+                const direct = target.closest(".sym-main-styled, .sym-assistant-styled");
+                if (direct) return direct;
+                const column = target.closest('[data-testid="column"], [data-testid="stColumn"]');
+                if (!column) return null;
+                return column.querySelector(".sym-main-styled, .sym-assistant-styled");
+            }
+
+            function nearestNestedScroller(target, panel) {
+                let node = target;
+                while (node && node !== panel) {
+                    if (node instanceof hostWindow.HTMLElement) {
+                        const style = hostWindow.getComputedStyle(node);
+                        const scrollable = /(auto|scroll)/.test(style.overflowY);
+                        if (scrollable && node.scrollHeight > node.clientHeight + 1) return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+
+            function canScroll(element, deltaY) {
+                if (deltaY < 0) return element.scrollTop > 1;
+                return element.scrollTop + element.clientHeight < element.scrollHeight - 1;
+            }
+
+            function wheelPixels(event, panel) {
+                if (event.deltaMode === 1) return event.deltaY * 16;
+                if (event.deltaMode === 2) return event.deltaY * panel.clientHeight;
+                return event.deltaY;
+            }
+
+            function handOffNestedScroll(event) {
+                if (!event.deltaY) return;
+                const panel = workflowPanelFor(event.target);
+                if (!panel) return;
+                const nested = nearestNestedScroller(event.target, panel);
+                if (nested && canScroll(nested, event.deltaY)) return;
+
+                const deltaY = wheelPixels(event, panel);
+                if (!canScroll(panel, deltaY)) return;
+                if (event.cancelable) event.preventDefault();
+                panel.scrollTop += deltaY;
+            }
+
             refreshPanels();
+            hostWindow.requestAnimationFrame(refreshPanels);
+            const resizeController = new AbortController();
+            hostWindow.addEventListener("resize", refreshPanels, {
+                signal: resizeController.signal,
+            });
+            window.addEventListener("beforeunload", () => resizeController.abort(), {
+                once: true,
+            });
+            if (!doc.documentElement.dataset.symWorkflowWheelHandoff) {
+                doc.addEventListener("wheel", handOffNestedScroll, {
+                    capture: true,
+                    passive: false,
+                });
+                doc.documentElement.dataset.symWorkflowWheelHandoff = "true";
+            }
         })();
         </script>
-        """,
+    """
+
+
+def workflow_layout_cleanup_html() -> str:
+    """Remove workflow-only DOM sizing when Streamlit reuses columns on another page."""
+    return """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            if (window.parent.__hydroagentAssistantResizeCleanup) {
+                window.parent.__hydroagentAssistantResizeCleanup();
+            }
+            doc.querySelectorAll(".sym-assistant-resize-handle").forEach((node) => node.remove());
+            doc.querySelectorAll(
+                ".sym-workflow-main-column, .sym-workflow-toggle-column, " +
+                ".sym-workflow-assistant-column"
+            ).forEach((column) => {
+                for (const property of ["flex", "width", "min-width", "position", "overflow"]) {
+                    column.style.removeProperty(property);
+                }
+                column.classList.remove(
+                    "sym-workflow-main-column",
+                    "sym-workflow-toggle-column",
+                    "sym-workflow-assistant-column"
+                );
+            });
+            doc.querySelectorAll('[data-sym-workflow-painted="true"]').forEach((column) => {
+                column.style.removeProperty("background-color");
+                delete column.dataset.symWorkflowPainted;
+            });
+            doc.querySelectorAll('[data-sym-workflow-sized="true"]').forEach((panel) => {
+                panel.style.removeProperty("height");
+                panel.style.removeProperty("max-height");
+                delete panel.dataset.symWorkflowSized;
+            });
+            doc.querySelectorAll(".sym-main-styled, .sym-assistant-styled").forEach((panel) => {
+                panel.style.removeProperty("background-color");
+                panel.classList.remove("sym-main-styled", "sym-assistant-styled");
+            });
+            doc.querySelectorAll('[data-testid="stHorizontalBlock"]').forEach((row) => {
+                row.style.removeProperty("--sym-assistant-panel-width");
+                row.style.removeProperty("--sym-workflow-panel-height");
+            });
+        })();
+        </script>
+    """
+
+
+def cleanup_workflow_layout() -> None:
+    components.html(workflow_layout_cleanup_html(), height=0, width=0)
+
+
+def render_workflow_panel_dom_hooks() -> None:
+    """Tag workflow panels and install their nested-scroll behavior."""
+    components.html(
+        workflow_panel_dom_hooks_html(),
         height=0,
         width=0,
     )
@@ -981,7 +1644,7 @@ def sanitize_config_token(name: str) -> str:
 
 def reuse_existing_domain_data_from_session(plan_cfg: dict | None = None) -> bool:
     plan_cfg = plan_cfg or {}
-    user_request = (
+    user_request = phrase_matching_text(
         user_prompt_for_metadata()
         or conversation_text_for_plan_rules()
         or s(st.session_state.get("nl_request", ""))
@@ -1059,7 +1722,9 @@ def finalize_spec_for_symfluence(spec_dict: dict) -> dict:
     raw_expid = spec_dict.get("experiment_id") or "exp"
     basin = symfluence_domain_name(str(raw_domain), str(raw_expid))
     expid = sanitize_config_token(str(raw_expid)) or str(raw_expid)
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     run_folder, sym_domain = resolve_run_workspace(
         basin,
         expid,
@@ -1100,18 +1765,13 @@ def mark_spatial_inputs_stale() -> None:
 
 
 def workflow_input_map_widget_key() -> str:
+    """Stable st_folium key so pan/zoom survive pour-point and bounding-box picks.
+
+    streamlit-folium remounts (and resets the camera) whenever this key or the
+    base-map Leaflet JS changes. Selection overlays belong in a FeatureGroup.
+    """
     version = int(st.session_state.get("workflow_map_widget_version", 0))
-    pour_hidden = int(bool(st.session_state.get("pour_point_map_hidden")))
-    bbox_hidden = int(bool(st.session_state.get("bbox_map_hidden")))
-    pour = None if pour_hidden else _resolve_pour_point_lat_lon()
-    bbox = None if bbox_hidden else _resolve_bounding_box_bounds()
-    pour_tag = (
-        "none"
-        if pour is None
-        else f"{pour[0]:.5f}_{pour[1]:.5f}"
-    )
-    bbox_tag = "none" if bbox is None else "set"
-    return f"input_map_v{version}_ph{pour_hidden}_bh{bbox_hidden}_{pour_tag}_{bbox_tag}"
+    return f"workflow_input_map_v{version}"
 
 
 def pour_point_widget_key() -> str:
@@ -1142,7 +1802,16 @@ def visible_selected_bbox() -> str:
     return s(st.session_state.selected_bounding_box) or bounding_box_input_value()
 
 
+def _on_workflow_input_map_change() -> None:
+    """Apply map clicks before widgets render so markers appear without a second rerun."""
+    handle_workflow_map_selection(
+        st.session_state.get(workflow_input_map_widget_key()),
+        rerun=False,
+    )
+
+
 def bump_workflow_map_widget_version() -> None:
+    """Force a map remount. Avoid on coordinate picks — that resets pan/zoom."""
     st.session_state.workflow_map_widget_version = int(
         st.session_state.get("workflow_map_widget_version", 0)
     ) + 1
@@ -1238,6 +1907,7 @@ def _clear_spatial_from_run_plan(*, pour: bool = False, bbox: bool = False) -> N
 
 
 def clear_pour_point_selection(*, refresh_editor: bool = True, remount_plan_editor: bool = False) -> None:
+    mark_workflow_ui_fields_explicit("pour_point_coords")
     st.session_state.pour_point_map_hidden = True
     st.session_state.map_lat = None
     st.session_state.map_lon = None
@@ -1246,13 +1916,13 @@ def clear_pour_point_selection(*, refresh_editor: bool = True, remount_plan_edit
     bump_spatial_input_widget_version()
     _clear_spatial_from_run_plan(pour=True)
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     if refresh_editor:
         refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
     bump_config_preview_version()
 
 
 def clear_bounding_box_selection(*, refresh_editor: bool = True, remount_plan_editor: bool = False) -> None:
+    mark_workflow_ui_fields_explicit("bounding_box_coords")
     st.session_state.bbox_map_hidden = True
     st.session_state.bbox_point_1 = None
     st.session_state.bbox_point_2 = None
@@ -1261,7 +1931,6 @@ def clear_bounding_box_selection(*, refresh_editor: bool = True, remount_plan_ed
     bump_spatial_input_widget_version()
     _clear_spatial_from_run_plan(bbox=True)
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     if refresh_editor:
         refresh_plan_editor_from_state(force=True, remount=remount_plan_editor)
     bump_config_preview_version()
@@ -1331,12 +2000,8 @@ def resolve_requested_plan_dependencies(plan: dict, user_request: str = "") -> d
         user_request,
         catalog=catalog,
         data_dir=SYMFLUENCE_DATA_DIR,
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
     )
-
-def run_py_tool(script_path: str, args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    cmd = [sys.executable, script_path] + args
-    return run_command(cmd, cwd=cwd, env=_subprocess_env())
-
 
 def _subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
@@ -1520,8 +2185,8 @@ def build_symfluence_step_cmd(step: str, config_path: Path) -> list[str]:
 DANGER_STEPS = {"run_model", "calibrate_model"}
 
 GPT_MODELS = {
-    "GPT-5 (Recommended)": ["gpt-5-mini", "gpt-5.2", "gpt-5.2-pro"],
-    "GPT-4.x (Legacy / Compatibility)": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+    "GPT-5.6": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+    "GPT-5 Mini": ["gpt-5-mini"],
 }
 ALL_GPT_MODELS = [m for group in GPT_MODELS.values() for m in group]
 
@@ -1533,33 +2198,24 @@ GEMINI_MODELS = {
 ALL_GEMINI_MODELS = [m for group in GEMINI_MODELS.values() for m in group]
 
 CLAUDE_MODELS = {
-    "Claude 5 (Recommended)": ["claude-sonnet-5"],
-    "Claude 4.x": [
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
+    "Claude 4.x (Recommended)": [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
     ],
-    "Claude 3.x (Legacy)": [
-        "claude-3-7-sonnet-latest",
+    "Claude 3.7": ["claude-3-7-sonnet-latest"],
+    "Claude 3.5 (Legacy)": [
         "claude-3-5-sonnet-latest",
-        "claude-haiku-4-5",
+        "claude-3-5-haiku-latest",
     ],
 }
 ALL_CLAUDE_MODELS = [m for group in CLAUDE_MODELS.values() for m in group]
 
 CLAUDE_MODEL_LABELS = {
-    "claude-sonnet-5": "Sonnet 5",
-    "claude-opus-4-8": "Opus 4.8",
-    "claude-sonnet-4-6": "Sonnet 4.6",
-    "claude-sonnet-4-5": "Sonnet 4.5",
+    "claude-sonnet-4-20250514": "Sonnet 4",
+    "claude-opus-4-20250514": "Opus 4",
     "claude-3-7-sonnet-latest": "Sonnet 3.7",
     "claude-3-5-sonnet-latest": "Sonnet 3.5",
-    "claude-haiku-4-5": "Haiku 4.5",
-}
-
-RETIRED_CLAUDE_MODEL_ALIASES = {
-    "claude-sonnet-4-20250514": "claude-sonnet-5",
-    "claude-opus-4-20250514": "claude-opus-4-8",
+    "claude-3-5-haiku-latest": "Haiku 3.5",
 }
 
 
@@ -1588,18 +2244,8 @@ LLM_PROVIDER_PACKAGES = {
 DEFAULT_LLM_MODEL = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-2.5-flash",
-    "claude": "claude-sonnet-5",
+    "claude": "claude-sonnet-4-20250514",
 }
-
-
-def resolve_llm_model(model_id: str, provider: str) -> str:
-    model_id = s(model_id) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
-    if provider == "claude":
-        model_id = RETIRED_CLAUDE_MODEL_ALIASES.get(model_id, model_id)
-        available = llm_models_for_provider("claude")
-        if model_id not in available:
-            model_id = DEFAULT_LLM_MODEL.get("claude", available[0])
-    return model_id
 
 
 def llm_models_for_provider(provider: str) -> list[str]:
@@ -1658,14 +2304,23 @@ def llm_provider_install_hint(provider: str) -> str:
 
 if "api_keys" not in st.session_state:
     st.session_state.api_keys = {}
+if "_api_key_sources" not in st.session_state:
+    st.session_state["_api_key_sources"] = {}
+
+st.session_state["_api_key_sources"].update(
+    load_api_keys_from_environment(st.session_state.api_keys)
+)
 
 persistent_cfg = load_persistent_config()
 for _provider in ("openai", "gemini", "claude"):
     _saved_key = (persistent_cfg or {}).get(f"{_provider}_api_key")
     if _saved_key and not st.session_state.api_keys.get(_provider):
         st.session_state.api_keys[_provider] = _saved_key
+        st.session_state["_api_key_sources"][_provider] = "local settings"
 
 st.session_state.setdefault("run_plan", None)
+st.session_state.setdefault("simulation_plan", None)
+st.session_state.setdefault("calibration_plan", None)
 st.session_state.setdefault("execute_plan", False)
 st.session_state.setdefault("workflow_executing", False)
 st.session_state.setdefault("execution_log_text", "")
@@ -1693,6 +2348,8 @@ defaults = {
     "bbox_selected": False,
     "pour_point_map_hidden": False,
     "bbox_map_hidden": False,
+    "show_pour_point_layer": False,
+    "show_bounding_box_layer": False,
     "show_dem_layer": False,
     "show_landclass_layer": False,
     "show_soilclass_layer": False,
@@ -1711,12 +2368,15 @@ defaults = {
     "gpt_model": "gpt-5-mini",
     "nl_request": "",
     "user_prompt": "",
-    "langprompt_enrich": True,
+    "langprompt_enrich": DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+    "langprompt_save": DEFAULT_SAVE_PROMPT_HISTORY,
+    "enable_prompt_phrase_matching": False,
     "chat_messages": [],
     "workflow_chat_compose_version": 0,
     "plan_editor_version": 0,
     "assistant_panel_tabs": "Prompt",
     "assistant_panel_open": True,
+    "assistant_panel_resize_version": 0,
     "hydroagent_nav_page": "Workflows",
     "workflow_section": "Input",
     "input_panel_widget_version": 0,
@@ -1738,7 +2398,7 @@ defaults = {
     "optimization_metric": "KGE",
     "optimization_target": "streamflow",
     "calibration_timestep": "daily",
-    "iterations": 50,
+    "iterations": 20,
     "population_size": 10,
 }
 
@@ -1762,6 +2422,7 @@ WORKFLOW_DISPLAY_ORDER = [
     ("model_agnostic_preprocessing", "MAP"),
     ("model_specific_preprocessing", "MSP"),
     ("run_model", "model"),
+    ("calibrate_model", "calibrate"),
     ("postprocess_results", "postprocess"),
 ]
 
@@ -1835,11 +2496,46 @@ def refresh_workflow_execution_log() -> tuple[bool, str, Path | None]:
     return running, log_text, log_path
 
 
-def render_workflow_output_execution_section() -> None:
-    """Workflow progress and command output on the Output tab (middle panel)."""
+@st.fragment
+def render_output_review_layers_fragment() -> None:
+    """Rebuild only the review map when layer controls change."""
+    st.session_state["_review_layer_artifact_signature"] = (
+        review_layer_artifact_signature()
+    )
+    available = render_map_layer_controls("out")
+    if available == 0 and symfluence_domain_shapefile_paths():
+        st.caption(
+            "No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first."
+        )
+    output_map = build_pour_point_map(
+        show_pour_point_layer=st.session_state.show_pour_point_layer,
+        show_bounding_box_layer=st.session_state.show_bounding_box_layer,
+        show_dem_layer=st.session_state.show_dem_layer,
+        show_landclass_layer=st.session_state.show_landclass_layer,
+        show_soilclass_layer=st.session_state.show_soilclass_layer,
+        show_riverbasins_layer=st.session_state.show_riverbasins_layer,
+        show_hrugru_layer=st.session_state.show_hrugru_layer,
+        show_forcing_layer=st.session_state.show_forcing_layer,
+        show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
+        fit_data_when_visible=True,
+    )
+    render_workflow_map(
+        output_map,
+        key="output_layers_map",
+        height=360,
+        feature_group_to_add=build_spatial_selection_feature_group(
+            show_pour_point_layer=st.session_state.show_pour_point_layer,
+            show_bounding_box_layer=st.session_state.show_bounding_box_layer,
+        ),
+    )
+
+
+def _render_execution_log_body() -> None:
+    """Draw workflow progress + command output from execution.log."""
     global output_box, progress_box
 
     running, log_text, log_path = refresh_workflow_execution_log()
+    rerun_if_review_layer_artifacts_changed()
 
     if st.session_state.pop("_workflow_just_started", False):
         st.success("Workflow started in the background.")
@@ -1872,6 +2568,20 @@ def render_workflow_output_execution_section() -> None:
 
     if log_path is not None:
         st.caption(f"Log file: `{log_path}`")
+
+
+@st.fragment(run_every=5)
+def _render_execution_log_while_running() -> None:
+    _render_execution_log_body()
+
+
+def render_workflow_output_execution_section() -> None:
+    """Workflow progress and command output on the Output tab (middle panel)."""
+    run_dir = active_workflow_run_dir()
+    if run_dir is not None and workflow_is_running(run_dir):
+        _render_execution_log_while_running()
+        return
+    _render_execution_log_body()
 
 
 def clean_cfg_for_safe_run(cfg: dict) -> dict:
@@ -1960,7 +2670,9 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
         return False
     spec = spec or {}
     cfg = cfg or {}
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     if is_lumped_workflow(spec, user_request):
         return False
     domain = s(spec.get("domain_name") or cfg.get("DOMAIN_NAME")).lower()
@@ -1968,6 +2680,14 @@ def is_semi_distributed_workflow(spec: dict, cfg: dict | None = None) -> bool:
         return True
     domain_def = s(spec.get("domain_def") or cfg.get("DOMAIN_DEFINITION_METHOD")).lower()
     discretization = s(spec.get("discretization") or cfg.get("DOMAIN_DISCRETIZATION")).upper()
+    model = s(spec.get("hydrological_model") or cfg.get("HYDROLOGICAL_MODEL")).upper()
+    routing = s(spec.get("routing_model") or cfg.get("ROUTING_MODEL")).lower()
+    if (
+        model == "SUMMA"
+        and "mizu" in routing
+        and domain_def in ("delineate", "semidistributed", "semi_distributed")
+    ):
+        return True
     steps = spec.get("steps") or []
     if isinstance(steps, list) and {"define_domain", "discretize_domain"} <= set(steps):
         if domain_def in ("delineate", "semidistributed", "semi_distributed"):
@@ -1988,7 +2708,7 @@ def apply_semi_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
         return cfg
     defaults = {
         "DELINEATION_METHOD": "stream_threshold",
-        "STREAM_THRESHOLD": 5000.0,
+        "STREAM_THRESHOLD": 1000.0,
         "MIN_HRU_SIZE": 0.0,
         "MIN_GRU_SIZE": 0.0,
         "RADIATION_CLASS_NUMBER": 1,
@@ -2018,7 +2738,7 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
     domain_name = s(spec.get("domain_name") or cfg.get("DOMAIN_NAME"))
     defaults = {
         "DELINEATION_METHOD": "stream_threshold",
-        "STREAM_THRESHOLD": 5000.0,
+        "STREAM_THRESHOLD": 1000.0,
         "MIN_HRU_SIZE": 0.0,
         "MIN_GRU_SIZE": 0.0,
         "RADIATION_CLASS_NUMBER": 1,
@@ -2041,7 +2761,9 @@ def apply_elevation_distributed_config_defaults(cfg: dict, spec: dict) -> dict:
 
 def apply_lumped_workflow_defaults(cfg: dict, spec: dict, user_request: str = "") -> dict:
     """Align lumped-basin configs with SYMFLUENCE examples (GRUs + lumped routing)."""
-    user_request = user_request or user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_request or user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     if not is_lumped_workflow(spec, user_request):
         return cfg
     defaults = {
@@ -2088,9 +2810,6 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
         "station_id": "STATION_ID",
         "routing_model": "ROUTING_MODEL",
         "pet_method": "PET_METHOD",
-        "spinup_period": "SPINUP_PERIOD",
-        "calibration_period": "CALIBRATION_PERIOD",
-        "evaluation_period": "EVALUATION_PERIOD",
         "discretization": "DOMAIN_DISCRETIZATION",
         "optimization_target": "OPTIMIZATION_TARGET",
         "optimization_metric": "OPTIMIZATION_METRIC",
@@ -2105,7 +2824,9 @@ def reapply_spec_overrides(cfg: dict, spec: dict) -> dict:
         "data_access": "DATA_ACCESS",
     }
 
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     for spec_key, yaml_key in mapping.items():
         if spec.get(spec_key) is None:
             continue
@@ -2160,7 +2881,7 @@ def is_new_map_click(lat: float, lon: float) -> bool:
     return True
 
 
-def handle_workflow_map_selection(map_data: dict | None) -> None:
+def handle_workflow_map_selection(map_data: dict | None, *, rerun: bool = True) -> None:
     """Apply pour point / bounding box map clicks; ignore stale st_folium replays."""
     if st.session_state.pop("_ignore_map_clicks_once", False):
         return
@@ -2168,8 +2889,7 @@ def handle_workflow_map_selection(map_data: dict | None) -> None:
         return
 
     clicked = map_data["last_clicked"]
-    lat = clicked["lat"]
-    lon = clicked["lng"]
+    lat, lon = _normalize_map_click_coords(clicked["lat"], clicked["lng"])
     if _map_click_is_suppressed(lat, lon):
         return
     if not is_new_map_click(lat, lon):
@@ -2179,7 +2899,8 @@ def handle_workflow_map_selection(map_data: dict | None) -> None:
         current = format_pour_point(lat, lon)
         if s(st.session_state.selected_pour_point) != current:
             set_pour_point_from_map(lat, lon)
-            st.rerun()
+            if rerun:
+                st.rerun()
         return
 
     if st.session_state.map_mode != "bounding_box":
@@ -2192,18 +2913,21 @@ def handle_workflow_map_selection(map_data: dict | None) -> None:
         st.session_state.bbox_point_2 = None
         st.session_state.bbox_selected = False
         sync_spatial_fields_to_run_plan(refresh_editor=True)
-        st.rerun()
+        if rerun:
+            st.rerun()
     elif not st.session_state.bbox_selected:
         lat1, lon1 = st.session_state.bbox_point_1
         set_bounding_box_from_points(lat1, lon1, lat, lon)
-        st.rerun()
+        if rerun:
+            st.rerun()
     else:
         st.session_state.bbox_point_1 = (lat, lon)
         st.session_state.bbox_point_2 = None
         st.session_state.bbox_selected = False
         st.session_state.selected_bounding_box = ""
         mark_spatial_inputs_stale()
-        st.rerun()
+        if rerun:
+            st.rerun()
 
 
 def format_pour_point(lat: float, lon: float) -> str:
@@ -2229,12 +2953,14 @@ def sync_manual_inputs_to_selected() -> None:
 
 
 def on_pour_point_input_change() -> None:
+    mark_workflow_ui_fields_explicit("pour_point_coords")
     sync_manual_pour_point_to_map()
     sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
     bump_config_preview_version()
 
 
 def on_bounding_box_input_change() -> None:
+    mark_workflow_ui_fields_explicit("bounding_box_coords")
     sync_manual_bounding_box_to_map()
     sync_all_ui_fields_to_plan(refresh_editor=True, force_editor=True)
     bump_config_preview_version()
@@ -2250,6 +2976,7 @@ def sync_workflow_settings_to_plan(*, refresh_editor: bool = True) -> None:
 
 
 def on_input_domain_name_change() -> None:
+    mark_workflow_ui_fields_explicit("domain_name")
     st.session_state.domain_name = s(
         st.session_state.get(input_panel_widget_key("input_domain_name"))
     )
@@ -2257,6 +2984,7 @@ def on_input_domain_name_change() -> None:
 
 
 def on_input_experiment_id_change() -> None:
+    mark_workflow_ui_fields_explicit("experiment_id")
     st.session_state.experiment_id = s(
         st.session_state.get(input_panel_widget_key("input_experiment_id"))
     )
@@ -2295,11 +3023,25 @@ def hoist_plan_extra_config_to_spec(spec: dict) -> dict:
     return spec
 
 
+def _station_lookup_cfg_from_plan(plan_cfg: dict | None = None) -> dict:
+    """Plan config enriched with the current pour point for nearest-gauge lookup."""
+    plan_cfg = dict(plan_cfg or {})
+    pour = (
+        s(st.session_state.selected_pour_point)
+        or s(plan_cfg.get("pour_point_coords"))
+    )
+    if pour and not s(plan_cfg.get("pour_point_coords")):
+        plan_cfg["pour_point_coords"] = pour
+    return plan_cfg
+
+
 def build_spec_dict(plan_cfg: dict | None = None) -> dict:
     plan_cfg = plan_cfg or {}
     run_steps = (st.session_state.get("run_plan") or {}).get("steps") or []
+    active_plan = st.session_state.get("run_plan") or {}
+    calibration_plan = is_calibration_workflow_plan(active_plan)
     domain_name = s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name)
-    user_request = (
+    user_request = phrase_matching_text(
         user_prompt_for_metadata()
         or conversation_text_for_plan_rules()
         or s(st.session_state.get("nl_request", ""))
@@ -2370,26 +3112,41 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
         "hydrological_model": current_hydrological_model(plan_cfg),
         "forcing_dataset": s(lookup_plan_config(plan_cfg, "forcing_dataset", "FORCING_DATASET"))
         or s(st.session_state.forcing_dataset) or None,
-        "station_id": (
+    }
+
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg)
+    explicit_station = (
+        s(lookup_plan_config(plan_cfg, "station_id", "STATION_ID"))
+        or s(st.session_state.station_id)
+    )
+    if calibration_plan:
+        station_id = (
             resolve_station_id_from_plan(
-                plan_cfg,
-                user_prompt_for_metadata()
-                or conversation_text_for_plan_rules()
-                or s(st.session_state.get("nl_request", "")),
-                fallback=s(st.session_state.station_id),
+                station_lookup_cfg,
+                phrase_matching_text(
+                    user_prompt_for_metadata()
+                    or conversation_text_for_plan_rules()
+                    or s(st.session_state.get("nl_request", ""))
+                ),
+                fallback=explicit_station,
             )
             or None
-        ),
+        )
+    else:
+        station_id = explicit_station or None
+    if station_id:
+        spec["station_id"] = station_id
 
-        # Prefer plan/chat NUM_PROCESSES, then Input tab mpi widget
-        "num_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
-        "mpi_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
-
-        "log_level": "INFO",
-        "log_to_file": True,
-        "log_format": "detailed",
-        "force_rerun": True,
-    }
+    spec.update(
+        {
+            "num_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
+            "mpi_processes": resolve_num_processes_from_plan_cfg(plan_cfg) or int(st.session_state.mpi),
+            "log_level": "INFO",
+            "log_to_file": True,
+            "log_format": "detailed",
+            "force_rerun": True,
+        }
+    )
 
     # Preserve extra planner-provided config keys.
     # Important for notebook-specific options such as:
@@ -2400,26 +3157,44 @@ def build_spec_dict(plan_cfg: dict | None = None) -> dict:
 
     spec = wx.merge_advanced_into_spec(spec, plan_cfg)
 
-    user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    user_request = phrase_matching_text(
+        user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    )
     disc = lookup_plan_config(plan_cfg, "discretization", "DOMAIN_DISCRETIZATION")
     if disc is not None and s(disc):
         spec["discretization"] = symfluence_discretization_from_plan(plan_cfg, user_request)
 
     sym_domain = s(spec.get("domain_name"))
-    if plan_uses_local_data(plan_cfg, run_steps, conversation_text_for_plan_rules(), data_dir=SYMFLUENCE_DATA_DIR):
+    obs_cfg = {**plan_cfg, **spec}
+    if calibration_plan and sym_domain and domain_has_usable_local_streamflow(
+        SYMFLUENCE_DATA_DIR, sym_domain, obs_cfg
+    ):
         spec["DOWNLOAD_WSC_DATA"] = False
-    elif sym_domain and domain_has_local_streamflow(SYMFLUENCE_DATA_DIR, sym_domain):
-        spec["DOWNLOAD_WSC_DATA"] = False
+    elif (
+        calibration_plan
+        and s(spec.get("streamflow_data_provider") or plan_cfg.get("streamflow_data_provider") or "WSC").upper()
+        == "WSC"
+        and s(spec.get("station_id"))
+    ):
+        spec["DOWNLOAD_WSC_DATA"] = True
+
+    spec["steps"] = list(run_steps)
 
     return hoist_plan_extra_config_to_spec(spec)
 
 
-def store_run_plan(plan: dict | None) -> None:
-    """Persist a compact plan (planner keys only) in session state."""
+def store_run_plan(plan: dict | None, *, mode: str | None = None) -> None:
+    """Persist the active plan and the mode-specific plan slot."""
     if plan is None:
         st.session_state.run_plan = None
         return
-    st.session_state.run_plan = normalize_plan_for_storage(plan)
+    stored = normalize_plan_for_storage(plan)
+    plan_mode = s(mode or stored.get("workflow_plan_mode") or st.session_state.get("workflow_plan_mode"))
+    st.session_state.run_plan = stored
+    if plan_mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        st.session_state.simulation_plan = stored
+    elif plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        st.session_state.calibration_plan = stored
 
 
 def plan_editor_text_from_run_plan() -> str:
@@ -2484,6 +3259,8 @@ def _chat_message_has_literal_config(text: str) -> bool:
 
 def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
     """Apply deterministic chat parsers before/after LLM refinement."""
+    if not prompt_phrase_matching_enabled():
+        return _deep_copy_plan(plan), False
     before = canonical_plan_config(plan.get("config") or {})
     patched = preserve_explicit_config_fields_from_prompt(
         apply_chat_step_order_edits(
@@ -2508,6 +3285,8 @@ def apply_chat_message_to_plan(plan: dict, text: str) -> tuple[dict, bool]:
 
 def _confirm_domain_from_chat_message(plan: dict, user_message: str) -> dict:
     """Mark domain_name confirmed when the user explicitly sets it in chat."""
+    if not prompt_phrase_matching_enabled():
+        return plan
     if not isinstance(plan, dict) or not s(user_message):
         return plan
     out = dict(plan)
@@ -2537,6 +3316,7 @@ def commit_chat_plan_update(
         conversation_text,
         data_dir=SYMFLUENCE_DATA_DIR,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
     )
     sorted_steps = sort_plan_steps_by_workflow_order(list(new_plan.get("steps") or []))
     if sorted_steps:
@@ -2563,6 +3343,7 @@ def commit_chat_plan_update(
             conversation_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             skip_workflow_step_restore=False,
+            enable_prompt_matching=prompt_phrase_matching_enabled(),
         )
         if list(restored.get("steps") or []) != list(plan.get("steps") or []):
             store_run_plan(restored)
@@ -2626,20 +3407,6 @@ def _plan_config_spatial_value(plan_cfg: dict, field: str) -> str:
     if field == "bounding_box_coords":
         return s(lookup_plan_config(plan_cfg, "bounding_box_coords", "BOUNDING_BOX_COORDS"))
     return ""
-
-
-def _preserve_plan_scalar_when_ui_empty() -> frozenset[str]:
-    return frozenset(
-        {
-            "domain_name",
-            "experiment_id",
-            "domain_def",
-            "hydrological_model",
-            "forcing_dataset",
-            "experiment_time_start",
-            "experiment_time_end",
-        }
-    )
 
 
 def sync_spatial_fields_to_run_plan(*, refresh_editor: bool = False) -> None:
@@ -2885,10 +3652,12 @@ def get_required_config_fields_for_steps(
     required = {
         "domain_name",
         "experiment_id",
-        "pour_point_coords",
         "experiment_time_start",
         "experiment_time_end",
     }
+
+    if "create_pour_point" in steps:
+        required.add("pour_point_coords")
 
     config_fields = {
         "domain_name",
@@ -2969,10 +3738,9 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
         "domain_def": s(st.session_state.domain_def),
         "hydrological_model": current_hydrological_model(),
         "forcing_dataset": s(st.session_state.forcing_dataset),
+        "experiment_time_start": effective_experiment_time_string("start"),
+        "experiment_time_end": effective_experiment_time_string("end"),
     }
-    plan_tstart, plan_tend = ui_experiment_dates_for_plan()
-    values["experiment_time_start"] = plan_tstart
-    values["experiment_time_end"] = plan_tend
 
     st.session_state.selected_pour_point = values["pour_point_coords"]
     st.session_state.selected_bounding_box = values["bounding_box_coords"]
@@ -2985,32 +3753,27 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
     plan.setdefault("config", {})
     cfg = plan["config"]
 
-    preserve_when_empty = _preserve_plan_scalar_when_ui_empty()
-
+    explicit = explicit_ui_fields(st.session_state)
     for key, value in values.items():
+        if key not in explicit:
+            continue
+        yaml_key = spec_key_to_yaml_key(key)
         if value:
             cfg[key] = value
-            if key == "pour_point_coords":
-                cfg.pop("POUR_POINT_COORDS", None)
-            if key == "bounding_box_coords":
-                cfg.pop("BOUNDING_BOX_COORDS", None)
-        elif key in {"pour_point_coords", "bounding_box_coords"}:
-            if not s(lookup_plan_config(cfg, key, key.upper())):
-                cfg.pop(key, None)
-                cfg.pop("POUR_POINT_COORDS" if key == "pour_point_coords" else "BOUNDING_BOX_COORDS", None)
-        elif key in preserve_when_empty:
-            continue
+            if yaml_key and yaml_key != key:
+                cfg.pop(yaml_key, None)
         else:
             cfg.pop(key, None)
+            if yaml_key:
+                cfg.pop(yaml_key, None)
 
-    domain_value = s(values.get("domain_name")) or s(cfg.get("domain_name"))
-    if domain_value:
-        plan["config"] = apply_user_provided_domain_name(cfg, domain_value)
-        cfg = plan["config"]
-        if not s(st.session_state.domain_name):
-            st.session_state.domain_name = s(cfg.get("domain_name"))
-    elif not s(cfg.get("domain_name")):
-        cfg.pop("domain_name", None)
+    if "domain_name" in explicit:
+        domain_value = s(values.get("domain_name"))
+        if domain_value:
+            plan["config"] = apply_user_provided_domain_name(cfg, domain_value)
+            cfg = plan["config"]
+        else:
+            cfg.pop("domain_name", None)
 
     steps = plan.get("steps", []) or []
     convo = conversation_text_for_plan_rules()
@@ -3025,23 +3788,9 @@ def sync_all_ui_fields_to_plan(*, refresh_editor: bool = False, force_editor: bo
 
 
 def _plan_cfg_with_live_ui_fields(plan_cfg: dict | None) -> dict:
-    """Merge live Input-tab values into plan config for needs_user_input checks."""
+    """Merge deliberate Input-tab edits into plan config for validation."""
     cfg = normalize_committed_plan_config(dict(plan_cfg or {}))
-    ui_domain = s(st.session_state.get("domain_name"))
-    if ui_domain:
-        cfg = apply_user_provided_domain_name(cfg, ui_domain)
-    ui_exp = s(st.session_state.get("experiment_id"))
-    if ui_exp:
-        cfg["experiment_id"] = ui_exp
-    ui_pour = s(st.session_state.get("selected_pour_point"))
-    if ui_pour:
-        cfg["pour_point_coords"] = ui_pour
-        cfg.pop("POUR_POINT_COORDS", None)
-    ui_bbox = s(st.session_state.get("selected_bounding_box"))
-    if ui_bbox:
-        cfg["bounding_box_coords"] = ui_bbox
-        cfg.pop("BOUNDING_BOX_COORDS", None)
-    return cfg
+    return apply_explicit_workflow_ui_overrides({"config": cfg})["config"]
 
 
 def resolve_plan_missing_inputs(
@@ -3050,6 +3799,7 @@ def resolve_plan_missing_inputs(
     user_request: str = "",
 ) -> list[str]:
     """Compute needs_user_input from step requirements and domain-name policy."""
+    user_request = phrase_matching_text(user_request)
     required = get_required_config_fields_for_steps(steps, plan_cfg, user_request)
     missing = [k for k in required if not plan_config_field_present(plan_cfg, k)]
     if domain_name_needs_user_input(plan_cfg, user_request, data_dir=SYMFLUENCE_DATA_DIR):
@@ -3370,6 +4120,7 @@ def render_fix_missing_inputs_section(needs: list[str]) -> None:
 
 
 def set_pour_point_from_map(lat: float, lon: float) -> None:
+    mark_workflow_ui_fields_explicit("pour_point_coords")
     value = format_pour_point(lat, lon)
 
     st.session_state.pour_point_map_hidden = False
@@ -3388,11 +4139,11 @@ def set_pour_point_from_map(lat: float, lon: float) -> None:
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
 def set_bounding_box_from_points(lat1: float, lon1: float, lat2: float, lon2: float) -> None:
+    mark_workflow_ui_fields_explicit("bounding_box_coords")
     value = format_bounding_box(lat1, lon1, lat2, lon2)
 
     st.session_state.bbox_map_hidden = False
@@ -3406,7 +4157,6 @@ def set_bounding_box_from_points(lat1: float, lon1: float, lat2: float, lon2: fl
     sync_spatial_fields_to_run_plan(refresh_editor=True)
 
     mark_spatial_inputs_stale()
-    bump_workflow_map_widget_version()
     bump_config_preview_version()
 
 
@@ -3422,49 +4172,341 @@ def first_existing_gdf(paths: list[str]):
     return None
 
 
+def _zoom_for_span_degrees(span: float) -> int:
+    """Leaflet zoom that frames a lat/lon span instead of the continent default."""
+    span = max(abs(float(span)), 1e-6)
+    zoom = int(round(math.log2(360.0 / span)))
+    return max(5, min(zoom, 14))
+
+
 def _map_view_center_zoom(
     pour_coords: tuple[float, float] | None,
     bbox_bounds: tuple[float, float, float, float] | None,
 ) -> tuple[list[float], int]:
-    """Default map center and zoom."""
+    """Center and zoom for the review map: prefer the defined bounding box."""
     if bbox_bounds is not None:
         north, west, south, east = bbox_bounds
-        return [(north + south) / 2.0, (west + east) / 2.0], WORKFLOW_MAP_ZOOM
+        span = max(abs(north - south), abs(east - west))
+        return [(north + south) / 2.0, (west + east) / 2.0], _zoom_for_span_degrees(span)
     if pour_coords is not None:
-        return [pour_coords[0], pour_coords[1]], WORKFLOW_MAP_ZOOM
-    return [51.0, -115.5], WORKFLOW_MAP_ZOOM
+        return [pour_coords[0], pour_coords[1]], 10
+    return list(WORKFLOW_MAP_CENTER), WORKFLOW_MAP_ZOOM
 
 
+def _normalize_map_click_coords(lat: float, lon: float) -> tuple[float, float]:
+    """Keep clicks on a single world copy (lat in range, lon wrapped to [-180, 180])."""
+    lat = max(-90.0, min(90.0, float(lat)))
+    lon = ((float(lon) + 180.0) % 360.0) - 180.0
+    return lat, lon
+
+
+def _add_map_wheel_scroll_handoff(m: folium.Map) -> None:
+    """Route ordinary map-wheel gestures to the enclosing workflow panel."""
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    handoff = MacroElement()
+    handoff._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+          var map = {{ this._parent.get_name() }};
+          if (map.scrollWheelZoom) map.scrollWheelZoom.disable();
+          map.getContainer().addEventListener("wheel", function(event) {
+            var frame = window.frameElement;
+            var panel = frame && frame.closest(
+              '[data-testid="stVerticalBlockBorderWrapper"]'
+            );
+            if (!panel || !event.deltaY) return;
+            var deltaY = event.deltaY;
+            if (event.deltaMode === 1) deltaY *= 16;
+            if (event.deltaMode === 2) deltaY *= panel.clientHeight;
+            var canScrollUp = deltaY < 0 && panel.scrollTop > 1;
+            var canScrollDown = deltaY > 0
+              && panel.scrollTop + panel.clientHeight < panel.scrollHeight - 1;
+            if (!canScrollUp && !canScrollDown) return;
+            if (event.cancelable) event.preventDefault();
+            panel.scrollTop += deltaY;
+          }, { passive: false });
+        })();
+        {% endmacro %}
+        """
+    )
+    handoff.add_to(m)
+
+
+MAP_LAYER_PANE_Z_INDEX: dict[str, int] = {
+    "sym-dem": 410,
+    "sym-landclass": 420,
+    "sym-soilclass": 430,
+    "sym-forcing": 440,
+    "sym-river-basins": 450,
+    "sym-hru-gru": 460,
+    "sym-river-network": 470,
+    "sym-spatial-overlay": 480,
+}
+
+MAP_LAYER_PANE_BY_NAME: dict[str, str] = {
+    "DEM Catchment": "sym-dem",
+    "Landclass Catchment": "sym-landclass",
+    "Soilclass Catchment": "sym-soilclass",
+    "ERA5 Intersected": "sym-forcing",
+    "River Basins": "sym-river-basins",
+    "HRUs / GRUs": "sym-hru-gru",
+    "River Network": "sym-river-network",
+}
+
+
+def _add_workflow_map_panes(m: folium.Map) -> None:
+    """Give review layers a stable draw order independent of toggle order."""
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    panes = MacroElement()
+    panes.panes = MAP_LAYER_PANE_Z_INDEX
+    panes._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        {% for name, z_index in this.panes.items() %}
+        var pane = {{ this._parent.get_name() }}.getPane({{ name | tojson }})
+          || {{ this._parent.get_name() }}.createPane({{ name | tojson }});
+        pane.style.zIndex = {{ z_index | tojson }};
+        {% endfor %}
+        {% endmacro %}
+        """
+    )
+    panes.add_to(m)
+
+
+def _workflow_base_map(center_lat: float, center_lon: float, zoom: int) -> folium.Map:
+    """One copy of the continents (no tile wrap). Skip hard maxBounds — that freezes pan on a wide map."""
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=zoom,
+        tiles=None,
+        min_zoom=WORKFLOW_MAP_MIN_ZOOM,
+        scroll_wheel_zoom=False,
+    )
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="OpenStreetMap",
+        no_wrap=True,
+        min_zoom=WORKFLOW_MAP_MIN_ZOOM,
+        overlay=False,
+        control=False,
+    ).add_to(m)
+    _add_workflow_map_panes(m)
+    _add_map_wheel_scroll_handoff(m)
+    return m
+
+
+def _review_data_bounds(
+    *,
+    bbox_bounds: tuple[float, float, float, float] | None = None,
+    pour_coords: tuple[float, float] | None = None,
+    layer_gdfs: list | None = None,
+) -> tuple[float, float, float, float] | None:
+    """Combined north/west/south/east extent of the displayed map data."""
+    souths: list[float] = []
+    wests: list[float] = []
+    norths: list[float] = []
+    easts: list[float] = []
+
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        souths.append(float(south))
+        wests.append(float(west))
+        norths.append(float(north))
+        easts.append(float(east))
+
+    if pour_coords is not None:
+        lat, lon = pour_coords
+        souths.append(float(lat))
+        wests.append(float(lon))
+        norths.append(float(lat))
+        easts.append(float(lon))
+
+    for gdf in layer_gdfs or []:
+        try:
+            framed = gdf
+            if framed.crs and str(framed.crs).lower() not in {"epsg:4326", "wgs84"}:
+                framed = framed.to_crs(4326)
+            minx, miny, maxx, maxy = framed.total_bounds
+            if any(value is None or not math.isfinite(float(value)) for value in (minx, miny, maxx, maxy)):
+                continue
+            wests.append(float(minx))
+            souths.append(float(miny))
+            easts.append(float(maxx))
+            norths.append(float(maxy))
+        except Exception:
+            continue
+
+    if not souths:
+        return None
+    south, west = min(souths), min(wests)
+    north, east = max(norths), max(easts)
+    if south == north:
+        south -= 0.01
+        north += 0.01
+    if west == east:
+        west -= 0.01
+        east += 0.01
+    return north, west, south, east
+
+
+def _fit_review_map_to_extent(
+    m: folium.Map,
+    data_bounds: tuple[float, float, float, float] | None,
+) -> None:
+    """Frame the review map tightly around all displayed data."""
+    if data_bounds is None:
+        return
+    north, west, south, east = data_bounds
+    padding = MAP_DATA_FIT_PADDING_PX
+    m.fit_bounds([[south, west], [north, east]], padding=(padding, padding))
+
+
+def _add_fit_data_control(
+    m: folium.Map,
+    data_bounds: tuple[float, float, float, float] | None,
+) -> None:
+    """Add a Leaflet control that restores the camera to displayed data."""
+    if data_bounds is None:
+        return
+    north, west, south, east = data_bounds
+    if south == north or west == east:
+        return
+
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    control = MacroElement()
+    control.north = north
+    control.west = west
+    control.south = south
+    control.east = east
+    control.padding = MAP_DATA_FIT_PADDING_PX
+    control._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        var FitDataControl = L.Control.extend({
+          options: { position: "topright" },
+          onAdd: function(map) {
+            var container = L.DomUtil.create("div", "leaflet-control-layers leaflet-control");
+            var button = L.DomUtil.create("a", "leaflet-control-layers-toggle", container);
+            button.href = "#";
+            button.title = "Fit map view to displayed data";
+            button.setAttribute("aria-label", "Fit map view to displayed data");
+            button.innerHTML = '<span aria-hidden="true" style="display:block;width:18px;height:18px;border:2px dashed #374151;border-radius:2px;box-sizing:border-box;"></span>';
+            button.style.cssText = "display:flex;align-items:center;justify-content:center;background-image:none;text-decoration:none;";
+            L.DomEvent.disableClickPropagation(container);
+            L.DomEvent.on(button, "click", function(event) {
+              L.DomEvent.preventDefault(event);
+              L.DomEvent.stopPropagation(event);
+              map.fitBounds(
+                [[{{ this.south }}, {{ this.west }}], [{{ this.north }}, {{ this.east }}]],
+                { padding: [{{ this.padding }}, {{ this.padding }}] }
+              );
+              if (event.detail > 0) button.blur();
+            });
+            return container;
+          }
+        });
+        (new FitDataControl()).addTo({{ this._parent.get_name() }});
+        {% endmacro %}
+        """
+    )
+    control.add_to(m)
+
+
+def _add_initial_data_fit_when_visible(
+    m: folium.Map,
+    data_bounds: tuple[float, float, float, float] | None,
+) -> None:
+    """Fit a map initialized inside a collapsed expander once it becomes visible."""
+    if data_bounds is None:
+        return
+    north, west, south, east = data_bounds
+    if south == north or west == east:
+        return
+
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    initial_fit = MacroElement()
+    initial_fit.north = north
+    initial_fit.west = west
+    initial_fit.south = south
+    initial_fit.east = east
+    initial_fit.padding = MAP_DATA_FIT_PADDING_PX
+    initial_fit._template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+          var map = {{ this._parent.get_name() }};
+          var observer = null;
+          var fitApplied = false;
+          function fitWhenVisible() {
+            var target = window.frameElement || map.getContainer();
+            var rect = target.getBoundingClientRect();
+            if (
+              fitApplied
+              || target.getClientRects().length === 0
+              || rect.width < 20
+              || rect.height < 20
+            ) return;
+            fitApplied = true;
+            map.invalidateSize({ pan: false });
+            window.requestAnimationFrame(function () {
+              map.fitBounds(
+                [[{{ this.south }}, {{ this.west }}], [{{ this.north }}, {{ this.east }}]],
+                { padding: [{{ this.padding }}, {{ this.padding }}], animate: false }
+              );
+            });
+            if (observer) observer.disconnect();
+          }
+          map.whenReady(function () {
+            var target = window.frameElement || map.getContainer();
+            if (window.ResizeObserver) {
+              observer = new ResizeObserver(fitWhenVisible);
+              observer.observe(target);
+            }
+            fitWhenVisible();
+          });
+        })();
+        {% endmacro %}
+        """
+    )
+    initial_fit.add_to(m)
+
+
+MAP_SPATIAL_LAYER_SPECS = [
+    ("show_pour_point_layer", "Pour point", "pourpoint"),
+    ("show_bounding_box_layer", "Bounding box", "boundingbox"),
+]
 MAP_FILL_LAYER_SPECS = [
-    ("show_riverbasins_layer", "River basins", "riverbasins"),
     ("show_hrugru_layer", "HRUs / GRUs", "hrugru"),
     ("show_dem_layer", "DEM", "dem"),
     ("show_landclass_layer", "Landclass", "landclass"),
     ("show_soilclass_layer", "Soilclass", "soilclass"),
-    ("show_forcing_layer", "ERA5 intersected", "forcing"),
+    ("show_forcing_layer", "Forcing intersected", "forcing"),
 ]
 RIVER_NETWORK_LAYER_SPEC = ("show_rivernetwork_layer", "River network", "rivernetwork")
-MAP_LAYER_CHECKBOX_SPECS = MAP_FILL_LAYER_SPECS + [RIVER_NETWORK_LAYER_SPEC]
-
-
-def _current_fill_layer_selection() -> str | None:
-    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
-        if st.session_state.get(state_key):
-            return path_key
-    return None
-
-
-def _sync_fill_layer_flags_from_selection(selected_path_key: str | None) -> None:
-    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
-        st.session_state[state_key] = bool(selected_path_key) and path_key == selected_path_key
+MAP_LAYER_CHECKBOX_SPECS = (
+    MAP_SPATIAL_LAYER_SPECS
+    + [("show_riverbasins_layer", "River basins", "riverbasins")]
+    + [RIVER_NETWORK_LAYER_SPEC]
+)
+MAP_LAYER_SPECS = MAP_LAYER_CHECKBOX_SPECS + MAP_FILL_LAYER_SPECS
 
 
 def reset_map_layer_ui_state() -> None:
     """Reset map layer widgets after loading a different run."""
-    for state_key, _, _ in MAP_LAYER_CHECKBOX_SPECS:
+    for state_key, _, _ in MAP_LAYER_SPECS:
         st.session_state[state_key] = False
+        st.session_state.pop(f"_review_layer_available_{state_key}", None)
     for prefix in ("out", "in"):
-        for state_key, _, _ in MAP_LAYER_CHECKBOX_SPECS:
+        for state_key, _, _ in MAP_LAYER_SPECS:
             st.session_state.pop(f"{prefix}_{state_key}", None)
         st.session_state.pop(f"{prefix}_review_fill_layer", None)
         st.session_state.pop(f"{prefix}_show_rivernetwork_layer", None)
@@ -3517,6 +4559,24 @@ def _first_existing_shapefile(candidates: list[Path]) -> Path | None:
     return None
 
 
+def _first_shapefile_in(directory: Path, *patterns: str) -> Path | None:
+    """First shapefile in a folder matching any glob."""
+    if not directory.is_dir():
+        return None
+    for pattern in patterns:
+        for path in sorted(directory.glob(pattern)):
+            if path.is_file() and path.suffix.lower() == ".shp":
+                return path
+    return None
+
+
+def _shapefile_or_expected(directory: Path, expected_name: str, *extra_globs: str) -> str:
+    found = _first_shapefile_in(directory, expected_name, *extra_globs)
+    if found is not None:
+        return str(found)
+    return str(directory / expected_name)
+
+
 def _resolve_domain_shapefile(
     directory: Path,
     *,
@@ -3529,9 +4589,12 @@ def _resolve_domain_shapefile(
     found = _first_existing_shapefile(candidates)
     if found is not None:
         return str(found)
-    matches = sorted(directory.glob(glob_pattern))
+    matches = sorted(directory.glob(glob_pattern)) if directory.is_dir() else []
     if matches:
         return str(matches[0])
+    loose = _first_shapefile_in(directory, "*.shp")
+    if loose is not None:
+        return str(loose)
     return str(candidates[0]) if candidates else ""
 
 
@@ -3562,11 +4625,24 @@ def symfluence_domain_shapefile_paths(
     """Expected SYMFLUENCE shapefile paths for the current domain and experiment."""
     domain_name = s(domain_name or st.session_state.domain_name)
     experiment_id = s(experiment_id or st.session_state.experiment_id)
-    if not domain_name or not experiment_id:
+    if not domain_name:
         return {}
 
-    domain_name = symfluence_domain_name(domain_name, experiment_id)
-    domain_root = symfluence_data_domain_dir(domain_name)
+    base_basin = symfluence_domain_name(domain_name, experiment_id)
+    run_folder = s(st.session_state.get("run_folder"))
+    basin = review_symfluence_domain_name(
+        base_basin,
+        experiment_id,
+        run_folder=run_folder,
+    )
+    domain_root = symfluence_data_domain_dir(basin, experiment_id)
+    if not domain_root.is_dir():
+        raw_root = SYMFLUENCE_DATA_DIR / f"domain_{base_basin}"
+        if raw_root.is_dir():
+            domain_root = raw_root
+            basin = base_basin
+    domain_name = basin
+    experiment_id = experiment_id or "run_1"
     plan_cfg = (st.session_state.run_plan or {}).get("config") or {}
     domain_def = (
         s(plan_cfg.get("domain_def"))
@@ -3580,18 +4656,51 @@ def symfluence_domain_shapefile_paths(
         plan_cfg=plan_cfg,
     )
     catchment_base = domain_root / "shapefiles" / "catchment_intersection"
+    pour_point_dir = domain_root / "shapefiles" / "pour_point"
     river_basins_dir = domain_root / "shapefiles" / "river_basins"
     river_network_dir = domain_root / "shapefiles" / "river_network"
+    forcing_dataset = (
+        s(plan_cfg.get("forcing_dataset"))
+        or s(st.session_state.get("forcing_dataset"))
+        or "ERA5"
+    )
+    forcing_path = domain_forcing_intersection_path(
+        SYMFLUENCE_DATA_DIR,
+        domain_name,
+        forcing_dataset=forcing_dataset,
+    )
+    if forcing_path.suffix.lower() != ".shp" or not forcing_path.is_file():
+        globbed = _first_shapefile_in(
+            catchment_base / "with_forcing",
+            "*intersected*.shp",
+            "*.shp",
+        )
+        if globbed is not None:
+            forcing_path = globbed
     return {
         "domain_root": str(domain_root),
-        "dem": str(catchment_base / "with_dem" / "catchment_with_dem.shp"),
-        "landclass": str(catchment_base / "with_landclass" / "catchment_with_landclass.shp"),
-        "soilclass": str(catchment_base / "with_soilgrids" / "catchment_with_soilclass.shp"),
-        "forcing": str(
-            catchment_base
-            / "with_forcing"
-            / f"{domain_name}_ERA5_intersected_shapefile.shp"
+        "pourpoint": _shapefile_or_expected(
+            pour_point_dir,
+            f"{domain_name}_pourPoint.shp",
+            "*pourPoint*.shp",
+            "*.shp",
         ),
+        "dem": _shapefile_or_expected(
+            catchment_base / "with_dem",
+            "catchment_with_dem.shp",
+            "*.shp",
+        ),
+        "landclass": _shapefile_or_expected(
+            catchment_base / "with_landclass",
+            "catchment_with_landclass.shp",
+            "*.shp",
+        ),
+        "soilclass": _shapefile_or_expected(
+            catchment_base / "with_soilgrids",
+            "catchment_with_soilclass.shp",
+            "*.shp",
+        ),
+        "forcing": str(forcing_path),
         "riverbasins": _resolve_domain_shapefile(
             river_basins_dir,
             name_builder=lambda suffix: f"{domain_name}_riverBasins_{suffix}.shp",
@@ -3608,76 +4717,189 @@ def symfluence_domain_shapefile_paths(
     }
 
 
+def review_symfluence_domain_name(
+    domain_name: str,
+    experiment_id: str,
+    *,
+    run_folder: str = "",
+    runs_dir: Path | None = None,
+) -> str:
+    """Actual SYMFLUENCE domain for the active assistant run."""
+    basin = symfluence_domain_name(domain_name, experiment_id)
+    run_folder = s(run_folder)
+    if not run_folder:
+        return basin
+
+    run_config = (runs_dir or RUNS_DIR) / run_folder / "config.yaml"
+    if run_config.is_file():
+        try:
+            run_cfg = yaml.safe_load(run_config.read_text(encoding="utf-8")) or {}
+            configured = s(run_cfg.get("DOMAIN_NAME"))
+            if configured:
+                return configured
+        except (OSError, yaml.YAMLError):
+            pass
+
+    return symfluence_domain_for_run_folder(run_folder, basin, experiment_id)
+
+
+_REVIEW_FILE_LAYER_KEYS = (
+    "pourpoint",
+    "dem",
+    "landclass",
+    "soilclass",
+    "forcing",
+    "riverbasins",
+    "hrugru",
+    "rivernetwork",
+)
+
+
+def review_layer_artifact_signature(
+    paths: dict[str, str] | None = None,
+) -> tuple[tuple[str, str, bool], ...]:
+    """Cheap signature used to detect newly created review-layer files."""
+    paths = paths if paths is not None else symfluence_domain_shapefile_paths()
+    return tuple(
+        (path_key, s(paths.get(path_key)), Path(s(paths.get(path_key))).is_file())
+        for path_key in _REVIEW_FILE_LAYER_KEYS
+    )
+
+
+def rerun_if_review_layer_artifacts_changed() -> None:
+    """Refresh the full view once when workflow output adds or removes map layers."""
+    state_key = "_review_layer_artifact_signature"
+    current = review_layer_artifact_signature()
+    previous = st.session_state.get(state_key)
+    st.session_state[state_key] = current
+    if previous is not None and previous != current:
+        st.rerun(scope="app")
+
+
 def shapefile_layer_available(path: str) -> bool:
     return bool(path) and os.path.exists(path)
 
 
-def render_map_layer_checkboxes(key_prefix: str) -> int:
-    """Output review map: one fill layer (radio) plus optional river-network overlay."""
+def _review_layer_available(path_key: str, paths: dict[str, str]) -> bool:
+    """Return whether a review-layer toggle has something it can display."""
+    if path_key == "boundingbox":
+        return _resolve_bounding_box_bounds(ignore_hidden=True) is not None
+    if path_key == "pourpoint":
+        if shapefile_layer_available(paths.get(path_key, "")):
+            return True
+        plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+        return any(
+            parse_pour_point(s(value)) is not None
+            for value in (
+                st.session_state.get("selected_pour_point"),
+                pour_point_input_value(),
+                lookup_plan_config(plan_cfg, "pour_point_coords", "POUR_POINT_COORDS"),
+            )
+        )
+    return shapefile_layer_available(paths.get(path_key, ""))
+
+
+def _review_layer_label(label: str, path_key: str) -> str:
+    if path_key != "forcing":
+        return label
+    plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+    forcing_dataset = (
+        s(plan_cfg.get("forcing_dataset"))
+        or s(st.session_state.get("forcing_dataset"))
+        or "Forcing"
+    )
+    return f"{forcing_dataset} intersected"
+
+
+def render_map_layer_controls(key_prefix: str) -> int:
+    """Independent overlays and one color layer; return the available layer count."""
     paths = symfluence_domain_shapefile_paths()
     if not paths:
-        st.info("Set **Domain name** and **Experiment ID** to check for review layers.")
+        reset_map_layer_ui_state()
+        st.info("Set **Domain name** on Input to check for review layers.")
         return 0
 
     available_count = 0
-    available_fills: list[tuple[str, str, str]] = []
-    for state_key, label, path_key in MAP_FILL_LAYER_SPECS:
+    st.markdown("**Overlays**")
+    cols = st.columns(2)
+    spatial_state_keys = {spec[0] for spec in MAP_SPATIAL_LAYER_SPECS}
+    for i, (state_key, label, path_key) in enumerate(MAP_LAYER_CHECKBOX_SPECS):
         shp_path = paths.get(path_key, "")
-        if shapefile_layer_available(shp_path):
+        available = _review_layer_available(path_key, paths)
+        if available:
             available_count += 1
-            available_fills.append((state_key, label, path_key))
+        availability_key = f"_review_layer_available_{state_key}"
+        had_availability = availability_key in st.session_state
+        was_available = bool(st.session_state.get(availability_key, False))
+        current = bool(st.session_state.get(state_key, False))
+        if not available and current:
+            st.session_state[state_key] = False
+            current = False
+        elif (
+            available
+            and state_key in spatial_state_keys
+            and (not had_availability or not was_available)
+        ):
+            current = True
+            st.session_state[state_key] = True
+        st.session_state[availability_key] = available
+        widget_key = f"{key_prefix}_{state_key}"
+        if not had_availability or available != was_available:
+            st.session_state.pop(widget_key, None)
+        with cols[i % len(cols)]:
+            st.session_state[state_key] = st.checkbox(
+                _review_layer_label(label, path_key),
+                value=current if available else False,
+                disabled=not available,
+                key=widget_key,
+                help=(
+                    shp_path
+                    if available and shp_path
+                    else "Available from the current plan"
+                    if available
+                    else f"Not found yet:\n{shp_path}"
+                ),
+            )
+    fill_labels = {"none": "None"}
+    for _, label, path_key in MAP_FILL_LAYER_SPECS:
+        if _review_layer_available(path_key, paths):
+            fill_labels[path_key] = _review_layer_label(label, path_key)
+            available_count += 1
 
-    rn_state_key, rn_label, rn_path_key = RIVER_NETWORK_LAYER_SPEC
-    river_path = paths.get(rn_path_key, "")
-    river_available = shapefile_layer_available(river_path)
-    if river_available:
-        available_count += 1
-
-    if not available_fills and not river_available:
-        _sync_fill_layer_flags_from_selection(None)
-        st.session_state.show_rivernetwork_layer = False
-        return 0
-
-    if available_fills:
-        fill_path_keys = [path_key for _, _, path_key in available_fills]
-        fill_labels = {path_key: label for _, label, path_key in available_fills}
-        current_fill = _current_fill_layer_selection()
-        if current_fill not in fill_path_keys:
-            current_fill = fill_path_keys[0]
-        selected_fill = st.radio(
-            "Review fill layer",
-            options=fill_path_keys,
-            index=fill_path_keys.index(current_fill),
-            format_func=lambda path_key: fill_labels[path_key],
-            horizontal=True,
-            label_visibility="collapsed",
-            key=f"{key_prefix}_review_fill_layer",
+    widget_key = f"{key_prefix}_review_fill_layer"
+    if st.session_state.get(widget_key) not in fill_labels:
+        # Carry an existing checkbox selection into the radio group on upgrade.
+        st.session_state[widget_key] = next(
+            (
+                path_key
+                for state_key, _, path_key in MAP_FILL_LAYER_SPECS
+                if path_key in fill_labels and st.session_state.get(state_key, False)
+            ),
+            "none",
         )
-        _sync_fill_layer_flags_from_selection(selected_fill)
-    else:
-        _sync_fill_layer_flags_from_selection(None)
-
-    rn_help = river_path if river_available else f"Not found yet:\n{river_path}"
-    current_rn = bool(st.session_state.get(rn_state_key, False)) if river_available else False
-    if not river_available and st.session_state.get(rn_state_key):
-        st.session_state[rn_state_key] = False
-    st.session_state[rn_state_key] = st.checkbox(
-        rn_label,
-        value=current_rn,
-        disabled=not river_available,
-        key=f"{key_prefix}_{rn_state_key}",
-        help=rn_help,
+    st.markdown("**Color layer**")
+    selected_fill = st.radio(
+        "Color layer",
+        options=list(fill_labels),
+        format_func=lambda path_key: fill_labels[path_key],
+        key=widget_key,
+        horizontal=True,
+        disabled=len(fill_labels) == 1,
+        label_visibility="collapsed",
     )
-
+    for state_key, _, path_key in MAP_FILL_LAYER_SPECS:
+        st.session_state[state_key] = path_key == selected_fill
+    if len(fill_labels) == 1:
+        st.caption("No color layers available in this domain yet.")
     return available_count
 
 
 # Match symfluence.reporting.plotters.domain_plotter choropleth recipes.
 SYMFLUENCE_MAP_FILL_OPACITY = 0.7
+MAP_DATA_FIT_PADDING_PX = 8
 
 MAP_LAYER_CHOROPLETH_PROFILES: dict[str, str] = {
     "HRUs / GRUs": "grus",
-    "River Basins": "grus",
     "DEM Catchment": "elevation",
     "Landclass Catchment": "landclass",
     "Soilclass Catchment": "soilclass",
@@ -3685,11 +4907,11 @@ MAP_LAYER_CHOROPLETH_PROFILES: dict[str, str] = {
 }
 
 MAP_LAYER_CMAP_BY_PROFILE: dict[str, str] = {
-    "grus": "viridis",
+    "grus": "tab20",
     "elevation": "terrain",
     "landclass": "Set2",
     "soilclass": "Set3",
-    "forcing": "viridis",
+    "forcing": "tab20",
 }
 
 MAP_LAYER_DEFAULT_TOOLTIPS: dict[str, list[str]] = {
@@ -3702,60 +4924,17 @@ MAP_LAYER_DEFAULT_TOOLTIPS: dict[str, list[str]] = {
 }
 
 MAP_LAYER_LEGEND_TITLES: dict[str, str] = {
-    "grus": "GRU units",
+    "grus": "GRUs",
     "elevation": "Elevation",
     "landclass": "Land use class",
     "soilclass": "Soil class",
     "forcing": "GRU units (forcing)",
 }
 
-# Scrollable swatch list up to this many classes; above that use compact gradient summary.
+# Non-categorical legends above this size use a compact gradient summary.
 MAP_LEGEND_MAX_SWATCHES = 120
 MAP_LEGEND_TWO_COLUMN_MIN = 10
-MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 140
-MAP_LEGEND_MIN_WIDTH_PX = 150
-MAP_LEGEND_MAX_WIDTH_PX = 190
-
-
-def _add_workflow_map_css(m: folium.Map) -> None:
-    """Keep map controls legible and compact inside narrow Streamlit columns."""
-    from branca.element import Element
-
-    m.get_root().header.add_child(
-        Element(
-            f"""
-            <style>
-              .leaflet-control-zoom {{
-                display: block !important;
-                visibility: visible !important;
-              }}
-              .leaflet-control-zoom a {{
-                display: block !important;
-                width: 28px !important;
-                height: 28px !important;
-                line-height: 26px !important;
-                color: #111827 !important;
-                background: #ffffff !important;
-                font-family: Arial, sans-serif !important;
-                font-size: 20px !important;
-                font-weight: 600 !important;
-                text-align: center !important;
-                text-decoration: none !important;
-                opacity: 1 !important;
-              }}
-              .leaflet-control-zoom a:hover {{
-                color: #111827 !important;
-                background: #f3f4f6 !important;
-              }}
-              .hydroagent-map-legend {{
-                min-width: {MAP_LEGEND_MIN_WIDTH_PX}px;
-                max-width: {MAP_LEGEND_MAX_WIDTH_PX}px;
-                box-sizing: border-box;
-              }}
-            </style>
-            """
-        )
-    )
+MAP_LEGEND_SCROLL_MAX_HEIGHT_PX = 240
 
 
 def _pour_point_legend_icon_html() -> str:
@@ -3784,6 +4963,13 @@ def _river_network_legend_icon_html() -> str:
     )
 
 
+def _river_basins_legend_icon_html() -> str:
+    return (
+        '<span style="width:14px;height:10px;border:1.5px solid purple;'
+        'background:rgba(128,0,128,0.10);border-radius:1px;flex-shrink:0;display:block;"></span>'
+    )
+
+
 def _map_has_bounding_box() -> bool:
     if not _bbox_visible_on_map():
         return False
@@ -3803,22 +4989,37 @@ def _map_has_bounding_box() -> bool:
 
 def _build_map_reference_legend_entries(
     *,
+    show_pour_point_layer: bool = True,
+    show_bounding_box_layer: bool = True,
+    show_riverbasins_layer: bool = False,
     show_rivernetwork_layer: bool = False,
+    include_spatial_symbols: bool = True,
 ) -> list[dict[str, str]]:
     """Symbol rows for pour point, bounding box, and optional river-network line."""
     entries: list[dict[str, str]] = []
-    if _resolve_pour_point_lat_lon() is not None:
+    if (
+        include_spatial_symbols
+        and show_pour_point_layer
+        and _resolve_pour_point_lat_lon() is not None
+    ):
         entries.append(
             {
                 "label": html.escape("Pour point"),
                 "icon_html": _pour_point_legend_icon_html(),
             }
         )
-    if _map_has_bounding_box():
+    if include_spatial_symbols and show_bounding_box_layer and _map_has_bounding_box():
         entries.append(
             {
                 "label": html.escape("Bounding box"),
                 "icon_html": _bounding_box_legend_icon_html(),
+            }
+        )
+    if show_riverbasins_layer:
+        entries.append(
+            {
+                "label": html.escape("Sub-basin boundaries"),
+                "icon_html": _river_basins_legend_icon_html(),
             }
         )
     if show_rivernetwork_layer:
@@ -3834,7 +5035,7 @@ def _build_map_reference_legend_entries(
 def _map_legend_reference_section_html() -> str:
     return """
               {% if this.reference_entries %}
-              <div style="border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px;">
+              <div style="flex:0 0 auto;border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px;">
                 <div style="font-size:10px;font-weight:600;color:#6b7280;margin-bottom:6px;">
                   Map symbols
                 </div>
@@ -3981,7 +5182,7 @@ def _symfluence_class_color_lookup(
     import numpy as np
 
     base_cmap = plt.get_cmap(cmap_name)
-    if continuous or n_classes > 100 or cmap_name == "viridis":
+    if continuous:
         colors = [_matplotlib_rgba_to_hex(base_cmap(i / n_classes)) for i in range(n_classes)]
     elif n_classes > base_cmap.N:
         extra_cmaps = ["Set3", "Set2", "Set1", "Paired", "tab20"]
@@ -3992,6 +5193,12 @@ def _symfluence_class_color_lookup(
                 break
             extra_cmap = plt.get_cmap(extra_name)
             all_colors.extend([extra_cmap(i) for i in np.linspace(0, 1, extra_cmap.N)])
+        if len(all_colors) < n_classes:
+            categorical_fallback = plt.get_cmap("hsv")
+            all_colors.extend(
+                categorical_fallback((index * 0.61803398875) % 1.0)
+                for index in range(n_classes - len(all_colors))
+            )
         colors = [_matplotlib_rgba_to_hex(color) for color in all_colors[:n_classes]]
     else:
         colors = [_matplotlib_rgba_to_hex(base_cmap(i)) for i in np.linspace(0, 1, n_classes)]
@@ -4030,32 +5237,23 @@ def _choropleth_legend_spec(
 
     count = len(legend_entries)
     spec: dict = {
-        "title": title,
-        "count": count,
+        "title": f"GRUs ({count})" if profile == "grus" else title,
+        "count": "" if profile == "grus" else count,
         "profile": profile,
         "start_color": legend_entries[0][1],
         "end_color": legend_entries[-1][1],
     }
 
-    if count > MAP_LEGEND_MAX_SWATCHES:
-        if profile in {"grus", "forcing"}:
-            spec.update(
-                {
-                    "mode": "gradient",
-                    "subtitle": "GRU ID (low → high)",
-                    "start_label": legend_entries[0][0],
-                    "end_label": legend_entries[-1][0],
-                }
-            )
-        else:
-            spec.update(
-                {
-                    "mode": "gradient",
-                    "subtitle": f"{count} classes (low → high)",
-                    "start_label": legend_entries[0][0],
-                    "end_label": legend_entries[-1][0],
-                }
-            )
+    categorical_profiles = {"grus", "forcing", "landclass", "soilclass"}
+    if count > MAP_LEGEND_MAX_SWATCHES and profile not in categorical_profiles:
+        spec.update(
+            {
+                "mode": "gradient",
+                "subtitle": f"{count} classes (low → high)",
+                "start_label": legend_entries[0][0],
+                "end_label": legend_entries[-1][0],
+            }
+        )
         return spec
 
     spec.update(
@@ -4063,7 +5261,7 @@ def _choropleth_legend_spec(
             "mode": "swatches",
             "entries": legend_entries,
             "two_column": count >= MAP_LEGEND_TWO_COLUMN_MIN,
-            "value_header": "GRU ID" if profile in {"grus", "forcing"} else "",
+            "value_header": "",
         }
     )
     return spec
@@ -4093,9 +5291,11 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
               <div style="font-weight:600;font-size:12px;color:#1f2937;margin-bottom:4px;">{{ this.title }}</div>
             """
@@ -4126,27 +5326,29 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow:hidden;
+                display:flex;flex-direction:column;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
-              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:6px;margin-bottom:5px;">
-                <span style="font-weight:600;font-size:11px;color:#1f2937;">{{ this.title }}</span>
+              <div style="flex:0 0 auto;display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;">
+                <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
+                {% if this.count %}
                 <span style="font-size:10px;color:#6b7280;white-space:nowrap;">{{ this.count }}</span>
+                {% endif %}
               </div>
-              <div style="height:7px;border-radius:4px;border:1px solid #cbd5e1;margin-bottom:5px;
-                background:linear-gradient(to right, {{ this.start_color }}, {{ this.end_color }});"></div>
               {% if this.value_header %}
-              <div style="display:grid;grid-template-columns:12px 1fr 12px 1fr;gap:3px 6px;
-                font-size:10px;color:#6b7280;margin-bottom:4px;">
-                <span></span><span>{{ this.value_header }}</span><span></span><span>{{ this.value_header }}</span>
+              <div style="flex:0 0 auto;font-size:10px;color:#6b7280;margin-bottom:4px;padding-left:18px;">
+                {{ this.value_header }}
               </div>
               {% endif %}
-              <div style="max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
-                {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:7px;{% endif %}">
+              <div style="flex:1 1 auto;min-height:0;max-height:{{ this.scroll_max_height }}px;overflow-y:auto;padding-right:2px;
+                {% if this.two_column %}display:grid;grid-template-columns:1fr 1fr;column-gap:12px;{% endif %}">
               {% for entry in this.entries %}
-                <div style="display:flex;align-items:center;gap:4px;margin:1px 0;min-width:0;">
-                  <span style="width:10px;height:10px;background:{{ entry.color }};
+                <div style="display:flex;align-items:center;gap:6px;margin:2px 0;min-width:0;">
+                  <span style="width:14px;height:14px;background:{{ entry.color }};
                     border:1px solid rgba(0,0,0,0.35);border-radius:2px;flex-shrink:0;"></span>
                   <span style="color:#374151;{% if this.value_header %}font-variant-numeric:tabular-nums;{% endif %}
                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ entry.label }}</span>
@@ -4167,9 +5369,11 @@ def _add_choropleth_legend_to_map(
         template = Template(
             """
             {% macro html(this, kwargs) %}
-            <div class="hydroagent-map-legend" style="position:absolute;bottom:18px;left:10px;z-index:1000;
+            <div style="position:absolute;bottom:28px;left:12px;z-index:1000;
+                min-width:196px;max-width:280px;
+                max-height:calc(100% - 118px);box-sizing:border-box;overflow-y:auto;
                 background:rgba(255,255,255,0.96);border:1px solid #d0d7de;border-radius:10px;
-                padding:7px 8px;font:10px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+                padding:10px 12px;font:11px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                 box-shadow:0 2px 8px rgba(0,0,0,0.18);">
               <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px;">
                 <span style="font-weight:600;font-size:12px;color:#1f2937;">{{ this.title }}</span>
@@ -4249,6 +5453,8 @@ def _symfluence_layer_choropleth(
     layer_name: str,
 ) -> tuple[gpd.GeoDataFrame, tuple[object, object] | None, dict]:
     profile = MAP_LAYER_CHOROPLETH_PROFILES.get(layer_name)
+    if profile is None and layer_name.endswith(" Intersected"):
+        profile = "forcing"
     if not profile:
         return gdf, None, {}
 
@@ -4261,7 +5467,7 @@ def _symfluence_layer_choropleth(
         class_col,
         MAP_LAYER_CMAP_BY_PROFILE[profile],
         profile=profile,
-        continuous=profile in {"grus", "forcing"},
+        continuous=profile == "elevation",
     )
     if not lookup:
         return gdf, None, {}
@@ -4292,12 +5498,27 @@ def _resolve_pour_point_lat_lon() -> tuple[float, float] | None:
     )
     if parsed is not None:
         return parsed
+
+    pour_point_path = symfluence_domain_shapefile_paths().get("pourpoint", "")
+    if shapefile_layer_available(pour_point_path):
+        try:
+            points = gpd.read_file(pour_point_path)
+            if not points.empty:
+                if points.crs is not None:
+                    points = points.to_crs(epsg=4326)
+                geometry = points.geometry.iloc[0]
+                if geometry is not None and not geometry.is_empty:
+                    if geometry.geom_type != "Point":
+                        geometry = geometry.centroid
+                    return float(geometry.y), float(geometry.x)
+        except Exception:
+            pass
     return None
 
 
-def _resolve_bounding_box_bounds() -> tuple[float, float, float, float] | None:
+def _resolve_bounding_box_bounds(*, ignore_hidden: bool = False) -> tuple[float, float, float, float] | None:
     """Return (north, west, south, east) from map clicks, text input, or plan config."""
-    if not _bbox_visible_on_map():
+    if not ignore_hidden and not _bbox_visible_on_map():
         return None
 
     if (
@@ -4326,7 +5547,7 @@ def _resolve_bounding_box_bounds() -> tuple[float, float, float, float] | None:
 
 
 def _add_bounding_box_overlay(
-    m: folium.Map,
+    parent: folium.Map | folium.FeatureGroup,
     north: float,
     west: float,
     south: float,
@@ -4334,14 +5555,18 @@ def _add_bounding_box_overlay(
     *,
     from_map_clicks: bool = False,
 ) -> None:
-    folium.Rectangle(
+    bounding_box = folium.Rectangle(
         bounds=[[south, west], [north, east]],
         tooltip="Bounding box",
         color="red",
         weight=1,
         fill=True,
         fill_opacity=0.15,
-    ).add_to(m)
+    )
+    # Folium filters this Leaflet path option from constructor kwargs.
+    bounding_box.options["interactive"] = False
+    bounding_box.options["pane"] = "sym-spatial-overlay"
+    bounding_box.add_to(parent)
     if from_map_clicks and st.session_state.bbox_point_1 and st.session_state.bbox_point_2:
         lat1, lon1 = st.session_state.bbox_point_1
         lat2, lon2 = st.session_state.bbox_point_2
@@ -4349,23 +5574,23 @@ def _add_bounding_box_overlay(
             [lat1, lon1],
             tooltip="Bounding box corner 1",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
         folium.Marker(
             [lat2, lon2],
             tooltip="Bounding box corner 2",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
     else:
         folium.Marker(
             [north, west],
             tooltip="Bounding box (north/west)",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
         folium.Marker(
             [south, east],
             tooltip="Bounding box (south/east)",
             icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+        ).add_to(parent)
 
 
 def _pour_point_map_icon() -> folium.DivIcon:
@@ -4386,7 +5611,7 @@ def _pour_point_map_icon() -> folium.DivIcon:
 
 
 def _add_pour_point_marker(
-    m: folium.Map,
+    parent: folium.Map | folium.FeatureGroup,
     lat: float,
     lon: float,
     *,
@@ -4396,7 +5621,53 @@ def _add_pour_point_marker(
         location=[lat, lon],
         tooltip=tooltip,
         icon=_pour_point_map_icon(),
-    ).add_to(m)
+    ).add_to(parent)
+
+
+def build_spatial_selection_feature_group(
+    *,
+    show_pour_point_layer: bool = True,
+    show_bounding_box_layer: bool = True,
+) -> folium.FeatureGroup:
+    """Pour-point / bounding-box overlays that update without remounting the map."""
+    fg = folium.FeatureGroup(name="Spatial selection")
+    bbox_bounds = _resolve_bounding_box_bounds() if show_bounding_box_layer else None
+    pour_coords = _resolve_pour_point_lat_lon() if show_pour_point_layer else None
+
+    if (
+        show_bounding_box_layer
+        and _bbox_visible_on_map()
+        and st.session_state.bbox_point_1 is not None
+        and not st.session_state.bbox_selected
+    ):
+        lat1, lon1 = st.session_state.bbox_point_1
+        folium.Marker(
+            [lat1, lon1],
+            tooltip="Bounding box corner 1",
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(fg)
+
+    if bbox_bounds is not None:
+        north, west, south, east = bbox_bounds
+        from_clicks = bool(
+            st.session_state.bbox_selected
+            and st.session_state.bbox_point_1
+            and st.session_state.bbox_point_2
+        )
+        _add_bounding_box_overlay(
+            fg,
+            north,
+            west,
+            south,
+            east,
+            from_map_clicks=from_clicks,
+        )
+
+    if pour_coords is not None:
+        tooltip = "Selected pour point" if st.session_state.get("map_point_selected") else "Pour point"
+        _add_pour_point_marker(fg, pour_coords[0], pour_coords[1], tooltip=tooltip)
+
+    return fg
 
 
 def build_pour_point_map(
@@ -4410,32 +5681,27 @@ def build_pour_point_map(
     show_hrugru_layer: bool = False,
     show_forcing_layer: bool = False,
     show_rivernetwork_layer: bool = False,
+    show_pour_point_layer: bool = True,
+    show_bounding_box_layer: bool = True,
+    *,
+    lock_initial_view: bool = False,
+    fit_data_when_visible: bool = False,
+    show_layer_control: bool = True,
 ):
-    bbox_bounds = _resolve_bounding_box_bounds()
-    pour_coords = _resolve_pour_point_lat_lon()
-    center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
-    center_lat, center_lon = center[0], center[1]
+    visible_bbox_bounds = _resolve_bounding_box_bounds()
+    bbox_bounds = None if lock_initial_view else _resolve_bounding_box_bounds(ignore_hidden=True)
+    pour_coords = None if lock_initial_view else _resolve_pour_point_lat_lon()
+    if lock_initial_view:
+        center_lat, center_lon = WORKFLOW_MAP_CENTER
+        zoom = WORKFLOW_MAP_ZOOM
+    else:
+        center, zoom = _map_view_center_zoom(pour_coords, bbox_bounds)
+        center_lat, center_lon = center[0], center[1]
 
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=zoom,
-        zoom_control=True,
-    )
-    _add_workflow_map_css(m)
-
-    if (
-        _bbox_visible_on_map()
-        and st.session_state.bbox_point_1 is not None
-        and not st.session_state.bbox_selected
-    ):
-        lat1, lon1 = st.session_state.bbox_point_1
-        folium.Marker(
-            [lat1, lon1],
-            tooltip="Bounding box corner 1",
-            icon=folium.Icon(color="red", icon="flag"),
-        ).add_to(m)
+    m = _workflow_base_map(center_lat, center_lon, zoom)
 
     active_legend_spec: dict = {}
+    active_gdfs: list = []
     try:
         layer_paths = symfluence_domain_shapefile_paths()
         if layer_paths:
@@ -4446,6 +5712,13 @@ def build_pour_point_map(
             riverbasins_path = layer_paths["riverbasins"]
             hrugru_path = layer_paths["hrugru"]
             rivernetwork_path = layer_paths["rivernetwork"]
+            plan_cfg = (st.session_state.get("run_plan") or {}).get("config") or {}
+            forcing_dataset = (
+                s(plan_cfg.get("forcing_dataset"))
+                or s(st.session_state.get("forcing_dataset"))
+                or "Forcing"
+            )
+            forcing_layer_name = f"{forcing_dataset} Intersected"
 
             def add_layer_if_exists(
                 shp_path: str,
@@ -4474,11 +5747,19 @@ def build_pour_point_map(
                         highlight_fn = lambda x, c=color: {"weight": 3, "fillOpacity": 0.15}
 
                 tips = tooltip_fields or MAP_LAYER_DEFAULT_TOOLTIPS.get(layer_name, [])
+                if not tips and layer_name.endswith(" Intersected"):
+                    tips = MAP_LAYER_DEFAULT_TOOLTIPS["ERA5 Intersected"]
+                pane = (
+                    "sym-forcing"
+                    if layer_name.endswith(" Intersected")
+                    else MAP_LAYER_PANE_BY_NAME[layer_name]
+                )
                 geojson_kwargs = {
                     "data": gdf.__geo_interface__,
                     "name": layer_name,
                     "style_function": style_fn,
                     "highlight_function": highlight_fn,
+                    "pane": pane,
                 }
 
                 if tips:
@@ -4499,8 +5780,6 @@ def build_pour_point_map(
                 folium.GeoJson(**geojson_kwargs).add_to(m)
                 return gdf, legend_spec
 
-            active_gdfs = []
-
             if show_dem_layer:
                 gdf, legend_spec = add_layer_if_exists(dem_path, "DEM Catchment", "red")
                 if gdf is not None:
@@ -4520,16 +5799,20 @@ def build_pour_point_map(
                     active_legend_spec = legend_spec
 
             if show_forcing_layer:
-                gdf, legend_spec = add_layer_if_exists(forcing_path, "ERA5 Intersected", "gray")
+                gdf, legend_spec = add_layer_if_exists(
+                    forcing_path,
+                    forcing_layer_name,
+                    "gray",
+                )
                 if gdf is not None:
                     active_gdfs.append(gdf)
                     active_legend_spec = legend_spec
 
             if show_riverbasins_layer:
-                gdf, legend_spec = add_layer_if_exists(riverbasins_path, "River Basins", "purple")
+                # Basin boundaries use a reference symbol, not a color legend.
+                gdf, _legend_spec = add_layer_if_exists(riverbasins_path, "River Basins", "purple")
                 if gdf is not None:
                     active_gdfs.append(gdf)
-                    active_legend_spec = legend_spec
 
             if show_hrugru_layer:
                 gdf, legend_spec = add_layer_if_exists(hrugru_path, "HRUs / GRUs", "brown")
@@ -4545,35 +5828,32 @@ def build_pour_point_map(
     except Exception as e:
         st.warning(f"Shapefile layer load failed: {e}")
 
-    if bbox_bounds is not None:
-        north, west, south, east = bbox_bounds
-        from_clicks = bool(
-            st.session_state.bbox_selected
-            and st.session_state.bbox_point_1
-            and st.session_state.bbox_point_2
-        )
-        _add_bounding_box_overlay(
-            m,
-            north,
-            west,
-            south,
-            east,
-            from_map_clicks=from_clicks,
-        )
-
+    # Selection markers live in a FeatureGroup so changing them does not remount
+    # the map (streamlit-folium hashes the base-map Leaflet JS into its widget key).
     _add_choropleth_legend_to_map(
         m,
         active_legend_spec,
         reference_entries=_build_map_reference_legend_entries(
+            show_pour_point_layer=show_pour_point_layer,
+            show_bounding_box_layer=show_bounding_box_layer,
+            show_riverbasins_layer=show_riverbasins_layer,
             show_rivernetwork_layer=show_rivernetwork_layer,
+            include_spatial_symbols=not lock_initial_view,
         ),
     )
 
-    if pour_coords is not None:
-        tooltip = "Selected pour point" if st.session_state.get("map_point_selected") else "Pour point"
-        _add_pour_point_marker(m, pour_coords[0], pour_coords[1], tooltip=tooltip)
-
-    folium.LayerControl().add_to(m)
+    if show_layer_control:
+        folium.LayerControl().add_to(m)
+    displayed_data_bounds = _review_data_bounds(
+        bbox_bounds=visible_bbox_bounds if show_bounding_box_layer else None,
+        pour_coords=pour_coords if show_pour_point_layer else None,
+        layer_gdfs=active_gdfs,
+    )
+    _add_fit_data_control(m, displayed_data_bounds)
+    if not lock_initial_view:
+        _fit_review_map_to_extent(m, displayed_data_bounds)
+        if fit_data_when_visible:
+            _add_initial_data_fit_when_visible(m, displayed_data_bounds)
     return m
 
 
@@ -4582,15 +5862,21 @@ def render_workflow_map(
     *,
     key: str,
     height: int | None = None,
+    feature_group_to_add: folium.FeatureGroup | None = None,
+    on_change=None,
 ) -> dict | None:
     """Folium map sized to the middle workflow column width."""
-    return st_folium(
-        map_obj,
-        key=key,
-        height=height or WORKFLOW_MAP_HEIGHT,
-        use_container_width=True,
-        returned_objects=["last_clicked"],
-    )
+    kwargs: dict[str, Any] = {
+        "key": key,
+        "height": height or WORKFLOW_MAP_HEIGHT,
+        "use_container_width": True,
+        "returned_objects": ["last_clicked"],
+    }
+    if feature_group_to_add is not None:
+        kwargs["feature_group_to_add"] = feature_group_to_add
+    if on_change is not None:
+        kwargs["on_change"] = on_change
+    return st_folium(map_obj, **kwargs)
 
 
 def dump_yaml(data, path: Path):
@@ -4626,37 +5912,52 @@ def run_cmd_stream(cmd: list[str], cwd: Path, output_box, log_path: Path | None 
             log_file.close()
 
 
-def augment_request_with_ui(nl: str) -> str:
-    from server.core.plan_rules import UI_DEFAULT_EXPERIMENT_END, UI_DEFAULT_EXPERIMENT_START
-
+def augment_request_with_ui(nl: str, *, workflow_plan_mode: str | None = None) -> str:
     lines = [s(nl), "", "Optional UI inputs (use ONLY if non-empty):"]
 
-    if s(st.session_state.domain_name):
+    if ui_field_is_explicit(st.session_state, "domain_name") and s(
+        st.session_state.domain_name
+    ):
         lines.append(f"- domain_name: {s(st.session_state.domain_name)}")
-    if s(st.session_state.experiment_id):
+    if ui_field_is_explicit(st.session_state, "experiment_id") and s(
+        st.session_state.experiment_id
+    ):
         lines.append(f"- experiment_id: {s(st.session_state.experiment_id)}")
-    if current_hydrological_model():
+    if ui_field_is_explicit(
+        st.session_state, "hydrological_model"
+    ) and current_hydrological_model():
         lines.append(f"- hydrological_model: {current_hydrological_model()}")
 
     effective_pour = s(st.session_state.selected_pour_point) or pour_point_input_value()
-    if effective_pour:
+    if ui_field_is_explicit(st.session_state, "pour_point_coords") and effective_pour:
         lines.append(f"- pour_point_coords: {effective_pour}")
 
     effective_bbox = s(st.session_state.selected_bounding_box) or bounding_box_input_value()
-    if effective_bbox:
+    if ui_field_is_explicit(
+        st.session_state, "bounding_box_coords"
+    ) and effective_bbox:
         lines.append(f"- bounding_box_coords: {effective_bbox}")
 
-    if s(st.session_state.domain_def):
+    if ui_field_is_explicit(st.session_state, "domain_def") and s(st.session_state.domain_def):
         lines.append(f"- domain_def: {s(st.session_state.domain_def)}")
-    tstart = s(st.session_state.tstart)
-    tend = s(st.session_state.tend)
-    if tstart and tstart != UI_DEFAULT_EXPERIMENT_START:
-        lines.append(f"- experiment_time_start: {tstart}")
-    if tend and tend != UI_DEFAULT_EXPERIMENT_END:
-        lines.append(f"- experiment_time_end: {tend}")
+    if ui_field_is_explicit(
+        st.session_state, "experiment_time_start"
+    ) and s(st.session_state.tstart):
+        lines.append(f"- experiment_time_start: {s(st.session_state.tstart)}")
+    if ui_field_is_explicit(
+        st.session_state, "experiment_time_end"
+    ) and s(st.session_state.tend):
+        lines.append(f"- experiment_time_end: {s(st.session_state.tend)}")
 
     lines = wx.augment_request_with_advanced(lines)
-    lines = wx.augment_request_with_calibration(lines)
+    if s(workflow_plan_mode) == WORKFLOW_PLAN_MODE_CALIBRATION:
+        lines = wx.augment_request_with_calibration(lines, s(nl))
+    mode_hint = planner_mode_instructions(
+        workflow_plan_mode or "",
+        enable_prompt_matching=prompt_phrase_matching_enabled(),
+    )
+    if mode_hint:
+        lines.append(mode_hint.strip())
     return "\n".join(lines).strip() + "\n"
 
 
@@ -4670,6 +5971,35 @@ def openai_key_for_langprompt() -> str | None:
 
 def render_prompt_library_panel() -> None:
     """LangPrompt: find similar past workflow prompts and optionally reuse them."""
+    st.markdown("**Prompt handling**")
+    examples_col, matching_col = st.columns(2)
+    with examples_col:
+        st.checkbox(
+            "Use stored-prompt library",
+            key="langprompt_enrich",
+            help=(
+                "Off by default. When enabled, search for similar prompts and prepend close "
+                "matches as reference examples for the planner."
+            ),
+        )
+    with matching_col:
+        st.checkbox(
+            "Enable phrase matching in prompts",
+            key="enable_prompt_phrase_matching",
+            help=(
+                "Off by default. When enabled, allow HydroAgent's legacy deterministic rules "
+                "to inspect the prompt in addition to the LLM's structured plan."
+            ),
+        )
+    st.checkbox(
+        "Save generated requests to prompt history",
+        key="langprompt_save",
+        help=(
+            "Off by default. When enabled, append the request after a plan is generated. "
+            "This saves the input request, not a validated prompt-config pair."
+        ),
+    )
+
     if not langprompt_available():
         import_error = langprompt_import_error()
         st.caption("Prompt library search requires langchain packages.")
@@ -4679,7 +6009,6 @@ def render_prompt_library_panel() -> None:
 
     nl = s(st.session_state.get("nl_request"))
     if not nl or is_plan_json_text(nl):
-        st.markdown("**Prompt library**")
         st.caption(
             "Type a workflow description in the prompt box above, then search for similar past prompts."
         )
@@ -4690,7 +6019,6 @@ def render_prompt_library_panel() -> None:
         st.caption("Save an **OpenAI** API key to search the prompt library (embeddings).")
         return
 
-    st.markdown("**Prompt library**")
     st.caption("Search past workflow prompts with semantic similarity (LangPrompt).")
 
     find_col, rebuild_col = st.columns([3, 1])
@@ -4707,12 +6035,6 @@ def render_prompt_library_panel() -> None:
             key="langprompt_rebuild_store",
             help="Re-embed all prompts (use after editing prompts/library/prompts.txt).",
         )
-
-    st.checkbox(
-        "Include similar examples when generating plan",
-        key="langprompt_enrich",
-        help="Prepend close matches from the prompt library as reference for the planner.",
-    )
 
     if find_clicked or rebuild_clicked:
         try:
@@ -4743,7 +6065,11 @@ def render_prompt_library_panel() -> None:
     if not matches:
         return
 
-    with st.expander("Similar prompts", expanded=True):
+    similar_expander_key = "langprompt_similar_expander"
+    if find_clicked or rebuild_clicked:
+        st.session_state[similar_expander_key] = True
+
+    with st.expander("Similar prompts", expanded=False, key=similar_expander_key):
         for index, match in enumerate(matches):
             if not hasattr(match, "score"):
                 continue
@@ -4765,8 +6091,12 @@ def render_prompt_library_panel() -> None:
                 st.markdown("---")
 
 
-def run_generate_plan_from_nl_request() -> None:
-    """NL prompt -> full SYMFLUENCE run plan (config, steps, needs_user_input)."""
+def run_generate_plan_from_nl_request(*, workflow_plan_mode: str) -> None:
+    """NL prompt -> SYMFLUENCE run plan for simulation or calibration workflow."""
+    workflow_plan_mode = s(workflow_plan_mode).lower()
+    if workflow_plan_mode not in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
+        st.error("Unknown workflow plan mode.")
+        return
     provider = s(st.session_state.get("llm_provider")) or "openai"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
     key = st.session_state.api_keys.get(provider)
@@ -4781,11 +6111,21 @@ def run_generate_plan_from_nl_request() -> None:
         return
     try:
         capture_user_prompt_from_session()
-        planner_request = augment_request_with_ui(st.session_state.nl_request)
-        model = resolve_llm_model(st.session_state.get("llm_model"), provider)
+        enable_prompt_matching = prompt_phrase_matching_enabled()
+        planner_request = augment_request_with_ui(
+            st.session_state.nl_request,
+            workflow_plan_mode=workflow_plan_mode,
+        )
         openai_key = openai_key_for_langprompt()
         langprompt_matches: list[PromptMatch] = []
-        if langprompt_available() and openai_key:
+        use_prompt_examples = prompt_library_action_enabled(
+            st.session_state.get(
+                "langprompt_enrich",
+                DEFAULT_USE_PROMPT_LIBRARY_EXAMPLES,
+            ),
+            openai_key,
+        )
+        if use_prompt_examples and langprompt_available():
             try:
                 langprompt_matches = find_similar_prompts(
                     st.session_state.nl_request,
@@ -4793,14 +6133,13 @@ def run_generate_plan_from_nl_request() -> None:
                     top=5,
                 )
                 st.session_state["_langprompt_matches"] = langprompt_matches
-                if st.session_state.get("langprompt_enrich", True):
-                    planner_request = enrich_planner_request(
-                        planner_request,
-                        langprompt_matches,
-                    )
+                planner_request = enrich_planner_request(
+                    planner_request,
+                    langprompt_matches,
+                )
             except Exception:
                 langprompt_matches = st.session_state.get("_langprompt_matches") or []
-                if st.session_state.get("langprompt_enrich", True) and langprompt_matches:
+                if langprompt_matches:
                     planner_request = enrich_planner_request(
                         planner_request,
                         langprompt_matches,
@@ -4810,25 +6149,42 @@ def run_generate_plan_from_nl_request() -> None:
             plan = gemini_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
         elif provider == "claude":
             plan = claude_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
         else:
             plan = openai_provider_client(key).generate_run_plan(
                 model=model,
                 user_request=planner_request,
+                enable_prompt_matching=enable_prompt_matching,
+                workflow_plan_mode=workflow_plan_mode,
             )
-        plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
+        if enable_prompt_matching:
+            plan = preserve_explicit_config_fields_from_prompt(plan, st.session_state.nl_request)
+        plan = apply_explicit_workflow_ui_overrides(plan)
         convo = conversation_text_for_plan_rules() or s(st.session_state.nl_request)
+        plan["workflow_plan_mode"] = workflow_plan_mode
+        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+            sim_plan = st.session_state.get("simulation_plan")
+            plan = merge_domain_config_from_simulation_plan(plan, sim_plan)
+            plan = merge_simulation_steps_into_calibration_plan(plan, sim_plan)
         plan = normalize_local_workflow_plan(
             plan,
             convo,
             data_dir=SYMFLUENCE_DATA_DIR,
+            workflow_plan_mode=workflow_plan_mode,
+            enable_prompt_matching=enable_prompt_matching,
         )
-        plan = resolve_requested_plan_dependencies(plan, convo)
+        if workflow_plan_mode == WORKFLOW_PLAN_MODE_CALIBRATION and enable_prompt_matching:
+            plan = strip_agent_calibration_config_unless_in_prompt(plan, s(st.session_state.nl_request))
+        st.session_state.workflow_plan_mode = workflow_plan_mode
 
         if not isinstance(plan, dict):
             raise RuntimeError(f"Planner returned non-dict: {type(plan)}")
@@ -4843,15 +6199,22 @@ def run_generate_plan_from_nl_request() -> None:
         if not isinstance(plan["needs_user_input"], list) or not all(isinstance(x, str) for x in plan["needs_user_input"]):
             raise RuntimeError("Planner returned invalid 'needs_user_input' (must be list[str]).")
 
-        store_run_plan(plan)
+        store_run_plan(plan, mode=workflow_plan_mode)
         st.session_state.pop("_committed_plan_steps", None)
         apply_plan_config_to_ui(plan)
         if s(st.session_state.get("run_folder")):
             st.session_state.run_workspace_locked = True
         refresh_plan_editor_from_state(force=True, remount=True)
         seed_chat_from_generate_plan(user_prompt_for_metadata(), plan)
-        save_chat_messages_to_run_folder()
-        if langprompt_available() and openai_key:
+        save_preview_chat_messages()
+        save_prompt_history = prompt_library_action_enabled(
+            st.session_state.get(
+                "langprompt_save",
+                DEFAULT_SAVE_PROMPT_HISTORY,
+            ),
+            openai_key,
+        )
+        if save_prompt_history and langprompt_available():
             try:
                 save_prompt_to_library(
                     st.session_state.nl_request,
@@ -4859,7 +6222,11 @@ def run_generate_plan_from_nl_request() -> None:
                 )
             except Exception:
                 pass
-        st.success("Run plan generated.")
+        st.success(
+            "Simulation plan generated."
+            if workflow_plan_mode == WORKFLOW_PLAN_MODE_SIMULATION
+            else "Calibration plan generated."
+        )
         st.rerun()
     except Exception as e:
         st.error(f"Planning error: {e}")
@@ -5034,51 +6401,26 @@ def apply_plan_config_to_ui(plan: dict):
     if forcing_dataset:
         st.session_state.forcing_dataset = forcing_dataset
 
-    dates_changed = False
     if tstart:
         st.session_state.tstart = tstart
-        dates_changed = True
-    elif _is_ui_placeholder_experiment_date(s(st.session_state.tstart), which="start") or not s(
-        st.session_state.tstart
-    ):
-        # Planner omitted dates — do not keep Input-tab placeholder defaults.
-        if s(st.session_state.tstart):
-            dates_changed = True
-        st.session_state.tstart = ""
 
     if tend:
         st.session_state.tend = tend
-        dates_changed = True
-    elif _is_ui_placeholder_experiment_date(s(st.session_state.tend), which="end") or not s(
-        st.session_state.tend
-    ):
-        if s(st.session_state.tend):
-            dates_changed = True
-        st.session_state.tend = ""
 
     mpi_val = resolve_num_processes_from_plan_cfg(cfgp)
     if mpi_val is not None:
         st.session_state.mpi = mpi_val
 
-    bump_input_panel_widget_versions()
-    if dates_changed:
-        from widget_keys import bump_experiment_datetime_widget_version
+    st.session_state.want_create_pour_point = "create_pour_point" in set(
+        (plan or {}).get("steps") or []
+    )
 
-        bump_experiment_datetime_widget_version()
+    bump_input_panel_widget_versions()
     mark_spatial_inputs_stale()
 
     sync_run_folder_from_session()
 
     wx.apply_advanced_config_from_plan(cfgp)
-    prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
-    if user_forbids_mizuroute(prompt):
-        st.session_state.routing_model = ""
-        cfgp.pop("routing_model", None)
-        cfgp.pop("ROUTING_MODEL", None)
-        extra = cfgp.get("extra_config")
-        if isinstance(extra, dict):
-            extra.pop("routing_model", None)
-            extra.pop("ROUTING_MODEL", None)
     st.session_state.refresh_spatial_inputs = True
 
 
@@ -5121,8 +6463,7 @@ def force_steps(plan: dict, want_create_pour_point: bool) -> dict:
         ordered.insert(i, "setup_project")
         seen.add("setup_project")
 
-    need_pour_point = want_create_pour_point or "define_domain" in seen
-    if need_pour_point and "create_pour_point" not in seen:
+    if want_create_pour_point and "create_pour_point" not in seen:
         i = ordered.index("setup_project") + 1
         ordered.insert(i, "create_pour_point")
         seen.add("create_pour_point")
@@ -5135,11 +6476,24 @@ def force_steps(plan: dict, want_create_pour_point: bool) -> dict:
     return plan
 
 
-st.set_page_config(page_title="HydroAgent: Hydrological Workflow Assistant", layout="wide")
+st.set_page_config(page_title="HydroAgent: SYMFLUENCE Workflow Assistant Agent", layout="wide")
 
 st.markdown(
     """
 <style>
+    :root {
+        --sym-divider-color: rgba(49, 51, 63, 0.18);
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --sym-divider-color: rgba(250, 250, 250, 0.42);
+        }
+    }
+    html[data-theme="dark"],
+    body[data-theme="dark"],
+    [data-theme="dark"] {
+        --sym-divider-color: rgba(250, 250, 250, 0.42);
+    }
     /* Slightly compact typography for the whole app (CSS only, not config.toml). */
     html {
         font-size: 14px;
@@ -5158,7 +6512,7 @@ st.markdown(
         justify-content: space-between;
         gap: 1rem;
         padding: 0.25rem 0 0.85rem 0;
-        border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+        border-bottom: 1px solid var(--sym-divider-color);
         margin-bottom: 0.85rem;
     }
     .sym-title-wrap {
@@ -5244,18 +6598,19 @@ st.markdown(
         padding-bottom: 0 !important;
         margin-bottom: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) {
         align-items: stretch !important;
         margin-bottom: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+    [data-testid="stHorizontalBlock"]:has(.sym-main-panel) > [data-testid="column"] {
         display: flex !important;
         flex-direction: column !important;
         min-height: 0 !important;
     }
-    .sym-workflow-panels ~ div [data-testid="stHorizontalBlock"] > [data-testid="column"] [data-testid="stVerticalBlockBorderWrapper"] {
-        height: calc(100dvh - 10.5rem) !important;
-        max-height: calc(100dvh - 10.5rem) !important;
+    .sym-main-styled,
+    .sym-assistant-styled {
+        height: var(--sym-workflow-panel-height, 720px) !important;
+        max-height: var(--sym-workflow-panel-height, 720px) !important;
         overflow-y: auto !important;
         overflow-x: hidden !important;
         flex: 1 1 auto !important;
@@ -5294,7 +6649,7 @@ st.markdown(
 <div class="sym-header">
   <div class="sym-title-wrap">
     <div class="sym-title">HydroAgent</div>
-    <div class="sym-subtitle">Hydrological Workflow Assistant</div>
+    <div class="sym-subtitle">SYMFLUENCE Workflow Assistant Agent</div>
   </div>
   <div class="sym-status">✓ System status</div>
 </div>
@@ -5471,7 +6826,9 @@ def apply_loaded_run_to_session(
     st.session_state.assistant_panel_open = True
 
     if plan:
-        store_run_plan(plan)
+        # plan_cfg includes the executed YAML config and normalized run identity;
+        # plan.json may contain a later draft for a different domain.
+        store_run_plan({**plan, "config": plan_cfg})
         steps = plan.get("steps")
         if isinstance(steps, list):
             st.session_state["_committed_plan_steps"] = list(steps)
@@ -5575,8 +6932,8 @@ def load_assistant_run(run_folder: str) -> str | None:
     exp = s(plan_cfg.get("experiment_id"))
     domain_raw = s(plan_cfg.get("domain_name"))
     if domain_raw and exp:
-        basin, mac_suffix = symfluence_domain_mac_suffix(domain_raw)
-        if mac_suffix is None:
+        basin = basin_domain_for_run_folder(run_folder, domain_raw, exp)
+        if basin == domain_raw:
             basin = split_domain_name_from_combined(domain_raw, exp) or domain_raw
         plan_cfg["domain_name"] = basin
 
@@ -5587,6 +6944,7 @@ def load_assistant_run(run_folder: str) -> str | None:
         st.session_state.user_prompt = recovered_prompt
         st.session_state["_pending_nl_transcript"] = recovered_prompt
 
+    clear_explicit_ui_fields(st.session_state)
     apply_loaded_run_to_session(
         run_folder,
         plan_cfg,
@@ -5602,6 +6960,8 @@ def load_assistant_run(run_folder: str) -> str | None:
 
 
 def load_symfluence_data_domain(folder_name: str) -> str | None:
+    from server.core.run_naming import find_assistant_run_for_domain
+
     folder_name = s(folder_name)
     if not folder_name:
         return "Select a SYMFLUENCE data domain folder."
@@ -5616,6 +6976,15 @@ def load_symfluence_data_domain(folder_name: str) -> str | None:
             f"Could not infer domain_name and experiment_id from {folder_name}. "
             "Ensure the folder matches domain_<name>_<experiment> or has simulations/<experiment_id>."
         )
+
+    try:
+        saved_run = find_assistant_run_for_domain(
+            domain_name, experiment_id, RUNS_DIR, data_dir=SYMFLUENCE_DATA_DIR,
+        )
+    except ValueError as exc:
+        return str(exc)
+    if saved_run is not None:
+        return load_assistant_run(saved_run)
 
     plan_cfg = {"domain_name": domain_name, "experiment_id": experiment_id}
     cfg_path = domain_path / "config.yaml"
@@ -5677,9 +7046,21 @@ def render_start_load_run_section() -> None:
                 st.info(f"Active SYMFLUENCE domain: `{data_path}`")
             else:
                 st.info(f"Active run folder name: `{active_folder}` (not created on disk yet)")
-            if not st.session_state.get("run_workspace_locked") and " (" in active_folder:
+            base_folder = preview_run_folder_name(
+                s(st.session_state.domain_name),
+                s(st.session_state.experiment_id),
+            )
+            if (
+                not st.session_state.get("run_workspace_locked")
+                and active_folder != base_folder
+                and run_folder_belongs_to_workspace(
+                    active_folder,
+                    s(st.session_state.domain_name),
+                    s(st.session_state.experiment_id),
+                )
+            ):
                 st.caption(
-                    "Mac-style duplicate active — SYMFLUENCE data will go to a new "
+                    "Duplicate run active — SYMFLUENCE data will go to a new "
                     f"`domain_*` folder, not the original workspace."
                 )
         else:
@@ -5701,9 +7082,9 @@ def render_start_load_run_section() -> None:
             st.caption(
                 "Uses Domain name and Experiment ID to create "
                 f"`runs/<domain>_<experiment>/` (config.yaml, plan.json, spec.json). "
-                "If that workspace already exists, a Mac-style duplicate is created, e.g. "
-                "`Bow_at_Banff_semi_distributed_run_1 (1)` with data under "
-                "`domain_Bow_at_Banff_semi_distributed (1)/`."
+                "If that workspace already exists, a numbered duplicate is created, e.g. "
+                "`Bow_at_Banff_semi_distributed_run_1_1` with data under "
+                "`domain_Bow_at_Banff_semi_distributed_1/`."
             )
             if st.button("Create new run folder", key="start_new_assistant_run", width="stretch"):
                 err = start_new_assistant_run_from_session()
@@ -5783,6 +7164,16 @@ def user_prompt_for_metadata() -> str:
     if nl and not is_plan_json_text(nl):
         return nl
     return ""
+
+
+def prompt_phrase_matching_enabled() -> bool:
+    """Whether legacy deterministic phrase rules may inspect prompt prose."""
+    return bool(st.session_state.get("enable_prompt_phrase_matching", False))
+
+
+def phrase_matching_text(text: str = "") -> str:
+    """Expose prompt prose to legacy rules only when the user opts in."""
+    return s(text) if prompt_phrase_matching_enabled() else ""
 
 
 def capture_user_prompt_from_session() -> None:
@@ -5908,11 +7299,9 @@ def reconcile_chat_reply(
     return "\n\n".join(chunks)
 
 
-def save_chat_messages_to_run_folder() -> None:
-    run_folder = s(st.session_state.get("run_folder"))
-    if not run_folder or run_folder in RUN_FOLDER_SKIP:
-        return
-    outdir = RUNS_DIR / run_folder
+def save_preview_chat_messages() -> None:
+    """Save draft conversation; run metadata is written on explicit save/execution."""
+    outdir = PREVIEW_DIR
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "chat.json").write_text(
         json.dumps({"messages": get_chat_messages()}, indent=2),
@@ -5960,6 +7349,7 @@ def call_llm_refine_run_plan(
     context_text: str,
     preserve_workflow_steps: bool = False,
 ) -> tuple[str, dict, bool]:
+    enable_prompt_matching = prompt_phrase_matching_enabled()
     if provider_id == "gemini":
         return gemini_provider_client(api_key).refine_run_plan(
             model=model,
@@ -5969,6 +7359,7 @@ def call_llm_refine_run_plan(
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             preserve_workflow_steps=preserve_workflow_steps,
+            enable_prompt_matching=enable_prompt_matching,
         )
     if provider_id == "claude":
         return claude_provider_client(api_key).refine_run_plan(
@@ -5979,6 +7370,7 @@ def call_llm_refine_run_plan(
             context_text=context_text,
             data_dir=SYMFLUENCE_DATA_DIR,
             preserve_workflow_steps=preserve_workflow_steps,
+            enable_prompt_matching=enable_prompt_matching,
         )
     return openai_provider_client(api_key).refine_run_plan(
         model=model,
@@ -5988,6 +7380,7 @@ def call_llm_refine_run_plan(
         context_text=context_text,
         data_dir=SYMFLUENCE_DATA_DIR,
         preserve_workflow_steps=preserve_workflow_steps,
+        enable_prompt_matching=enable_prompt_matching,
     )
 
 
@@ -6027,7 +7420,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 "Still missing before execution: " + ", ".join(missing),
                 kind="warning",
             )
-        save_chat_messages_to_run_folder()
+        save_preview_chat_messages()
         return
 
     steps_only_change = (
@@ -6044,19 +7437,13 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             conversation_text=conversation_text,
             emit_chat_messages=False,
         )
+        stored = st.session_state.run_plan or pre_patched
         append_chat_message(
             "assistant",
-            "Updated the plan steps from your message.",
+            reconcile_chat_reply("", current_plan, stored, user_message=text),
             kind="text",
         )
-        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
-        if missing:
-            append_chat_message(
-                "assistant",
-                "Still missing before execution: " + ", ".join(missing),
-                kind="warning",
-            )
-        save_chat_messages_to_run_folder()
+        save_preview_chat_messages()
         return
 
     provider = s(st.session_state.get("llm_provider")) or "openai"
@@ -6075,7 +7462,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 "Updated the plan from your message (no API key needed for this change).",
                 kind="text",
             )
-            save_chat_messages_to_run_folder()
+            save_preview_chat_messages()
             return
         append_chat_message(
             "assistant",
@@ -6096,7 +7483,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 "Updated the plan from your message.",
                 kind="text",
             )
-            save_chat_messages_to_run_folder()
+            save_preview_chat_messages()
             return
         append_chat_message(
             "assistant",
@@ -6108,6 +7495,11 @@ def refine_plan_from_chat_message(user_text: str) -> None:
     working_plan = pre_patched if pre_changed else current_plan
     context_text = build_chat_refinement_context()
     model = s(st.session_state.get("llm_model")) or DEFAULT_LLM_MODEL.get(provider, "gpt-5-mini")
+    preserve_steps = _chat_message_preserves_workflow_steps(
+        text,
+        before=current_plan,
+        after=pre_patched if pre_changed else current_plan,
+    )
 
     try:
         reply, new_plan, updated = call_llm_refine_run_plan(
@@ -6118,6 +7510,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
             current_plan=working_plan,
             conversation_text=conversation_text,
             context_text=context_text,
+            preserve_workflow_steps=preserve_steps,
         )
         candidate = new_plan if updated else working_plan
         final_plan, _ = apply_chat_message_to_plan(candidate, text)
@@ -6127,16 +7520,15 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 final_plan,
                 user_message=text,
                 conversation_text=conversation_text,
+                emit_chat_messages=False,
             )
-        append_chat_message("assistant", reply)
-        missing = (st.session_state.run_plan or {}).get("needs_user_input") or []
-        if missing:
-            append_chat_message(
-                "assistant",
-                "Still missing before execution: " + ", ".join(missing),
-                kind="warning",
-            )
-        save_chat_messages_to_run_folder()
+        stored = st.session_state.run_plan or final_plan
+        append_chat_message(
+            "assistant",
+            reconcile_chat_reply(reply, current_plan, stored, user_message=text),
+            kind="text",
+        )
+        save_preview_chat_messages()
     except Exception as e:
         if pre_changed:
             commit_chat_plan_update(
@@ -6150,7 +7542,7 @@ def refine_plan_from_chat_message(user_text: str) -> None:
                 f"LLM refinement failed ({e}), but I applied the config change from your message.",
                 kind="info",
             )
-            save_chat_messages_to_run_folder()
+            save_preview_chat_messages()
             return
         append_chat_message(
             "assistant",
@@ -6214,6 +7606,43 @@ def clear_chat_messages(*, clear_plan: bool = False) -> None:
     st.session_state.pop("_committed_plan_steps", None)
 
 
+def render_new_workflow_control() -> None:
+    """Render the global, confirmed reset action for the Assistant panel."""
+    control_version = int(st.session_state.get("new_workflow_control_version", 0))
+    title_col, action_col = st.columns([0.58, 0.42], vertical_alignment="center")
+    with title_col:
+        st.markdown("#### Assistant")
+    with action_col:
+        with st.popover(
+            "New workflow",
+            key=f"new_workflow_popover_v{control_version}",
+            use_container_width=True,
+            help="Clear the current draft and detach the active run without deleting saved files.",
+        ):
+            st.markdown("**Start a new workflow?**")
+            st.caption(
+                "This clears the current prompt, plan, configuration, and map selections. "
+                "Saved runs and SYMFLUENCE data will not be deleted."
+            )
+            if workflow_running_for_current_run():
+                st.info("The current workflow will continue in its saved run.")
+            if st.button(
+                "Start new workflow",
+                key=f"confirm_new_workflow_v{control_version}",
+                type="primary",
+                width="stretch",
+            ):
+                reset_workflow_session_state(st.session_state)
+                reset_map_layer_ui_state()
+                # Remounting the popover gives it a fresh, closed frontend state.
+                st.session_state["new_workflow_control_version"] = control_version + 1
+                st.session_state["_new_workflow_flash"] = True
+                st.rerun()
+
+    if st.session_state.pop("_new_workflow_flash", False):
+        st.success("New workflow ready. Describe what you want in the prompt.")
+
+
 ASSISTANT_PANEL_TABS_KEY = "assistant_panel_tabs"
 ASSISTANT_TAB_PROMPT = "Prompt"
 ASSISTANT_TAB_CHAT = "Chat"
@@ -6257,12 +7686,12 @@ def render_workflow_chat_tab() -> None:
     with clear_chat_col:
         if st.button("Clear chat", key="clear_chat_button", width="stretch", type="secondary"):
             clear_chat_messages(clear_plan=False)
-            save_chat_messages_to_run_folder()
+            save_preview_chat_messages()
             st.rerun()
     with clear_all_col:
         if st.button("Clear chat & plan", key="clear_chat_and_plan_button", width="stretch", type="secondary"):
             clear_chat_messages(clear_plan=True)
-            save_chat_messages_to_run_folder()
+            save_preview_chat_messages()
             st.rerun()
     st.caption(
         "**Clear chat** removes message history only. **Clear chat & plan** also removes the run plan on the Prompt tab."
@@ -6385,9 +7814,9 @@ def render_workflow_assistant_panel() -> None:
         '<span class="sym-assistant-panel" aria-hidden="true"></span><div class="right-panel">',
         unsafe_allow_html=True,
     )
-    render_workflow_panel_dom_hooks()
     apply_pending_assistant_panel_tab_focus()
     capture_plan_editor_draft()
+    render_new_workflow_control()
     st.radio(
         "Assistant panel",
         options=[ASSISTANT_TAB_PROMPT, ASSISTANT_TAB_CHAT],
@@ -6405,8 +7834,6 @@ def render_workflow_assistant_panel() -> None:
             plan_text_holder = render_persistent_plan_editor(visible=False)
         render_workflow_chat_tab()
     else:
-        st.markdown("#### LLM Assistant")
-
         if not FORCINGS_AVAILABLE:
             st.warning("Local install: acquire_forcings is disabled. Use HPC/MAF or provide external forcings.")
 
@@ -6415,6 +7842,7 @@ def render_workflow_assistant_panel() -> None:
             _cfg_key = persistent_cfg.get(f"{_provider}_api_key")
             if _cfg_key and not st.session_state.api_keys.get(_provider):
                 st.session_state.api_keys[_provider] = _cfg_key
+                st.session_state["_api_key_sources"][_provider] = "local settings"
 
         provider_labels = list(LLM_PROVIDER_BY_LABEL.keys())
         current_provider = s(st.session_state.get("llm_provider")) or "openai"
@@ -6433,12 +7861,18 @@ def render_workflow_assistant_panel() -> None:
         active_provider_label = LLM_PROVIDER_LABELS[active_provider]
 
         if st.session_state.api_keys.get(active_provider):
-            st.success(f"{active_provider_label} API key loaded ✔")
+            active_key_source = st.session_state["_api_key_sources"].get(active_provider)
+            if active_key_source == "OPENAI_API_KEY":
+                st.success(
+                    f"{active_provider_label} API key loaded from `OPENAI_API_KEY` ✔"
+                )
+            else:
+                st.success(f"{active_provider_label} API key loaded ✔")
         else:
             st.warning(f"No {active_provider_label} API key loaded")
 
         api_key_help = {
-            "openai": "OpenAI API key.",
+            "openai": "OpenAI API key. HydroAgent automatically uses OPENAI_API_KEY when set.",
             "gemini": "Google AI Studio / Gemini API key.",
             "claude": "Anthropic API key from console.anthropic.com.",
         }.get(active_provider, "LLM API key.")
@@ -6451,6 +7885,7 @@ def render_workflow_assistant_panel() -> None:
         if st.button("Save key", key="save_openai_key", width="stretch", type="secondary"):
             if api_key.strip():
                 st.session_state.api_keys[active_provider] = api_key.strip()
+                st.session_state["_api_key_sources"][active_provider] = "local settings"
                 cfg_local = load_local_settings()
                 cfg_local[f"{active_provider}_api_key"] = api_key.strip()
                 save_local_settings(cfg_local)
@@ -6545,13 +7980,70 @@ def render_workflow_assistant_panel() -> None:
                 '<div class="assistant-plan-divider">------------------</div>',
                 unsafe_allow_html=True,
             )
+        gen_sim_col, gen_cal_col = st.columns(2)
+        with gen_sim_col:
             if st.button(
-                "Generate plan",
-                key="generate_plan_gpt",
+                "Generate simulation plan",
+                key="generate_plan_simulation",
+                width="stretch",
+                type="primary",
+                help="Domain setup, preprocessing, and run_model — no calibration or gauge download.",
+            ):
+                run_generate_plan_from_nl_request(workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION)
+        with gen_cal_col:
+            if st.button(
+                "Generate calibration plan",
+                key="generate_plan_calibration",
                 width="stretch",
                 type="secondary",
+                help="Adds process_observed_data, calibrate_model, station_id, and optimization settings.",
             ):
-                run_generate_plan_from_nl_request()
+                run_generate_plan_from_nl_request(workflow_plan_mode=WORKFLOW_PLAN_MODE_CALIBRATION)
+
+        # Calibration agent: visible once a plan exists (calibration plans use it; simulation plans can add cal later).
+        if st.session_state.get("run_plan") is None:
+            st.info(
+                "After you generate a plan, the **Calibration agent (CalibHydroAgent)** panel appears here. "
+                "Use **Generate calibration plan** when you are ready to optimize parameters."
+            )
+        else:
+            mode_label = plan_workflow_mode(st.session_state.run_plan)
+            if mode_label == WORKFLOW_PLAN_MODE_SIMULATION:
+                st.caption("Plan mode: **simulation** — no station/calibration fields unless you add them in chat.")
+            elif mode_label == WORKFLOW_PLAN_MODE_CALIBRATION:
+                st.caption("Plan mode: **calibration** — includes gauge data and calibrate_model when applicable.")
+
+            st.session_state.allow_run = st.checkbox(
+                "Allow dangerous run steps",
+                value=st.session_state.get("allow_run", False),
+                key="allow_run_before_calibration",
+            )
+            st.text_input(
+                "Type RUN to allow dangerous execution",
+                key="danger_phrase",
+                help="Required for run_model or calibrate_model.",
+            )
+
+            assistant_cal_agent_out = st.empty()
+
+            def _assistant_run_calibration_agent(mode: str) -> None:
+                if mode == "run" and not st.session_state.allow_run:
+                    st.error("Enable **Allow dangerous run steps** first.")
+                    return
+                ok, result = run_calibration_agent_from_state(mode, assistant_cal_agent_out)
+                if result.get("error"):
+                    st.error(result["error"])
+                elif mode == "design" and ok:
+                    st.success("Calibration config designed and validated.")
+                elif mode == "run" and ok and (result.get("run") or {}).get("success"):
+                    st.success("Calibration agent run finished.")
+                elif mode == "run":
+                    st.error("Calibration agent run did not succeed.")
+
+            wx.render_calibration_agent_section(
+                run_agent_fn=_assistant_run_calibration_agent,
+                location="assistant",
+            )
 
         if st.session_state.get("run_plan") is not None:
             plan_text_holder = render_persistent_plan_editor(visible=True)
@@ -6581,28 +8073,17 @@ def render_workflow_assistant_panel() -> None:
             st.session_state.want_create_pour_point = st.checkbox(
                 "Also run create_pour_point",
                 value=st.session_state.want_create_pour_point,
-                help=(
-                    "Creates the pour-point shapefile from coordinates. "
-                    "Always inserted before define_domain when that shapefile is missing."
-                ),
-            )
-            st.session_state.allow_run = st.checkbox(
-                "Allow dangerous run steps",
-                value=st.session_state.get("allow_run", False),
-            )
-            st.text_input(
-                "Type RUN to allow dangerous execution",
-                key="danger_phrase",
-                help="Required for run_model or calibrate_model.",
             )
 
-            needs = st.session_state.run_plan.get("needs_user_input", []) or []
+            render_fix_missing_inputs_section(
+                (st.session_state.run_plan or {}).get("needs_user_input", []) or []
+            )
+            needs = (st.session_state.run_plan or {}).get("needs_user_input", []) or []
             if needs:
                 st.warning(
                     f"{len(needs)} required field(s) missing before execution. "
-                    "Use the section below or the Input tab."
+                    "Use the section above or the Input tab."
                 )
-                render_fix_missing_inputs_section(needs)
 
             assistant_shortcut_out = st.empty()
             wx.render_run_shortcuts_section(
@@ -6610,23 +8091,6 @@ def render_workflow_assistant_panel() -> None:
                 location="assistant",
             )
 
-            assistant_cal_out = st.empty()
-
-            def _assistant_run_calibrate() -> None:
-                if not st.session_state.allow_run:
-                    st.error("Enable **Allow dangerous run steps** first.")
-                    return
-                with st.spinner("Running calibration…"):
-                    rc, _ = execute_single_symfluence_step("calibrate_model", assistant_cal_out)
-                if rc == 0:
-                    st.success("Calibration step finished.")
-                else:
-                    st.error(f"Calibration failed (return code {rc}).")
-
-            wx.render_calibration_section(
-                execute_calibrate_fn=_assistant_run_calibrate,
-                location="assistant",
-            )
             steps_set = set(st.session_state.run_plan.get("steps", []) or [])
             needs_confirm = bool(steps_set & DANGER_STEPS)
             can_execute = len(needs) == 0
@@ -6744,14 +8208,6 @@ def write_run_metadata_files(outdir: Path, plan: dict, spec_dict: dict | None = 
         )
 
 
-def mirror_preview_plan_to_run_folder(plan: dict, spec_dict: dict | None = None) -> None:
-    """Copy the current plan into the active run folder when domain + experiment are set."""
-    run_folder = s(st.session_state.get("run_folder"))
-    if not run_folder or run_folder in RUN_FOLDER_SKIP:
-        return
-    write_run_metadata_files(RUNS_DIR / run_folder, plan, spec_dict)
-
-
 def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
     plan_cfg_local = (st.session_state.run_plan or {}).get("config", {}) or {}
     real_spec_dict = build_spec_dict(plan_cfg_local)
@@ -6823,6 +8279,22 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 
     dump_yaml(real_cfg, real_out_yaml)
 
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg_local)
+    station_id = resolve_station_id_from_plan(
+        station_lookup_cfg,
+        phrase_matching_text(
+            user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+        ),
+        fallback=s(st.session_state.station_id),
+    )
+    if station_id:
+        real_cfg["STATION_ID"] = station_id
+        if not domain_has_usable_local_streamflow(
+            SYMFLUENCE_DATA_DIR, s(real_cfg.get("DOMAIN_NAME")), real_cfg
+        ):
+            real_cfg["DOWNLOAD_WSC_DATA"] = True
+        dump_yaml(real_cfg, real_out_yaml)
+
     write_run_metadata_files(
         real_outdir,
         st.session_state.run_plan or {},
@@ -6835,6 +8307,39 @@ def build_real_run_files_from_state() -> tuple[Path, Path, dict, dict]:
 def append_session_execution_log(chunk: str) -> None:
     prev = st.session_state.get("execution_log_text", "") or ""
     st.session_state.execution_log_text = prev + chunk
+
+
+def append_calibration_agent_to_execution_log(outdir: Path, result: dict) -> None:
+    """Persist CalibHydroAgent subprocess output into the run execution.log."""
+    run = result.get("run") if isinstance(result.get("run"), dict) else {}
+    logs = str(run.get("logs_excerpt") or result.get("error") or "").strip()
+    rc = run.get("return_code")
+    stopped = result.get("stopped")
+    interp = result.get("interpretation") if isinstance(result.get("interpretation"), dict) else {}
+    summary = str(interp.get("summary") or "").strip()
+    lines = ["", "===== STEP: calibrate_model ====="]
+    command = run.get("raw", {}).get("command") if isinstance(run.get("raw"), dict) else None
+    if command:
+        lines.append("$ " + " ".join(str(part) for part in command))
+    if stopped:
+        lines.append(f"stopped={stopped}")
+    if summary:
+        lines.append(summary)
+    if logs:
+        lines.append(logs)
+    else:
+        lines.append("(no subprocess output captured)")
+    if rc is not None:
+        lines.append(f"\n[STEP calibrate_model] return code: {rc}")
+    chunk = "\n".join(lines) + "\n"
+    log_path = execution_log_path(outdir)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(chunk)
+    append_session_execution_log(chunk)
+    from server.core.calibration_logs import persist_calibration_logs_for_run
+
+    persist_calibration_logs_for_run(outdir)
 
 
 def manual_execution_log_path(outdir: Path) -> Path:
@@ -6897,7 +8402,7 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
     """Return a user-facing error when config is missing fields required for a step."""
     plan = st.session_state.run_plan or {}
     plan_cfg = plan.get("config") or {}
-    user_request = user_prompt_for_metadata()
+    user_request = phrase_matching_text(user_prompt_for_metadata())
     domain_name = s(cfg.get("DOMAIN_NAME") or plan_cfg.get("domain_name"))
     experiment_id = s(plan_cfg.get("experiment_id") or cfg.get("EXPERIMENT_ID") or "run_1")
     forcing_dataset = s(plan_cfg.get("forcing_dataset") or cfg.get("FORCING_DATASET") or "ERA5")
@@ -6922,8 +8427,14 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
             "(north/west/south/east)."
         )
 
+    pour = s(cfg.get("POUR_POINT_COORDS") or plan_cfg.get("pour_point_coords"))
+    symfluence_domain = (
+        s(cfg.get("DOMAIN_NAME"))
+        or symfluence_domain_name(domain_name, experiment_id)
+        or domain_name
+    )
+
     if step == "define_domain":
-        pour = s(cfg.get("POUR_POINT_COORDS"))
         bbox = s(cfg.get("BOUNDING_BOX_COORDS"))
         ok, msg = pour_point_inside_bounding_box(pour, bbox)
         if not ok:
@@ -6932,15 +8443,22 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
                 f"the bounding box. {msg}"
             )
 
+    basin_err = basin_pour_point_preflight_error(
+        step, pour, SYMFLUENCE_DATA_DIR, symfluence_domain
+    )
+    if basin_err:
+        return basin_err
+
     if step == "discretize_domain" and domain_name:
-        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, domain_name):
+        if not domain_has_local_river_basins(SYMFLUENCE_DATA_DIR, symfluence_domain):
             return (
                 "discretize_domain needs river basin shapefiles from define_domain first. "
-                f"No {domain_name}_riverBasins_*.shp under "
-                f"SYMFLUENCE_data/domain_{domain_name}/shapefiles/river_basins/. "
+                f"No {symfluence_domain}_riverBasins_*.shp under "
+                f"SYMFLUENCE_data/domain_{symfluence_domain}/shapefiles/river_basins/. "
                 "Re-run define_domain and confirm that shapefile exists before HRU. "
-                "If define_domain reported success but the file is missing, check the pour "
-                "point lies inside the bounding box (north/west/south/east)."
+                "If define_domain reported success but the file is missing, the pour point "
+                "may lie off the river network or delineation failed for a basin-related reason "
+                "(widening the bounding box alone may not fix this)."
             )
 
     if step == "model_agnostic_preprocessing" and domain_name:
@@ -6975,10 +8493,17 @@ def symfluence_step_preflight_error(step: str, cfg: dict) -> str | None:
             )
 
     if step == "model_specific_preprocessing" and domain_name:
+        if domain_has_remapped_forcing(SYMFLUENCE_DATA_DIR, domain_name):
+            return None
         if domain_has_forcing_intersection(
             SYMFLUENCE_DATA_DIR, domain_name, forcing_dataset=forcing_dataset
         ):
-            return None
+            return (
+                "model_specific_preprocessing needs remapped basin-averaged forcing "
+                "(.nc under data/forcing/basin_averaged_data). MAP created the intersection "
+                "shapefile but remapping did not write NetCDF files. Re-run "
+                "model_agnostic_preprocessing."
+            )
         return (
             "model_specific_preprocessing needs the ERA5/catchment intersection from "
             "model_agnostic_preprocessing. Run define_domain → discretize_domain → "
@@ -6996,6 +8521,69 @@ def format_subprocess_return_code(rc: int) -> str:
             "see execution.log and SYMFLUENCE_data/.../_workLog_.../)"
         )
     return str(rc)
+
+
+def run_calibration_agent_from_state(mode: str, output_box) -> tuple[bool, dict]:
+    """Invoke CalibHydroAgent via server.calibration.agent_integration."""
+    from server.calibration.agent_integration import run_calibration_assistant
+
+    outdir, out_yaml, manual_cfg, _ = build_real_run_files_from_state()
+    st.session_state["_calib_base_config"] = manual_cfg
+
+    user_prompt = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    allow = bool(st.session_state.get("allow_run")) and mode == "run"
+
+    with st.spinner("Calibration agent…" if mode == "run" else "Designing calibration…"):
+        result = run_calibration_assistant(
+            config_path=out_yaml,
+            session_state=session_state_snapshot(),
+            plan=st.session_state.run_plan or {},
+            user_prompt=user_prompt,
+            symfluence_repo=SYMFLUENCE_REPO,
+            symfluence_python=SYMFLUENCE_PYTHON,
+            symfluence_data_dir=SYMFLUENCE_DATA_DIR,
+            calib_repo=DEFAULT_CALIB_HYDRO_AGENT_REPO,
+            execute=(mode == "run"),
+            allow_dangerous=allow,
+            auto_replan=bool(st.session_state.get("calib_agent_auto_replan")),
+            sensitivity_guided=bool(st.session_state.get("calib_agent_sensitivity_guided")),
+            top_n_params=int(st.session_state.get("calib_agent_top_n_params", 4) or 4),
+            screening_iterations=int(st.session_state.get("calib_agent_screening_iterations", 30) or 30),
+        )
+
+    st.session_state["calib_agent_last_outcome"] = result
+    updated_plan = result.get("updated_plan")
+    if isinstance(updated_plan, dict):
+        store_run_plan(updated_plan, mode=WORKFLOW_PLAN_MODE_CALIBRATION)
+        wx.apply_advanced_config_from_plan((updated_plan.get("config") or {}))
+        refresh_plan_editor_from_state(force=True, remount=True)
+        bump_input_panel_widget_version()
+        bump_config_preview_version()
+        write_run_metadata_files(
+            outdir,
+            st.session_state.run_plan or updated_plan,
+            spec_dict=result.get("spec"),
+        )
+
+    msg_lines = []
+    stopped = result.get("stopped")
+    if stopped:
+        msg_lines.append(f"stopped={stopped}")
+    interp = result.get("interpretation") or {}
+    if isinstance(interp, dict) and interp.get("summary"):
+        msg_lines.append(interp["summary"])
+    if result.get("error"):
+        msg_lines.append(str(result["error"]))
+    text = "\n".join(msg_lines) or json.dumps(result, indent=2, default=str)
+    if output_box is not None:
+        output_box.code(text)
+    if mode == "run":
+        append_calibration_agent_to_execution_log(outdir, result)
+    else:
+        append_session_execution_log(f"\n[CalibHydroAgent mode={mode}]\n{text}\n")
+    if isinstance(updated_plan, dict):
+        st.rerun()
+    return bool(result.get("ok")), result
 
 
 def execute_single_symfluence_step(step: str, output_box) -> tuple[int, str]:
@@ -7101,58 +8689,40 @@ def render_run_single_steps_section() -> None:
                 else:
                     st.error(f"Dry run failed (return code {rc}).")
 
-        proven_steps = [
+        allow_dangerous = bool(st.session_state.get("allow_run"))
+        st.markdown("**Workflow steps**")
+        if not allow_dangerous:
+            st.caption(
+                "**Run model** and **Calibrate** appear below but are disabled until you enable "
+                "**Allow dangerous run steps** in the Assistant panel."
+            )
+
+        runnable_steps = [
             (step, label)
             for step, label in WORKFLOW_DISPLAY_ORDER
-            if PROVEN_STATUS.get(step, False)
+            if step in SUPPORTED_STEPS
         ]
-        if proven_steps:
-            st.markdown("**Proven workflow steps**")
-            cols = st.columns(3)
-            for i, (step, label) in enumerate(proven_steps):
-                with cols[i % 3]:
-                    if st.button(
-                        f"Run {label}",
-                        key=f"input_single_{step}",
-                        width="stretch",
-                    ):
-                        with st.spinner(f"Running {label}…"):
-                            rc, _ = execute_single_symfluence_step(step, step_output)
-                        if rc == 0:
-                            st.success(f"{label} completed.")
-                        else:
-                            st.error(f"{label} failed (return code {rc}).")
-
-        st.markdown("**Dangerous steps**")
-        if not st.session_state.allow_run:
-            st.caption("Enable **Allow dangerous run steps** in the assistant panel to run model or calibration.")
-        danger_cols = st.columns(2)
-        with danger_cols[0]:
-            if st.button(
-                "Run model",
-                key="input_single_run_model",
-                width="stretch",
-                disabled=not st.session_state.allow_run,
-            ):
-                with st.spinner("Running model…"):
-                    rc, _ = execute_single_symfluence_step("run_model", step_output)
-                if rc == 0:
-                    st.success("Model run completed.")
-                else:
-                    st.error(f"Model run failed (return code {rc}).")
-        with danger_cols[1]:
-            if st.button(
-                "Calibrate model",
-                key="input_single_calibrate_model",
-                width="stretch",
-                disabled=not st.session_state.allow_run,
-            ):
-                with st.spinner("Calibrating…"):
-                    rc, _ = execute_single_symfluence_step("calibrate_model", step_output)
-                if rc == 0:
-                    st.success("Calibration completed.")
-                else:
-                    st.error(f"Calibration failed (return code {rc}).")
+        cols = st.columns(3)
+        for i, (step, label) in enumerate(runnable_steps):
+            is_danger = step in DANGER_STEPS
+            btn_label = f"Run {label}"
+            if is_danger:
+                btn_label = f"Run {label} (dangerous)"
+            if not PROVEN_STATUS.get(step, False) and not is_danger:
+                btn_label = f"Run {label} (experimental)"
+            with cols[i % 3]:
+                if st.button(
+                    btn_label,
+                    key=f"input_single_{step}",
+                    width="stretch",
+                    disabled=is_danger and not allow_dangerous,
+                ):
+                    with st.spinner(f"Running {label}…"):
+                        rc, _ = execute_single_symfluence_step(step, step_output)
+                    if rc == 0:
+                        st.success(f"{label} completed.")
+                    else:
+                        st.error(f"{label} failed (return code {rc}).")
 
         unproven_labels = [
             label
@@ -7163,9 +8733,10 @@ def render_run_single_steps_section() -> None:
         ]
         if unproven_labels:
             st.caption(
-                "Not available here yet: "
+                "Experimental steps may change; prefer **Execute plan** when they are in your plan. "
+                "Not marked proven yet: "
                 + ", ".join(unproven_labels)
-                + ". Use **Plan steps** or **Execute plan** when those steps are in your plan."
+                + "."
             )
 
 
@@ -7174,21 +8745,31 @@ def render_workflow_input_tab() -> None:
 
     render_start_load_run_section()
     
-    start_dt = parse_datetime_value(st.session_state.tstart, dt.datetime(2001, 1, 1, 1, 0))
-    end_dt = parse_datetime_value(st.session_state.tend, dt.datetime(2001, 1, 10, 23, 0))
+    start_dt = resolve_experiment_datetime("start")
+    end_dt = resolve_experiment_datetime("end")
+    start_date_default = _clamp_experiment_date(start_dt.date())
+    end_date_default = _clamp_experiment_date(end_dt.date(), min_date=start_date_default)
     
     ws1, ws2, ws3 = st.columns(3)
     with ws1:
-        st.session_state.domain_name = st.text_input(
+        st.text_input(
             "Domain name",
             st.session_state.domain_name,
             key=input_panel_widget_key("input_domain_name"),
+            on_change=on_input_domain_name_change,
+        )
+        st.session_state.domain_name = s(
+            st.session_state.get(input_panel_widget_key("input_domain_name"))
         )
     with ws2:
-        st.session_state.experiment_id = st.text_input(
+        st.text_input(
             "Experiment ID",
             st.session_state.experiment_id,
             key=input_panel_widget_key("input_experiment_id"),
+            on_change=on_input_experiment_id_change,
+        )
+        st.session_state.experiment_id = s(
+            st.session_state.get(input_panel_widget_key("input_experiment_id"))
         )
     with ws3:
         st.session_state.run_folder = st.text_input(
@@ -7212,6 +8793,8 @@ def render_workflow_input_tab() -> None:
             index=HYDROLOGICAL_MODEL_OPTIONS.index(hydro_value),
             help="Leave blank if the model should come only from the prompt/plan.",
             key=input_panel_widget_key("input_hydrological_model"),
+            on_change=mark_workflow_ui_fields_explicit,
+            args=("hydrological_model",),
         )
     with ws5:
         domain_value = coerce_selectbox_value(st.session_state.domain_def, DOMAIN_DEF_OPTIONS)
@@ -7221,6 +8804,8 @@ def render_workflow_input_tab() -> None:
             index=DOMAIN_DEF_OPTIONS.index(domain_value),
             help="How the spatial domain should be defined.",
             key=input_panel_widget_key("input_domain_def"),
+            on_change=mark_workflow_ui_fields_explicit,
+            args=("domain_def",),
         )
     with ws6:
         forcing_value = coerce_selectbox_value(
@@ -7234,6 +8819,8 @@ def render_workflow_input_tab() -> None:
             index=FORCING_DATASET_OPTIONS.index(forcing_value),
             help="Must match a SYMFLUENCE FORCING_DATASET value.",
             key=input_panel_widget_key("input_forcing_dataset"),
+            on_change=mark_workflow_ui_fields_explicit,
+            args=("forcing_dataset",),
         )
     
     ws7, ws8, ws9 = st.columns(3)
@@ -7244,34 +8831,62 @@ def render_workflow_input_tab() -> None:
             128,
             int(st.session_state.mpi),
             key=mpi_widget_key(),
+            on_change=mark_workflow_ui_fields_explicit,
+            args=("num_processes",),
         )
         sync_mpi_to_run_plan()
     with ws8:
         start_date = st.date_input(
             "Start date",
-            value=start_dt.date(),
+            value=start_date_default,
+            min_value=EXPERIMENT_DATE_MIN,
+            max_value=EXPERIMENT_DATE_MAX,
+            help=_EXPERIMENT_DATE_HELP,
             key=experiment_datetime_widget_key("experiment_start_date"),
+            on_change=mark_experiment_datetime_explicit,
+            args=("start",),
         )
         start_time = st.time_input(
             "Start time",
             value=start_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_start_time"),
+            on_change=mark_experiment_datetime_explicit,
+            args=("start",),
         )
-        st.session_state.tstart = format_datetime_value(start_date, start_time)
+        commit_experiment_datetime_from_widgets(
+            kind="start",
+            date_value=start_date,
+            time_value=start_time,
+        )
     with ws9:
         end_date = st.date_input(
             "End date",
-            value=end_dt.date(),
+            value=end_date_default,
+            min_value=max(EXPERIMENT_DATE_MIN, start_date),
+            max_value=EXPERIMENT_DATE_MAX,
+            help=_EXPERIMENT_DATE_HELP,
             key=experiment_datetime_widget_key("experiment_end_date"),
+            on_change=mark_experiment_datetime_explicit,
+            args=("end",),
         )
         end_time = st.time_input(
             "End time",
             value=end_dt.time().replace(second=0, microsecond=0),
             key=experiment_datetime_widget_key("experiment_end_time"),
+            on_change=mark_experiment_datetime_explicit,
+            args=("end",),
         )
-        st.session_state.tend = format_datetime_value(end_date, end_time)
+        commit_experiment_datetime_from_widgets(
+            kind="end",
+            date_value=end_date,
+            time_value=end_time,
+        )
     
-    st.caption(f"Experiment time window: `{st.session_state.tstart}` → `{st.session_state.tend}`")
+    st.caption(
+        "Experiment time window: "
+        f"`{effective_experiment_time_string('start') or '—'}` → "
+        f"`{effective_experiment_time_string('end') or '—'}`"
+    )
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown(
@@ -7298,7 +8913,9 @@ def render_workflow_input_tab() -> None:
             key=pour_point_widget_key(),
             on_change=on_pour_point_input_change,
         )
-        if st.button("Clear pour point", key="clear_selected_pour_point"):
+        if st.button(
+            "Clear pour point", key="clear_selected_pour_point", width="stretch"
+        ):
             _handle_clear_pour_point()
             st.rerun()
     with bbox_col:
@@ -7307,7 +8924,9 @@ def render_workflow_input_tab() -> None:
             key=bounding_box_widget_key(),
             on_change=on_bounding_box_input_change,
         )
-        if st.button("Clear bounding box", key="clear_selected_bbox"):
+        if st.button(
+            "Clear bounding box", key="clear_selected_bbox", width="stretch"
+        ):
             _handle_clear_bounding_box()
             st.rerun()
 
@@ -7319,8 +8938,15 @@ def render_workflow_input_tab() -> None:
         show_hrugru_layer=False,
         show_forcing_layer=False,
         show_rivernetwork_layer=False,
+        show_layer_control=False,
     )
-    map_data = render_workflow_map(map_obj, key=workflow_input_map_widget_key(), height=430)
+    map_data = render_workflow_map(
+        map_obj,
+        key=workflow_input_map_widget_key(),
+        height=430,
+        feature_group_to_add=build_spatial_selection_feature_group(),
+        on_change=_on_workflow_input_map_change,
+    )
     handle_workflow_map_selection(map_data)
     
     status_col1, status_col2 = st.columns(2)
@@ -7338,6 +8964,8 @@ def render_workflow_input_tab() -> None:
             st.caption("Bounding box mode: click first corner, then opposite corner.")
 
     sync_input_panel_to_run_plan()
+    wx.render_advanced_config_section()
+    render_run_single_steps_section()
     shortcut_output = st.empty()
     wx.render_run_shortcuts_section(
         execute_bundle_fn=lambda key: execute_step_bundle(key, shortcut_output),
@@ -7347,6 +8975,7 @@ def render_workflow_input_tab() -> None:
 
 
 def sync_preview_artifacts() -> None:
+    """Refresh draft artifacts without changing a saved run's provenance."""
     global cfg, preview_yaml, spec_dict
 
     plan_cfg = effective_plan_config_for_preview()
@@ -7401,58 +9030,13 @@ def sync_preview_artifacts() -> None:
     update_run_plan_needs_user_input()
 
     preview_plan_json = preview_dir / "plan_preview.json"
-    plan_to_save = json.loads(json.dumps(st.session_state.run_plan or {}))
-    plan_to_save.setdefault("config", {})
-    
-    if s(st.session_state.domain_name):
-        plan_to_save["config"]["domain_name"] = s(st.session_state.domain_name)
-    if s(st.session_state.experiment_id):
-        plan_to_save["config"]["experiment_id"] = s(st.session_state.experiment_id)
-    
-    effective_model = current_hydrological_model((st.session_state.run_plan or {}).get("config", {}) or {})
-    if effective_model:
-        plan_to_save["config"]["hydrological_model"] = effective_model
-    elif "hydrological_model" in plan_to_save["config"]:
-        plan_to_save["config"].pop("hydrological_model", None)
-    
-    effective_pour = visible_selected_pour() or s(
-        (st.session_state.run_plan or {}).get("config", {}).get("pour_point_coords")
+    plan_to_save = apply_explicit_workflow_ui_overrides(
+        json.loads(json.dumps(st.session_state.run_plan or {}))
     )
-    if effective_pour:
-        plan_to_save["config"]["pour_point_coords"] = effective_pour
-    elif "pour_point_coords" in plan_to_save["config"]:
-        plan_to_save["config"].pop("pour_point_coords", None)
-    
-    if s(st.session_state.domain_def):
-        plan_to_save["config"]["domain_def"] = s(st.session_state.domain_def)
-    if s(st.session_state.forcing_dataset):
-        plan_to_save["config"]["forcing_dataset"] = s(st.session_state.forcing_dataset)
-    if s(st.session_state.tstart):
-        plan_to_save["config"]["experiment_time_start"] = s(st.session_state.tstart)
-    if s(st.session_state.tend):
-        plan_to_save["config"]["experiment_time_end"] = s(st.session_state.tend)
-
-    mpi_val = resolve_num_processes_from_plan_cfg(plan_to_save.get("config") or {}) or int(
-        st.session_state.mpi
-    )
-    plan_to_save["config"]["num_processes"] = mpi_val
-    plan_to_save["config"].pop("NUM_PROCESSES", None)
-    
-    effective_bbox = visible_selected_bbox() or s(
-        (st.session_state.run_plan or {}).get("config", {}).get("bounding_box_coords")
-    )
-    
-    if effective_bbox:
-        plan_to_save["config"]["bounding_box_coords"] = effective_bbox
-    elif "bounding_box_coords" in plan_to_save["config"]:
-        plan_to_save["config"].pop("bounding_box_coords", None)
     
     plan_to_save = normalize_plan_for_storage(plan_to_save)
     with open(preview_plan_json, "w", encoding="utf-8") as f:
         json.dump(plan_to_save, f, indent=2)
-
-    if st.session_state.get("run_plan"):
-        mirror_preview_plan_to_run_folder(plan_to_save, spec_dict)
 
 
 def workflow_output_config_preview() -> tuple[str, str]:
@@ -7501,21 +9085,10 @@ def render_workflow_output_tab() -> None:
 
     with st.expander("Review layers", expanded=False):
         st.caption(
-            "Choose one fill layer below, and optionally overlay **River network**. "
+            "Combine overlays with one color layer. Unavailable overlays are disabled; "
+            "color choices appear when their data is available."
         )
-        available = render_map_layer_checkboxes("out")
-        if available == 0 and symfluence_domain_shapefile_paths():
-            st.caption("No review shapefiles found yet. Run workflow steps such as define_domain or discretize_domain first.")
-        output_map = build_pour_point_map(
-            show_dem_layer=st.session_state.show_dem_layer,
-            show_landclass_layer=st.session_state.show_landclass_layer,
-            show_soilclass_layer=st.session_state.show_soilclass_layer,
-            show_riverbasins_layer=st.session_state.show_riverbasins_layer,
-            show_hrugru_layer=st.session_state.show_hrugru_layer,
-            show_forcing_layer=st.session_state.show_forcing_layer,
-            show_rivernetwork_layer=st.session_state.show_rivernetwork_layer,
-        )
-        render_workflow_map(output_map, key="output_layers_map", height=360)
+        render_output_review_layers_fragment()
 
     with st.expander("Advanced", expanded=False):
         st.markdown("**Manual SYMFLUENCE steps**")
@@ -7540,7 +9113,7 @@ def render_workflow_output_tab() -> None:
         if not st.session_state.allow_run:
             st.caption("Enable **Allow dangerous run steps** in the assistant panel to use Run Model Only.")
 
-        st.caption("Routed discharge extract/summarize and hydrograph metrics are on the **Results** page.")
+        st.caption("Routed discharge, hydrographs, and evaluation metrics are on the **Results** page.")
 
     render_workflow_output_execution_section()
 
@@ -7552,6 +9125,7 @@ def render_workflow_output_tab() -> None:
 
 # Sidebar pages (non-Workflows) — after helper definitions so callbacks exist.
 if current_page != "Workflows":
+    cleanup_workflow_layout()
     st.subheader(current_page)
     if current_page == "Dashboard":
         wx.render_dashboard_page(
@@ -7571,24 +9145,10 @@ if current_page != "Workflows":
     elif current_page == "Logs":
         wx.render_logs_page(runs_dir=RUNS_DIR, run_folder_skip=RUN_FOLDER_SKIP)
     elif current_page == "Experiments":
-        exp_cal_out = st.empty()
-
-        def _experiments_run_calibrate(output_box=exp_cal_out):
-            if not st.session_state.allow_run:
-                st.error("Enable **Allow dangerous run steps** first.")
-                return
-            with st.spinner("Running calibration…"):
-                rc, _ = execute_single_symfluence_step("calibrate_model", output_box)
-            if rc == 0:
-                st.success("Calibration step finished.")
-            else:
-                st.error(f"Calibration failed (return code {rc}).")
-
         wx.render_experiments_page(
             runs_dir=RUNS_DIR,
             run_folder_skip=RUN_FOLDER_SKIP,
             load_run_fn=load_assistant_run,
-            execute_calibrate_fn=_experiments_run_calibrate,
         )
     elif current_page == "Results":
         wx.render_results_page(
@@ -7613,14 +9173,22 @@ assistant_panel_open = bool(st.session_state.get("assistant_panel_open", True))
 if assistant_panel_open:
     main_col, toggle_col, assistant_col = st.columns([0.72, 0.02, 0.28], gap="large")
 else:
-    main_col, toggle_col, assistant_col = st.columns([0.98, 0.02, 0.001], gap="small")
+    main_col, toggle_col = st.columns([0.98, 0.02], gap="small")
+    assistant_col = None
 
 with toggle_col:
     toggle_label = "\u276F" if assistant_panel_open else "\u276E"
     toggle_help = "Hide assistant panel" if assistant_panel_open else "Show assistant panel"
     if st.button(toggle_label, key=ASSISTANT_PANEL_TOGGLE_KEY, help=toggle_help):
         st.session_state.assistant_panel_open = not assistant_panel_open
+        st.session_state.assistant_panel_resize_version = int(
+            st.session_state.get("assistant_panel_resize_version", 0)
+        ) + 1
         st.rerun()
+    if assistant_panel_open:
+        render_assistant_panel_resizer()
+    else:
+        cleanup_assistant_panel_resizer()
 
 with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     st.markdown('<span class="sym-main-panel" aria-hidden="true"></span>', unsafe_allow_html=True)
@@ -7639,9 +9207,11 @@ with main_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
     with output_tab:
         render_workflow_output_tab()
 
-with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
-    if assistant_panel_open:
+if assistant_col is not None:
+    with assistant_col.container(height=WORKFLOW_PANEL_HEIGHT, border=False):
         render_workflow_assistant_panel()
+
+render_workflow_panel_dom_hooks()
 
 
 def show_text(text: str):
@@ -7652,6 +9222,7 @@ def show_text(text: str):
 if st.session_state.execute_plan and st.session_state.run_plan:
     st.session_state.execute_plan = False
     capture_user_prompt_from_session()
+    enable_prompt_matching = prompt_phrase_matching_enabled()
     committed_steps = st.session_state.get("_committed_plan_steps")
     plan = normalize_local_workflow_plan(
         force_steps(
@@ -7662,24 +9233,10 @@ if st.session_state.execute_plan and st.session_state.run_plan:
         or user_prompt_for_metadata()
         or s(st.session_state.get("nl_request", "")),
         data_dir=SYMFLUENCE_DATA_DIR,
+        enable_prompt_matching=enable_prompt_matching,
     )
     if isinstance(committed_steps, list) and committed_steps:
         plan["steps"] = list(committed_steps)
-    plan = force_steps(
-        plan,
-        want_create_pour_point=st.session_state.want_create_pour_point,
-    )
-    plan = ensure_create_pour_point_before_define_domain(
-        plan,
-        conversation_text_for_plan_rules()
-        or user_prompt_for_metadata()
-        or s(st.session_state.get("nl_request", "")),
-        data_dir=SYMFLUENCE_DATA_DIR,
-    )
-    sorted_exec_steps = sort_plan_steps_by_workflow_order(list(plan.get("steps") or []))
-    if sorted_exec_steps:
-        plan["steps"] = sorted_exec_steps
-    st.session_state["_committed_plan_steps"] = list(plan.get("steps") or [])
     store_run_plan(plan)
     plan_cfg = (plan or {}).get("config", {}) or {}
     spec_dict = build_spec_dict(plan_cfg)
@@ -7746,24 +9303,55 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     else:
         cfg.pop("BOUNDING_BOX_COORDS", None)
 
-    dump_yaml(cfg, out_yaml)
-
-    write_run_metadata_files(outdir, plan, spec_dict)
-
     user_request = user_prompt_for_metadata() or s(st.session_state.get("nl_request", ""))
+    matching_request = phrase_matching_text(user_request)
     basin_domain = symfluence_domain_name(
         s(plan_cfg.get("domain_name")) or s(st.session_state.domain_name),
         s(plan_cfg.get("experiment_id")) or s(st.session_state.experiment_id),
     )
-    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
+    symfluence_domain = basin_domain
+    plan = ensure_skip_acquire_forcings_when_local_forcing(
+        plan,
+        matching_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
+    plan = ensure_skip_model_agnostic_when_local_preprocessing(
+        plan,
+        matching_request,
+        data_dir=SYMFLUENCE_DATA_DIR,
+    )
     plan = ensure_skip_process_observed_when_local_streamflow(
         plan,
-        user_request,
+        matching_request,
         data_dir=SYMFLUENCE_DATA_DIR,
         symfluence_domain=symfluence_domain,
     )
     store_run_plan(plan)
+    plan_cfg = (plan or {}).get("config", {}) or {}
 
+    station_lookup_cfg = _station_lookup_cfg_from_plan(plan_cfg)
+    if current_pour and not s(station_lookup_cfg.get("pour_point_coords")):
+        station_lookup_cfg["pour_point_coords"] = current_pour
+    station_id = resolve_station_id_from_plan(
+        station_lookup_cfg,
+        matching_request,
+        fallback=s(st.session_state.station_id),
+    )
+    if station_id:
+        cfg["STATION_ID"] = station_id
+    symfluence_domain_for_obs = s(cfg.get("DOMAIN_NAME")) or basin_domain
+    if domain_has_usable_local_streamflow(SYMFLUENCE_DATA_DIR, symfluence_domain_for_obs, cfg):
+        cfg["DOWNLOAD_WSC_DATA"] = False
+    elif station_id and s(cfg.get("STREAMFLOW_DATA_PROVIDER") or plan_cfg.get("streamflow_data_provider") or "WSC").upper() == "WSC":
+        cfg["DOWNLOAD_WSC_DATA"] = True
+
+    dump_yaml(cfg, out_yaml)
+
+    # Simulation plans may drop local-reuse steps here. Calibration plans keep them;
+    # the executor skips re-running those steps when artifacts already exist.
+    write_run_metadata_files(outdir, plan, spec_dict)
+
+    symfluence_domain = s(cfg.get("DOMAIN_NAME")) or basin_domain
     steps = plan.get("steps", []) or []
 
     pour_coords = (
@@ -7842,6 +9430,7 @@ if st.session_state.execute_plan and st.session_state.run_plan:
                 "symfluence_data_dir": str(SYMFLUENCE_DATA_DIR),
                 "symfluence_python": str(SYMFLUENCE_PYTHON),
                 "user_request": user_request,
+                "enable_prompt_matching": enable_prompt_matching,
                 "resume": resume,
             },
         )
@@ -7855,18 +9444,6 @@ if st.session_state.execute_plan and st.session_state.run_plan:
     except Exception as e:
         st.error(f"Failed to start workflow: {e}")
         st.session_state.workflow_executing = False
-
-if current_page == "Workflows":
-    _poll_run_dir = active_workflow_run_dir()
-    if _poll_run_dir and workflow_is_running(_poll_run_dir):
-        st.session_state["_workflow_poll_active"] = True
-        import time
-
-        time.sleep(5)
-        st.rerun()
-    elif st.session_state.pop("_workflow_poll_active", False) and _poll_run_dir:
-        sync_workflow_execution_state(_poll_run_dir, st.session_state)
-        st.rerun()
 
 if validate_btn:
     rc, msg = execute_validate_config_step(output_box)

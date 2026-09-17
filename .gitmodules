@@ -1,0 +1,4 @@
+[submodule "symfluence"]
+	path = symfluence
+	url = https://github.com/uofs-simlab/SYMFLUENCE-HydroAgent.git
+	branch = hydroagent-v2

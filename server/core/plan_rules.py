@@ -1,9 +1,12 @@
 from __future__ import annotations
-# Layout note: minor UI spacing tweaks.
 
+import csv
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from server.core.shared_input_cache import shared_input_cache_has_asset
 
 
 def _s(value: Any) -> str:
@@ -264,23 +267,6 @@ def domain_has_local_dem(data_dir: str | Path | None, domain_name: str) -> bool:
     return domain_dem_path(data_dir, domain_name).is_file()
 
 
-def domain_pour_point_shapefile_path(data_dir: str | Path, domain_name: str) -> Path:
-    name = _s(domain_name)
-    return (
-        Path(data_dir)
-        / f"domain_{name}"
-        / "shapefiles"
-        / "pour_point"
-        / f"{name}_pourPoint.shp"
-    )
-
-
-def domain_has_local_pour_point(data_dir: str | Path | None, domain_name: str) -> bool:
-    if not data_dir or not _s(domain_name):
-        return False
-    return domain_pour_point_shapefile_path(data_dir, domain_name).is_file()
-
-
 def domain_attributes_root(data_dir: str | Path, domain_name: str) -> Path:
     return Path(data_dir) / f"domain_{_s(domain_name)}" / "data" / "attributes"
 
@@ -365,12 +351,6 @@ def normalize_committed_plan_config(cfg: dict | None) -> dict:
     return out
 
 
-_DOMAIN_META_WORDS = frozenset({
-    "name", "called", "named", "the", "a", "an", "is", "for", "my", "our",
-    "this", "that", "as", "to", "of", "in", "with", "from",
-})
-
-
 def extract_explicit_domain_name_from_request(user_request: str) -> str:
     """Return domain_name only when the user explicitly names it in the prompt."""
     text = _s(user_request)
@@ -378,14 +358,8 @@ def extract_explicit_domain_name_from_request(user_request: str) -> str:
         return ""
 
     patterns = (
-        # High-specificity patterns first
         r"\buse\s+([A-Za-z0-9_\-]+)\s+as\s+(?:the\s+)?domain(?:\s+name|_name)\b",
         r"\b(?:set|change|update)\s+(?:the\s+)?domain(?:\s+name|_name)\s+(?:to\s+)?([A-Za-z0-9_\-]+)\b",
-        r"\bdomain\s+called\s+([A-Za-z0-9_\-]+)",
-        r"\b(?:called|named)\s+([A-Za-z0-9_\-]+)\s+for\s+experiment\b",
-        r"\bfor\s+domain\s+([A-Za-z0-9_\-]+)",
-        r"\bdomain\s+([A-Za-z0-9_\-]+)\s+with\s+experiment\b",
-        r"\bdomain\s+([A-Za-z0-9_\-]+)\s*,\s*experiment\b",
         r"\bdomain_name\s+to\s+([A-Za-z0-9_\-]+)",
         r"\b(?:set|change|update)\s+domain_name\s+to\s+([A-Za-z0-9_\-]+)",
         r"\bdomain_name\s*[=:]\s*[\"']?([A-Za-z0-9_\-]+)",
@@ -402,130 +376,8 @@ def extract_explicit_domain_name_from_request(user_request: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            token = match.group(1)
-            if token.lower() in _DOMAIN_META_WORDS:
-                continue
-            return normalize_domain_name_token(token)
+            return normalize_domain_name_token(match.group(1))
     return ""
-
-
-UI_DEFAULT_EXPERIMENT_START = "2001-01-01 01:00"
-UI_DEFAULT_EXPERIMENT_END = "2001-01-10 23:00"
-
-
-def extract_experiment_dates_from_request(user_request: str) -> tuple[str, str]:
-    """Parse common natural-language experiment windows from the user prompt."""
-    text = _s(user_request)
-    if not text:
-        return "", ""
-
-    year_range = re.search(r"\bfrom\s+(\d{4})\s+to\s+(\d{4})\b", text, flags=re.IGNORECASE)
-    if year_range:
-        start_year, end_year = year_range.group(1), year_range.group(2)
-        return f"{start_year}-01-01 01:00", f"{end_year}-12-31 23:00"
-
-    patterns = (
-        r"\bfrom\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
-        r"\bdates?\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
-        r"\b(?:experiment\s+window|run)\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
-        r"\b(?:calibration|evaluation)\s+period\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return f"{match.group(1)} 01:00", f"{match.group(2)} 23:00"
-    return "", ""
-
-
-def request_mentions_experiment_dates(user_request: str) -> bool:
-    text = _s(user_request)
-    if not text:
-        return False
-    if extract_experiment_dates_from_request(text) != ("", ""):
-        return True
-    return bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", text))
-
-
-def sanitize_planner_experiment_dates(cfg: dict, user_request: str) -> dict:
-    """Apply prompt dates and drop UI placeholder windows not mentioned by the user."""
-    out = dict(cfg or {})
-    start, end = extract_experiment_dates_from_request(user_request)
-    if start:
-        out["experiment_time_start"] = start
-    if end:
-        out["experiment_time_end"] = end
-
-    prompt_has_dates = request_mentions_experiment_dates(user_request)
-    prompt_mentions_2001 = bool(re.search(r"\b2001\b", _s(user_request)))
-
-    for key in ("experiment_time_start", "experiment_time_end"):
-        value = _s(out.get(key))
-        if not value:
-            continue
-        is_ui_default = value in {
-            UI_DEFAULT_EXPERIMENT_START,
-            UI_DEFAULT_EXPERIMENT_END,
-            UI_DEFAULT_EXPERIMENT_START[:10],
-            UI_DEFAULT_EXPERIMENT_END[:10],
-        }
-        is_2001 = value.startswith("2001-")
-        if is_ui_default and not prompt_has_dates:
-            out.pop(key, None)
-        elif is_2001 and not prompt_mentions_2001:
-            out.pop(key, None)
-    return out
-
-
-def apply_workflow_config_policies(cfg: dict, user_request: str = "") -> dict:
-    """Normalize discretization, lumped routing, and elevation extras from the prompt."""
-    from server.core.ui_config_fields import (
-        is_lumped_workflow,
-        normalize_discretization_value,
-        symfluence_discretization_from_plan,
-    )
-
-    out = dict(cfg or {})
-    disc = normalize_discretization_value(_s(out.get("discretization")))
-    if disc:
-        out["discretization"] = disc
-
-    if re.search(r"\b(?:do\s+not\s+use|without|no)\s+mizu\s*route\b", user_request, flags=re.IGNORECASE):
-        out.pop("routing_model", None)
-
-    if is_lumped_workflow(out, user_request):
-        extra = dict(out.get("extra_config") or {}) if isinstance(out.get("extra_config"), dict) else {}
-        extra.setdefault("ROUTING_DELINEATION", "lumped")
-        extra.setdefault("PARAMETER_REGIONALIZATION", "lumped")
-        out["extra_config"] = extra
-        out["discretization"] = symfluence_discretization_from_plan(out, user_request)
-
-    band_match = re.search(r"\belevation\s+band\s+size\s+(\d+)", user_request, flags=re.IGNORECASE)
-    if band_match:
-        extra = dict(out.get("extra_config") or {}) if isinstance(out.get("extra_config"), dict) else {}
-        extra["ELEVATION_BAND_SIZE"] = int(band_match.group(1))
-        out["extra_config"] = extra
-
-    if re.search(r"\bGRUs?\b", user_request, flags=re.IGNORECASE):
-        out["discretization"] = "GRUs"
-
-    return out
-
-
-def domain_name_literal_in_request(domain_name: str, user_request: str) -> bool:
-    """True when the prompt names this basin in a domain context (not weak inference)."""
-    token = normalize_domain_name_token(domain_name)
-    text = _s(user_request)
-    if not token or not text:
-        return False
-    if extract_explicit_domain_name_from_request(text).lower() == token.lower():
-        return True
-    patterns = (
-        rf"\bfor\s+domain\s+{re.escape(token)}\b",
-        rf"\bdomain\s+{re.escape(token)}\b",
-        rf"\bcalled\s+{re.escape(token)}\b",
-        rf"\bdomain\s+called\s+{re.escape(token)}\b",
-    )
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def domain_name_needs_user_input(
@@ -550,9 +402,6 @@ def domain_name_needs_user_input(
 
     explicit = extract_explicit_domain_name_from_request(user_request)
     if explicit and explicit.lower() == name.lower():
-        return False
-
-    if domain_name_literal_in_request(name, user_request):
         return False
 
     if is_weak_domain_name(name):
@@ -597,15 +446,13 @@ def ensure_domain_name_user_input(
         cfg = mark_domain_name_confirmed(cfg)
     elif _s(cfg.get("domain_name")) and domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
         weak = is_weak_domain_name(_s(cfg.get("domain_name")))
-        if weak and not domain_name_literal_in_request(_s(cfg.get("domain_name")), user_request):
-            cfg.pop("domain_name", None)
+        cfg.pop("domain_name", None)
+        if weak:
             _append_plan_note(
                 out,
                 "Removed weak inferred domain_name; provide a filesystem-safe basin name "
                 "(e.g. Bow_at_Banff_semi_distributed).",
             )
-        elif weak and domain_name_literal_in_request(_s(cfg.get("domain_name")), user_request):
-            cfg = apply_user_provided_domain_name(cfg, _s(cfg.get("domain_name")))
 
     out["config"] = cfg
     if not domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
@@ -706,13 +553,46 @@ def domain_has_local_river_basins(
     domain_name: str,
 ) -> bool:
     """True when define_domain produced at least one river_basins shapefile."""
-    if not data_dir or not _s(domain_name):
-        return False
-    basins_dir = domain_root(data_dir, domain_name) / "shapefiles" / "river_basins"
-    if not basins_dir.is_dir():
-        return False
-    name = _s(domain_name)
-    return any(basins_dir.glob(f"{name}_riverBasins_*.shp"))
+    from server.core.local_domain import domain_river_basins_shapefiles
+
+    return bool(domain_river_basins_shapefiles(data_dir, domain_name))
+
+
+STEPS_REQUIRING_BASIN_POUR_POINT = frozenset(
+    {
+        "discretize_domain",
+        "model_agnostic_preprocessing",
+        "model_specific_preprocessing",
+        "run_model",
+        "calibrate_model",
+        "postprocess_results",
+    }
+)
+
+
+def basin_pour_point_preflight_error(
+    step: str,
+    pour_coords: str,
+    data_dir: str | Path | None,
+    domain_name: str,
+) -> str | None:
+    """Block post-define_domain steps when pour point lies outside delineated basin."""
+    from server.core.local_domain import pour_point_inside_delineated_basin
+
+    if step not in STEPS_REQUIRING_BASIN_POUR_POINT:
+        return None
+    if not _s(domain_name) or not _s(pour_coords):
+        return None
+    if not domain_has_local_river_basins(data_dir, domain_name):
+        return None
+    ok, detail = pour_point_inside_delineated_basin(pour_coords, data_dir, domain_name)
+    if ok:
+        return None
+    return (
+        f"{step} blocked: the pour point is outside the delineated basin polygon. "
+        "This is a basin delineation issue, not a bounding-box issue. "
+        f"{detail}"
+    )
 
 
 def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str) -> bool:
@@ -720,6 +600,55 @@ def domain_has_local_summa_forcing(data_dir: str | Path | None, domain_name: str
         return False
     forcing_dir = domain_root(data_dir, domain_name) / "data" / "forcing" / "SUMMA_input"
     return any(forcing_dir.glob("*.nc"))
+
+
+def domain_has_remapped_forcing(data_dir: str | Path | None, domain_name: str) -> bool:
+    """True when MAP/MSP forcing NetCDF exists (basin-averaged, SUMMA input, or model-ready)."""
+    if not data_dir or not _s(domain_name):
+        return False
+    root = domain_root(data_dir, domain_name)
+    for rel in (
+        "data/forcing/basin_averaged_data",
+        "data/forcing/SUMMA_input",
+        "data/model_ready/forcings",
+    ):
+        folder = root / rel
+        if folder.is_dir() and any(folder.glob("*.nc")):
+            return True
+    return False
+
+
+def domain_forcing_intersection_path(
+    data_dir: str | Path | None,
+    domain_name: str,
+    *,
+    forcing_dataset: str = "ERA5",
+) -> Path:
+    """Expected or existing ERA5/forcing–catchment intersection (.shp or .csv)."""
+    name = _s(domain_name)
+    dataset = _s(forcing_dataset) or "ERA5"
+    folder = (
+        domain_root(data_dir or "", name)
+        / "shapefiles"
+        / "catchment_intersection"
+        / "with_forcing"
+    )
+    stem = f"{name}_{dataset}_intersected_shapefile"
+    for suffix in (".shp", ".csv", ".gpkg"):
+        path = folder / f"{stem}{suffix}"
+        if path.is_file():
+            return path
+    if folder.is_dir():
+        matches = sorted(
+            p
+            for p in folder.iterdir()
+            if p.is_file()
+            and "intersected" in p.name.lower()
+            and p.suffix.lower() in {".shp", ".csv", ".gpkg"}
+        )
+        if matches:
+            return matches[0]
+    return folder / f"{stem}.shp"
 
 
 def domain_has_forcing_intersection(
@@ -731,15 +660,10 @@ def domain_has_forcing_intersection(
     """True when model_agnostic_preprocessing intersect output exists."""
     if not data_dir or not _s(domain_name):
         return False
-    name = _s(domain_name)
-    base = (
-        domain_root(data_dir, name)
-        / "shapefiles"
-        / "catchment_intersection"
-        / "with_forcing"
-        / f"{name}_{_s(forcing_dataset) or 'ERA5'}_intersected_shapefile"
+    path = domain_forcing_intersection_path(
+        data_dir, domain_name, forcing_dataset=forcing_dataset
     )
-    return base.with_suffix(".shp").is_file() or base.with_suffix(".csv").is_file()
+    return path.is_file()
 
 
 def domain_forcing_raw_data_dir(data_dir: str | Path, domain_name: str) -> Path:
@@ -791,44 +715,21 @@ def ensure_skip_acquire_forcings_when_local_forcing(
     *,
     data_dir: str | Path | None = None,
 ) -> dict:
-    """Drop acquire_forcings when local ERA5/SUMMA forcing is already on disk."""
+    """Keep acquire_forcings in the plan; set local data access when forcing already exists."""
     if not isinstance(plan, dict):
         return plan
     out = dict(plan)
     cfg = dict(out.get("config") or {})
     domain_name = _s(cfg.get("domain_name"))
-    steps = list(out.get("steps") or [])
     if user_requires_fresh_cloud_workflow(user_request, cfg):
-        return out
-    if "acquire_forcings" not in steps:
-        return out
-    if workflow_step_user_required(out, "acquire_forcings", user_request):
         return out
     if not domain_name or not data_dir:
         return out
-
-    raw_exists = domain_has_local_era5_raw_forcing(data_dir, domain_name)
-    summa_exists = domain_has_local_summa_forcing(data_dir, domain_name)
-    local_first = request_indicates_local_data_reuse(user_request, cfg, data_dir=data_dir)
-
-    if summa_exists:
-        out["steps"] = [step for step in steps if step != "acquire_forcings"]
+    # Keep acquire_forcings in the plan; Execute plan reuses local forcing at runtime.
+    if domain_has_local_summa_forcing(data_dir, domain_name) or domain_has_local_era5_raw_forcing(
+        data_dir, domain_name
+    ):
         out = ensure_local_data_access_in_plan(out)
-        _append_plan_note(
-            out,
-            "Skipped acquire_forcings; reusing existing local SUMMA forcing files.",
-        )
-        return out
-
-    if raw_exists and local_first:
-        out["steps"] = [step for step in steps if step != "acquire_forcings"]
-        out = ensure_local_data_access_in_plan(out)
-        _append_plan_note(
-            out,
-            "Skipped acquire_forcings; reusing existing local ERA5/raw forcing files.",
-        )
-        return out
-
     return out
 
 
@@ -843,23 +744,9 @@ def ensure_skip_model_agnostic_when_local_preprocessing(
         return plan
     out = dict(plan)
     cfg = dict(out.get("config") or {})
-    domain_name = _s(cfg.get("domain_name"))
-    steps = list(out.get("steps") or [])
     if user_requires_fresh_cloud_workflow(user_request, cfg):
         return out
-    if "model_agnostic_preprocessing" not in steps:
-        return out
-    if workflow_step_user_required(out, "model_agnostic_preprocessing", user_request):
-        return out
-    if not domain_name or not data_dir:
-        return out
-    if not domain_has_local_summa_forcing(data_dir, domain_name):
-        return out
-    out["steps"] = [step for step in steps if step != "model_agnostic_preprocessing"]
-    _append_plan_note(
-        out,
-        "Skipped model_agnostic_preprocessing; reusing existing local SUMMA forcing input.",
-    )
+    # Keep model_agnostic_preprocessing in the plan; Execute plan reuses local forcing at runtime.
     return out
 
 
@@ -904,6 +791,85 @@ def domain_has_local_streamflow(data_dir: str | Path | None, domain_name: str) -
     return domain_streamflow_processed_path(data_dir, domain_name).is_file()
 
 
+def _parse_experiment_datetime(value: str | None) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(value or "").strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def experiment_window_from_cfg(cfg: dict | None) -> tuple[datetime, datetime] | None:
+    cfg = cfg or {}
+    start = _parse_experiment_datetime(
+        _s(cfg.get("EXPERIMENT_TIME_START") or cfg.get("experiment_time_start"))
+    )
+    end = _parse_experiment_datetime(
+        _s(cfg.get("EXPERIMENT_TIME_END") or cfg.get("experiment_time_end"))
+    )
+    if start is None or end is None:
+        return None
+    return start, end
+
+
+def _streamflow_csv_datetime_bounds(path: Path) -> tuple[datetime, datetime] | None:
+    if not path.is_file():
+        return None
+    first: datetime | None = None
+    last: datetime | None = None
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            raw = _s(row.get("datetime") or row.get("DATE") or row.get("date"))
+            if not raw:
+                continue
+            dt = _parse_experiment_datetime(raw)
+            if dt is None:
+                continue
+            if first is None:
+                first = dt
+            last = dt
+    if first is None or last is None:
+        return None
+    return first, last
+
+
+def local_streamflow_overlaps_experiment(
+    data_dir: str | Path | None,
+    domain_name: str,
+    experiment_start: datetime,
+    experiment_end: datetime,
+) -> bool:
+    """True when a local preprocessed streamflow CSV overlaps the experiment window."""
+    if not data_dir or not _s(domain_name):
+        return False
+    path = domain_streamflow_processed_path(data_dir, domain_name)
+    bounds = _streamflow_csv_datetime_bounds(path)
+    if bounds is None:
+        return False
+    obs_start, obs_end = bounds
+    return obs_start <= experiment_end and experiment_start <= obs_end
+
+
+def domain_has_usable_local_streamflow(
+    data_dir: str | Path | None,
+    domain_name: str,
+    cfg: dict | None = None,
+) -> bool:
+    """
+    True when local preprocessed streamflow exists and overlaps the experiment window.
+
+    If experiment dates are missing from cfg, returns False so downloads are not skipped.
+    """
+    if not domain_has_local_streamflow(data_dir, domain_name):
+        return False
+    window = experiment_window_from_cfg(cfg or {})
+    if window is None:
+        return False
+    return local_streamflow_overlaps_experiment(data_dir, domain_name, *window)
+
+
 def is_valid_station_id(value: str) -> bool:
     """Reject placeholder LLM values like 'ID' and accept WSC-style gauge IDs."""
     token = _s(value)
@@ -939,16 +905,69 @@ def resolve_station_id_from_plan(
     user_request: str = "",
     *,
     fallback: str = "",
+    pour_point_coords: str = "",
 ) -> str:
     cfg = cfg or {}
     for candidate in (
         _s(cfg.get("station_id")),
+        _s(cfg.get("STATION_ID")),
         _s(fallback),
         extract_station_id_from_request(user_request),
     ):
         if is_valid_station_id(candidate):
             return candidate
+
+    pour = pour_point_coords or _s(cfg.get("pour_point_coords")) or _s(cfg.get("POUR_POINT_COORDS"))
+    provider = _s(cfg.get("streamflow_data_provider")) or _s(cfg.get("STREAMFLOW_DATA_PROVIDER")) or "WSC"
+    if pour and provider.upper() in {"WSC", "USGS"}:
+        from server.core.station_resolver import resolve_station_near_pour_point
+
+        window = experiment_window_from_cfg(cfg)
+        hit = resolve_station_near_pour_point(
+            provider,
+            pour,
+            experiment_start=window[0].strftime("%Y-%m-%d %H:%M") if window else None,
+            experiment_end=window[1].strftime("%Y-%m-%d %H:%M") if window else None,
+        )
+        if hit:
+            return hit[0]
     return ""
+
+
+def resolve_station_id_note_from_plan(
+    cfg: dict | None,
+    user_request: str = "",
+    *,
+    fallback: str = "",
+    pour_point_coords: str = "",
+) -> str:
+    """Human-readable note when station_id was auto-selected."""
+    station_id = resolve_station_id_from_plan(
+        cfg,
+        user_request,
+        fallback=fallback,
+        pour_point_coords=pour_point_coords,
+    )
+    if not station_id:
+        return ""
+    if _s((cfg or {}).get("station_id")) or _s((cfg or {}).get("STATION_ID")) or _s(fallback):
+        return ""
+    if extract_station_id_from_request(user_request):
+        return ""
+    pour = pour_point_coords or _s((cfg or {}).get("pour_point_coords")) or _s((cfg or {}).get("POUR_POINT_COORDS"))
+    provider = _s((cfg or {}).get("streamflow_data_provider")) or _s((cfg or {}).get("STREAMFLOW_DATA_PROVIDER")) or "WSC"
+    if not pour:
+        return ""
+    from server.core.station_resolver import resolve_station_near_pour_point
+
+    window = experiment_window_from_cfg(cfg)
+    hit = resolve_station_near_pour_point(
+        provider,
+        pour,
+        experiment_start=window[0].strftime("%Y-%m-%d %H:%M") if window else None,
+        experiment_end=window[1].strftime("%Y-%m-%d %H:%M") if window else None,
+    )
+    return hit[1] if hit and hit[0] == station_id else ""
 
 
 def ensure_plan_station_id(plan: dict, user_request: str = "") -> dict:
@@ -956,14 +975,19 @@ def ensure_plan_station_id(plan: dict, user_request: str = "") -> dict:
         return plan
     out = dict(plan)
     cfg = dict(out.get("config") or {})
+    previous = _s(cfg.get("station_id"))
     station_id = resolve_station_id_from_plan(cfg, user_request)
     if not station_id:
         out["config"] = cfg
         return out
-    if _s(cfg.get("station_id")) != station_id:
+    auto_note = resolve_station_id_note_from_plan(cfg, user_request) if not previous else ""
+    if previous != station_id:
         cfg["station_id"] = station_id
         out["config"] = cfg
-        _append_plan_note(out, f"Set station_id to {station_id} from user request.")
+        if auto_note:
+            _append_plan_note(out, auto_note)
+        elif extract_station_id_from_request(user_request):
+            _append_plan_note(out, f"Set station_id to {station_id} from user request.")
     return out
 
 
@@ -977,6 +1001,9 @@ def ensure_skip_process_observed_when_local_streamflow(
     if not isinstance(plan, dict):
         return plan
     out = dict(plan)
+    if is_calibration_workflow_plan(out):
+        # Keep process_observed_data in the calibration plan; Execute plan reuses the CSV at runtime.
+        return out
     cfg = dict(out.get("config") or {})
     domain_name = _s(symfluence_domain) or _s(cfg.get("domain_name"))
     steps = list(out.get("steps") or [])
@@ -988,12 +1015,12 @@ def ensure_skip_process_observed_when_local_streamflow(
         return out
     if not domain_name or not data_dir:
         return out
-    if not domain_has_local_streamflow(data_dir, domain_name):
+    if not domain_has_usable_local_streamflow(data_dir, domain_name, cfg):
         return out
     out["steps"] = [step for step in steps if step != "process_observed_data"]
     _append_plan_note(
         out,
-        "Skipped process_observed_data; reusing existing local preprocessed streamflow.",
+        "Skipped process_observed_data; reusing local preprocessed streamflow that overlaps the experiment window.",
     )
     return out
 
@@ -1131,40 +1158,13 @@ def ensure_skip_domain_rerun_when_local_artifacts_exist(
     *,
     data_dir: str | Path | None = None,
 ) -> dict:
-    """
-    Re-running define_domain/discretize_domain overwrites catchment shapefiles and
-    breaks alignment with pre-existing SUMMA forcing HRU IDs.
-    """
+    """Keep define_domain/discretize_domain in the plan; Execute plan reuses local catchments."""
     if not isinstance(plan, dict):
         return plan
     out = dict(plan)
     cfg = dict(out.get("config") or {})
-    domain_name = _s(cfg.get("domain_name"))
-    experiment_id = _s(cfg.get("experiment_id")) or "run_1"
-    steps = list(out.get("steps") or [])
-
     if user_requires_fresh_cloud_workflow(user_request, cfg):
         return out
-
-    if is_weak_domain_name(domain_name):
-        return out
-
-    if domain_name_needs_user_input(cfg, user_request, data_dir=data_dir):
-        return out
-
-    if not domain_has_complete_local_workflow(data_dir, domain_name, experiment_id):
-        return out
-
-    removed = [step for step in ("define_domain", "discretize_domain") if step in steps]
-    if not removed:
-        return out
-
-    out["steps"] = [step for step in steps if step not in removed]
-    _append_plan_note(
-        out,
-        "Skipped define_domain/discretize_domain; reusing existing local catchment and forcing "
-        "(re-delineation would break HRU ID alignment).",
-    )
     return out
 
 
@@ -1341,7 +1341,7 @@ def _plan_steps_are_gated(steps: list[str] | None) -> bool:
 
 def _plan_ready_for_step_inference(plan: dict) -> bool:
     needs = set(plan.get("needs_user_input") or [])
-    return not (needs - {"bounding_box_coords", "pour_point_coords"})
+    return not (needs - {"bounding_box_coords"})
 
 
 def infer_gated_plan_steps(
@@ -1408,11 +1408,12 @@ def resolve_plan_step_dependencies(
     *,
     catalog: dict,
     data_dir: str | Path | None = None,
+    enable_prompt_matching: bool = True,
 ) -> dict:
     """Infer goals from the prompt, expand catalog dependencies, and refresh needs_user_input."""
     from server.capabilities.resolve_dependencies import resolve_step_dependencies
 
-    user_request = _s(user_request)
+    user_request = _s(user_request) if enable_prompt_matching else ""
     new_plan = dict(plan)
 
     new_plan = normalize_local_workflow_plan(
@@ -1420,6 +1421,7 @@ def resolve_plan_step_dependencies(
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=False,
+        enable_prompt_matching=enable_prompt_matching,
     )
 
     steps = list(new_plan.get("steps") or [])
@@ -1477,6 +1479,7 @@ def resolve_plan_step_dependencies(
         user_request,
         data_dir=data_dir,
         skip_workflow_step_restore=True,
+        enable_prompt_matching=enable_prompt_matching,
     )
     return new_plan
 
@@ -1518,37 +1521,6 @@ _SKIP_ACQUIRE_ATTRIBUTES_PHRASES = (
 )
 
 
-def ensure_create_pour_point_before_define_domain(
-    plan: dict,
-    user_request: str = "",
-    *,
-    data_dir: str | Path | None = None,
-) -> dict:
-    """define_domain needs a pour-point shapefile; insert create_pour_point when omitted."""
-    if not isinstance(plan, dict):
-        return plan
-    out = dict(plan)
-    steps = list(out.get("steps") or [])
-    if "define_domain" not in steps or "create_pour_point" in steps:
-        return out
-    if _user_forbids_step_inference(user_request, "create_pour_point"):
-        return out
-
-    cfg = dict(out.get("config") or {})
-    domain_name = _s(cfg.get("domain_name"))
-    if domain_name and data_dir and domain_has_local_pour_point(data_dir, domain_name):
-        return out
-
-    idx = steps.index("define_domain")
-    steps.insert(idx, "create_pour_point")
-    out["steps"] = steps
-    _append_plan_note(
-        out,
-        "Inserted create_pour_point before define_domain (pour-point shapefile required for delineation).",
-    )
-    return out
-
-
 def ensure_acquire_attributes_before_define_domain(
     plan: dict,
     user_request: str = "",
@@ -1582,56 +1554,6 @@ def ensure_acquire_attributes_before_define_domain(
     _append_plan_note(
         out,
         "Inserted acquire_attributes before define_domain (DEM/attributes required for delineation).",
-    )
-    return out
-
-
-def ensure_discretize_domain_before_preprocessing(
-    plan: dict,
-    user_request: str = "",
-    *,
-    data_dir: str | Path | None = None,
-) -> dict:
-    """model_agnostic_preprocessing needs HRU/GRU shapefiles from discretize_domain."""
-    if not isinstance(plan, dict):
-        return plan
-    out = dict(plan)
-    steps = list(out.get("steps") or [])
-    if "discretize_domain" in steps:
-        return out
-    if _user_forbids_step_inference(user_request, "discretize_domain"):
-        return out
-
-    needs_hrus = bool(
-        {
-            "model_agnostic_preprocessing",
-            "model_specific_preprocessing",
-            "run_model",
-        }
-        & set(steps)
-    )
-    cfg = dict(out.get("config") or {})
-    delineated = "define_domain" in steps or _s(cfg.get("domain_def")).lower() == "delineate"
-    if not needs_hrus or not delineated:
-        return out
-
-    domain_name = _s(cfg.get("domain_name"))
-    experiment_id = _s(cfg.get("experiment_id")) or "run_1"
-    if domain_name and data_dir and domain_has_local_discretization(
-        data_dir, domain_name, experiment_id
-    ):
-        return out
-
-    if "define_domain" in steps:
-        steps.insert(steps.index("define_domain") + 1, "discretize_domain")
-    elif "model_agnostic_preprocessing" in steps:
-        steps.insert(steps.index("model_agnostic_preprocessing"), "discretize_domain")
-    else:
-        steps.append("discretize_domain")
-    out["steps"] = sort_plan_steps_by_workflow_order(steps)
-    _append_plan_note(
-        out,
-        "Inserted discretize_domain before preprocessing (HRU/GRU shapefiles required).",
     )
     return out
 
@@ -1698,12 +1620,20 @@ def ensure_online_data_when_missing(
     if user_forbids_download_step(user_request, "acquire_attributes"):
         return out
 
-    out = ensure_create_pour_point_before_define_domain(out, user_request, data_dir=data_dir)
     out = ensure_acquire_attributes_before_define_domain(out, user_request, data_dir=data_dir)
     steps = list(out.get("steps") or [])
 
     needs_dem = bool({"define_domain", "discretize_domain"} & set(steps))
     if needs_dem and domain_name and data_dir and not domain_has_local_dem(data_dir, domain_name):
+        extra_raw = cfg.get("extra_config")
+        extra = extra_raw if isinstance(extra_raw, dict) else {}
+        bounding_box = (
+            cfg.get("bounding_box_coords")
+            or cfg.get("BOUNDING_BOX_COORDS")
+            or extra.get("bounding_box_coords")
+            or extra.get("BOUNDING_BOX_COORDS")
+        )
+        cached_dem = shared_input_cache_has_asset(data_dir, bounding_box, "dem")
         out = ensure_cloud_data_access_for_acquire_steps(out, user_request, data_dir=data_dir)
         cfg = dict(out.get("config") or {})
         if "acquire_attributes" not in steps:
@@ -1722,10 +1652,17 @@ def ensure_online_data_when_missing(
                 if "bounding_box_coords" not in needs:
                     needs.append("bounding_box_coords")
                 out["needs_user_input"] = needs
-        _append_plan_note(
-            out,
-            f"Local DEM missing for {domain_name}; using online acquisition (DATA_ACCESS cloud).",
-        )
+        if cached_dem:
+            _append_plan_note(
+                out,
+                "Compatible source inputs are available in the shared cache; acquisition will "
+                "reuse them before contacting cloud services.",
+            )
+        else:
+            _append_plan_note(
+                out,
+                f"Local DEM missing for {domain_name}; using online acquisition (DATA_ACCESS cloud).",
+            )
 
     return out
 
@@ -1857,7 +1794,7 @@ def restore_workflow_steps_from_user_request(
     """When the user supplies an explicit step list, honor that order."""
     if not isinstance(plan, dict):
         return plan
-    ordered = extract_ordered_steps_from_request(user_request)
+    ordered = extract_ordered_workflow_steps(user_request)
     if len(ordered) < 3:
         return plan
     cfg = dict(plan.get("config") or {})
@@ -1957,12 +1894,405 @@ def _drop_satisfied_needs_user_input(plan: dict) -> dict:
     return out
 
 
+WORKFLOW_PLAN_MODE_SIMULATION = "simulation"
+WORKFLOW_PLAN_MODE_CALIBRATION = "calibration"
+
+_CALIBRATION_PLAN_CONFIG_KEYS = (
+    "calibration_period",
+    "CALIBRATION_PERIOD",
+    "optimization_metric",
+    "OPTIMIZATION_METRIC",
+    "optimization_target",
+    "OPTIMIZATION_TARGET",
+    "calibration_timestep",
+    "CALIBRATION_TIMESTEP",
+    "iterative_optimization_algorithm",
+    "ITERATIVE_OPTIMIZATION_ALGORITHM",
+    "iterations",
+    "NUMBER_OF_ITERATIONS",
+    "population_size",
+    "POPULATION_SIZE",
+    "params_to_calibrate",
+    "PARAMS_TO_CALIBRATE",
+    "basin_params_to_calibrate",
+    "BASIN_PARAMS_TO_CALIBRATE",
+)
+
+_SIMULATION_STRIP_STEPS = frozenset({"calibrate_model"})
+_OBSERVATION_PLAN_CONFIG_KEYS = (
+    "station_id",
+    "STATION_ID",
+    "streamflow_data_provider",
+    "STREAMFLOW_DATA_PROVIDER",
+)
+
+# Filled by CalibHydroAgent at design time unless the user names them in the main prompt.
+_AGENT_OWNED_CALIBRATION_CONFIG_KEYS = (
+    "calibration_period",
+    "CALIBRATION_PERIOD",
+    "evaluation_period",
+    "EVALUATION_PERIOD",
+    "spinup_period",
+    "SPINUP_PERIOD",
+    "optimization_metric",
+    "OPTIMIZATION_METRIC",
+    "optimization_target",
+    "OPTIMIZATION_TARGET",
+    "calibration_timestep",
+    "CALIBRATION_TIMESTEP",
+    "iterative_optimization_algorithm",
+    "ITERATIVE_OPTIMIZATION_ALGORITHM",
+    "iterations",
+    "NUMBER_OF_ITERATIONS",
+    "population_size",
+    "POPULATION_SIZE",
+    "params_to_calibrate",
+    "PARAMS_TO_CALIBRATE",
+    "basin_params_to_calibrate",
+    "BASIN_PARAMS_TO_CALIBRATE",
+)
+
+_DOMAIN_CONFIG_KEYS = (
+    "domain_name",
+    "DOMAIN_NAME",
+    "experiment_id",
+    "EXPERIMENT_ID",
+    "pour_point_coords",
+    "POUR_POINT_COORDS",
+    "bounding_box_coords",
+    "BOUNDING_BOX_COORDS",
+    "hydrological_model",
+    "HYDROLOGICAL_MODEL",
+    "domain_def",
+    "DOMAIN_DEFINITION_METHOD",
+    "experiment_time_start",
+    "EXPERIMENT_TIME_START",
+    "experiment_time_end",
+    "EXPERIMENT_TIME_END",
+    "forcing_dataset",
+    "FORCING_DATASET",
+    "routing_model",
+    "ROUTING_MODEL",
+    "num_processes",
+    "NUM_PROCESSES",
+    "data_access",
+    "DATA_ACCESS",
+)
+
+
+def plan_workflow_mode(plan: dict | None) -> str:
+    return _s((plan or {}).get("workflow_plan_mode")).lower()
+
+
+def is_calibration_workflow_plan(plan: dict | None) -> bool:
+    return plan_workflow_mode(plan) == WORKFLOW_PLAN_MODE_CALIBRATION
+
+
+def is_simulation_workflow_plan(plan: dict | None) -> bool:
+    return plan_workflow_mode(plan) == WORKFLOW_PLAN_MODE_SIMULATION
+
+
+def planner_mode_instructions(mode: str, *, enable_prompt_matching: bool = True) -> str:
+    mode = _s(mode).lower()
+    if mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        if enable_prompt_matching:
+            return (
+                "\n\nWORKFLOW MODE: simulation only.\n"
+                "- Keep the full SUMMA pipeline: validate_config, setup_project, create_pour_point, "
+                "acquire_attributes, define_domain, discretize_domain, acquire_forcings, "
+                "model_agnostic_preprocessing, build_model_ready_store, model_specific_preprocessing, "
+                "and run_model.\n"
+                "- Do not omit those steps when local files already exist; Execute plan reuses artifacts at run time.\n"
+                "- Add postprocess_results only when the user asked for evaluation, metrics, or plots.\n"
+                "- Observed-streamflow processing is valid in simulation mode when requested; in that case "
+                "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
+                "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
+                "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
+                "- Do NOT set calibration_period, optimization fields, or params_to_calibrate in config.\n"
+            )
+        return (
+            "\n\nWORKFLOW MODE: simulation only.\n"
+            "- Preserve the workflow scope requested by the user.\n"
+            "- Add postprocess_results only when the user asked for evaluation, metrics, or plots.\n"
+            "- Observed-streamflow processing is valid in simulation mode when requested; in that case "
+            "include process_observed_data and preserve station_id and streamflow_data_provider.\n"
+            "- Otherwise omit process_observed_data, station_id, and streamflow_data_provider.\n"
+            "- Do NOT include calibrate_model unless the user explicitly requests calibration.\n"
+            "- Do NOT set calibration_period, optimization fields, or params_to_calibrate in config.\n"
+        )
+    if mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        return (
+            "\n\nWORKFLOW MODE: calibration.\n"
+            "- Keep the same full SUMMA pipeline as a simulation workflow "
+            "(validate_config through run_model, including define_domain, discretize_domain, "
+            "acquire_forcings, and model_agnostic_preprocessing).\n"
+            "- Do not omit those steps just because local artifacts exist; Execute plan reuses them at run time.\n"
+            "- Add process_observed_data and calibrate_model for streamflow calibration (unless the user forbids them).\n"
+            "- Set station_id and streamflow_data_provider=WSC when a pour point is available.\n"
+            "- Leave calibration_period, optimization_metric, iterative_optimization_algorithm, "
+            "iterations, population_size, params_to_calibrate, and related optimization fields NULL "
+            "unless the user explicitly requests them above — CalibHydroAgent designs these at calibration time.\n"
+            "- Do NOT include postprocess_results unless the user explicitly asks for it.\n"
+        )
+    return ""
+
+
+def _explicit_agent_calibration_fields(user_request: str) -> set[str]:
+    from server.core.calibration_prompt_fields import explicit_calibration_fields_in_prompt
+
+    return explicit_calibration_fields_in_prompt(user_request)
+
+
+def strip_agent_calibration_config_unless_in_prompt(plan: dict, user_request: str = "") -> dict:
+    """Remove agent-owned calibration knobs unless the user named them in the prompt."""
+    if not isinstance(plan, dict):
+        return plan
+    explicit = _explicit_agent_calibration_fields(user_request)
+    if not explicit:
+        out = dict(plan)
+        cfg = dict(out.get("config") or {})
+        extra = dict(cfg.get("extra_config") or {}) if isinstance(cfg.get("extra_config"), dict) else {}
+        for key in _AGENT_OWNED_CALIBRATION_CONFIG_KEYS:
+            cfg.pop(key, None)
+            extra.pop(key, None)
+        if extra:
+            cfg["extra_config"] = extra
+        else:
+            cfg.pop("extra_config", None)
+        out["config"] = cfg
+        return out
+
+    out = dict(plan)
+    cfg = dict(out.get("config") or {})
+    extra = dict(cfg.get("extra_config") or {}) if isinstance(cfg.get("extra_config"), dict) else {}
+    session_aliases = {
+        "iterative_optimization_algorithm": "iterative_optimization_algorithm",
+        "optimization_metric": "optimization_metric",
+        "optimization_target": "optimization_target",
+        "calibration_timestep": "calibration_timestep",
+        "iterations": "iterations",
+        "population_size": "population_size",
+        "calibration_period": "calibration_period",
+        "evaluation_period": "evaluation_period",
+        "spinup_period": "spinup_period",
+        "params_to_calibrate": "params_to_calibrate",
+        "basin_params_to_calibrate": "basin_params_to_calibrate",
+    }
+    for field in session_aliases:
+        if field not in explicit:
+            for key in list(cfg.keys()):
+                if key.lower() == field.lower() or key.upper().replace("_", "") == field.upper().replace("_", ""):
+                    cfg.pop(key, None)
+            extra.pop(field, None)
+    if extra:
+        cfg["extra_config"] = extra
+    else:
+        cfg.pop("extra_config", None)
+    out["config"] = cfg
+    return out
+
+
+def merge_domain_config_from_simulation_plan(cal_plan: dict, sim_plan: dict | None) -> dict:
+    """Carry domain/experiment settings from a simulation plan into a calibration plan."""
+    if not isinstance(cal_plan, dict) or not isinstance(sim_plan, dict):
+        return cal_plan
+    out = dict(cal_plan)
+    cfg = dict(out.get("config") or {})
+    sim_cfg = dict(sim_plan.get("config") or {})
+    sim_extra = sim_cfg.get("extra_config") if isinstance(sim_cfg.get("extra_config"), dict) else {}
+    if isinstance(sim_extra, dict):
+        sim_cfg = {**sim_extra, **sim_cfg}
+    for key in _DOMAIN_CONFIG_KEYS:
+        if _s(cfg.get(key)):
+            continue
+        val = sim_cfg.get(key)
+        if val not in (None, ""):
+            cfg[key] = val
+    out["config"] = cfg
+    return out
+
+
+def merge_simulation_steps_into_calibration_plan(cal_plan: dict, sim_plan: dict | None) -> dict:
+    """Keep simulation workflow steps and add calibration steps on top."""
+    if not isinstance(cal_plan, dict):
+        return cal_plan
+    out = dict(cal_plan)
+    cal_steps = list(out.get("steps") or [])
+    sim_steps = list((sim_plan or {}).get("steps") or []) if isinstance(sim_plan, dict) else []
+    if not sim_steps:
+        return out
+    merged: list[str] = []
+    for step in sim_steps + cal_steps:
+        if step and step not in merged:
+            merged.append(step)
+    out["steps"] = sort_plan_steps_by_workflow_order(merged)
+    return out
+
+
+_SUMMA_DELINEATE_CORE_STEPS = (
+    "validate_config",
+    "setup_project",
+    "create_pour_point",
+    "acquire_attributes",
+    "define_domain",
+    "discretize_domain",
+    "acquire_forcings",
+    "model_agnostic_preprocessing",
+    "build_model_ready_store",
+    "model_specific_preprocessing",
+    "run_model",
+)
+_LUMPED_CORE_STEPS = (
+    "validate_config",
+    "setup_project",
+    "create_pour_point",
+    "acquire_attributes",
+    "acquire_forcings",
+    "model_agnostic_preprocessing",
+    "build_model_ready_store",
+    "model_specific_preprocessing",
+    "run_model",
+)
+
+
+def _user_requested_postprocess_results(user_request: str) -> bool:
+    text = _s(user_request)
+    if not text:
+        return False
+    if re.search(r"\bdo not (?:run|include) postprocess_results\b", text, re.I):
+        return False
+    stripped = re.sub(r"workflow mode:.*", "", text, flags=re.I | re.S)
+    return bool(
+        re.search(r"\bpostprocess_results\b", stripped, re.I)
+        or re.search(r"\b(evaluate results|plot results|compute metrics)\b", stripped, re.I)
+    )
+
+
+def restore_simulation_setup_steps_for_calibration(
+    plan: dict,
+    user_request: str = "",
+    sim_plan: dict | None = None,
+) -> dict:
+    """Keep the full SUMMA pipeline in simulation and calibration plans."""
+    if not isinstance(plan, dict):
+        return plan
+    mode = plan_workflow_mode(plan)
+    if mode not in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
+        return plan
+
+    from server.core.ui_config_fields import is_lumped_workflow
+
+    cfg = dict(plan.get("config") or {})
+    steps = list(plan.get("steps") or [])
+    sim_steps = list((sim_plan or {}).get("steps") or []) if isinstance(sim_plan, dict) else []
+    lumped = is_lumped_workflow(cfg, user_request)
+    domain_def = _s(cfg.get("domain_def")).lower()
+    model = _s(cfg.get("hydrological_model")).upper()
+    routing = _s(cfg.get("routing_model")).lower()
+    wants_delineate = not lumped and (
+        domain_def in ("delineate", "semidistributed", "semi_distributed")
+        or (model == "SUMMA" and "mizu" in routing)
+        or "define_domain" in sim_steps
+        or "discretize_domain" in sim_steps
+    )
+    core = list(_SUMMA_DELINEATE_CORE_STEPS if wants_delineate else _LUMPED_CORE_STEPS)
+    if mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        for step in ("process_observed_data", "calibrate_model"):
+            if step not in core:
+                core.append(step)
+
+    to_add: list[str] = []
+    for step in core:
+        if step in steps:
+            continue
+        if user_forbids_download_step(user_request, step):
+            continue
+        if re.search(rf"\bdo not (?:run|include) {re.escape(step)}\b", user_request or "", re.I):
+            continue
+        to_add.append(step)
+
+    out = dict(plan)
+    merged = list(steps) + to_add
+    if not _user_requested_postprocess_results(user_request):
+        merged = [step for step in merged if step != "postprocess_results"]
+    merged = [step for step in merged if step != "dry_run"]
+    out["steps"] = sort_plan_steps_by_workflow_order(merged)
+    if to_add:
+        _append_plan_note(
+            out,
+            "Kept full simulation workflow steps: " + ", ".join(to_add) + ".",
+        )
+    return out
+
+
+def strip_calibration_from_plan(plan: dict, user_request: str = "") -> dict:
+    """Remove calibration-only steps and config keys from a simulation plan."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    cfg = dict(out.get("config") or {})
+    steps = list(out.get("steps") or [])
+    kept_steps: list[str] = []
+    for step in steps:
+        if step in _SIMULATION_STRIP_STEPS and workflow_step_user_required(out, step, user_request):
+            kept_steps.append(step)
+        elif step not in _SIMULATION_STRIP_STEPS:
+            kept_steps.append(step)
+    out["steps"] = kept_steps
+
+    for key in _CALIBRATION_PLAN_CONFIG_KEYS:
+        cfg.pop(key, None)
+    if "process_observed_data" not in kept_steps:
+        for key in _OBSERVATION_PLAN_CONFIG_KEYS:
+            cfg.pop(key, None)
+    extra = cfg.get("extra_config")
+    if isinstance(extra, dict):
+        extra = dict(extra)
+        for key in _CALIBRATION_PLAN_CONFIG_KEYS:
+            extra.pop(key, None)
+        if "process_observed_data" not in kept_steps:
+            for key in _OBSERVATION_PLAN_CONFIG_KEYS:
+                extra.pop(key, None)
+        if extra:
+            cfg["extra_config"] = extra
+        else:
+            cfg.pop("extra_config", None)
+    out["config"] = cfg
+    return out
+
+
+def ensure_calibration_workflow_steps(plan: dict, user_request: str = "") -> dict:
+    """Ensure calibration plans include obs download and calibrate steps when allowed."""
+    if not isinstance(plan, dict):
+        return plan
+    out = dict(plan)
+    steps = list(out.get("steps") or [])
+    to_add: list[str] = []
+    for step in ("process_observed_data", "calibrate_model"):
+        if step in steps:
+            continue
+        if workflow_step_user_required(out, step, user_request):
+            continue
+        forbidden = _DOWNLOAD_STEP_FORBID_PHRASES.get(step)
+        if forbidden and any(phrase in (user_request or "").lower() for phrase in forbidden):
+            continue
+        if re.search(rf"\bdo not (?:run|include) {re.escape(step)}\b", user_request or "", re.I):
+            continue
+        to_add.append(step)
+    if to_add:
+        out["steps"] = sort_plan_steps_by_workflow_order(steps + to_add)
+        _append_plan_note(out, f"Added calibration steps: {', '.join(to_add)}.")
+    return out
+
+
 def normalize_local_workflow_plan(
     plan: dict,
     user_request: str = "",
     *,
     data_dir: str | Path | None = None,
     skip_workflow_step_restore: bool = False,
+    workflow_plan_mode: str | None = None,
+    enable_prompt_matching: bool = True,
 ) -> dict:
     """
     Fix plans for local-data / notebook-style workflows: no bbox gate, restore steps from prompt.
@@ -1970,25 +2300,31 @@ def normalize_local_workflow_plan(
     """
     if not isinstance(plan, dict):
         return plan
+    if not enable_prompt_matching:
+        user_request = ""
     out = dict(plan)
     cfg = dict(out.get("config") or {})
+    if not enable_prompt_matching and _s(cfg.get("domain_name")):
+        cfg = mark_domain_name_confirmed(cfg)
     out["config"] = cfg
     steps = list(out.get("steps") or [])
-
-    # Honor exclusive validate/dry-run requests before any step expansion.
-    if request_requests_validation_dry_run_only(user_request):
-        out["steps"] = ["validate_config", "dry_run"]
-        out = ensure_domain_name_user_input(out, user_request, data_dir=data_dir)
-        out = apply_explicit_step_constraints(out, user_request)
-        return _drop_satisfied_needs_user_input(out)
 
     out = try_restore_local_recovery_plan(out, user_request, data_dir=data_dir)
     cfg = dict(out.get("config") or {})
     out["config"] = cfg
     steps = list(out.get("steps") or [])
 
+    mode = _s(workflow_plan_mode) or plan_workflow_mode(out)
+    if mode in {WORKFLOW_PLAN_MODE_SIMULATION, WORKFLOW_PLAN_MODE_CALIBRATION}:
+        out["workflow_plan_mode"] = mode
+
     out = strip_user_forbidden_download_steps(out, user_request)
-    out = ensure_plan_station_id(out, user_request)
+    if mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        pass
+    elif mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        pass
+    else:
+        out = ensure_plan_station_id(out, user_request)
     out = ensure_domain_name_user_input(out, user_request, data_dir=data_dir)
     if not skip_workflow_step_restore:
         out = restore_workflow_steps_from_user_request(out, user_request, data_dir=data_dir)
@@ -1999,7 +2335,6 @@ def normalize_local_workflow_plan(
         out = ensure_local_data_access_in_plan(out)
     out = ensure_online_data_when_missing(out, user_request, data_dir=data_dir)
     cfg = dict(out.get("config") or {})
-    cfg = apply_workflow_config_policies(cfg, user_request)
     out["config"] = cfg
     steps = list(out.get("steps") or [])
 
@@ -2014,12 +2349,14 @@ def normalize_local_workflow_plan(
             out = infer_gated_plan_steps(out, user_request, data_dir=data_dir)
             steps = list(out.get("steps") or [])
 
-    out = apply_explicit_step_constraints(out, user_request)
-    out = ensure_create_pour_point_before_define_domain(out, user_request, data_dir=data_dir)
-    out = ensure_acquire_attributes_before_define_domain(out, user_request, data_dir=data_dir)
-    out = ensure_discretize_domain_before_preprocessing(out, user_request, data_dir=data_dir)
-    steps = list(out.get("steps") or [])
-    cfg = dict(out.get("config") or {})
+    if mode == WORKFLOW_PLAN_MODE_SIMULATION:
+        out = strip_calibration_from_plan(out, user_request)
+        if enable_prompt_matching:
+            out = restore_simulation_setup_steps_for_calibration(out, user_request)
+    elif mode == WORKFLOW_PLAN_MODE_CALIBRATION:
+        out = restore_simulation_setup_steps_for_calibration(out, user_request)
+        out = ensure_calibration_workflow_steps(out, user_request)
+        out = ensure_plan_station_id(out, user_request)
 
     if not plan_uses_local_data(cfg, steps, user_request, data_dir=data_dir):
         return _drop_satisfied_needs_user_input(out)
@@ -2051,96 +2388,11 @@ def extract_steps_from_request(user_request: str, allowed_steps: list[str]) -> l
     return found
 
 
-def _user_forbids_step_inference(user_request: str, step_keyword: str) -> bool:
-    """True when the prompt explicitly forbids a step (e.g. 'do not run the model')."""
-    text = _s(user_request).lower()
-    kw = step_keyword.lower()
-    neg = (
-        rf"\b(?:do\s+not|don'?t|without|skip|omit|exclude|no)\s+(?:\w+\s+){{0,3}}{re.escape(kw)}\b",
-        rf"\b(?:do\s+not|don'?t)\s+{re.escape(kw)}\b",
-    )
-    return any(re.search(p, text) for p in neg)
-
-
-def request_forbids_run_model(user_request: str) -> bool:
-    return (
-        _user_forbids_step_inference(user_request, "run the model")
-        or _user_forbids_step_inference(user_request, "run model")
-        or _user_forbids_step_inference(user_request, "run_model")
-        or _user_forbids_step_inference(user_request, "model run")
-    )
-
-
-def request_forbids_calibrate(user_request: str) -> bool:
-    return (
-        _user_forbids_step_inference(user_request, "calibrat")
-        or _user_forbids_step_inference(user_request, "calibration")
-    )
-
-
-def request_forbids_postprocess(user_request: str) -> bool:
-    return (
-        _user_forbids_step_inference(user_request, "postprocess")
-        or _user_forbids_step_inference(user_request, "postprocessing")
-        or _user_forbids_step_inference(user_request, "post-process")
-    )
-
-
-def request_requests_validation_dry_run_only(user_request: str) -> bool:
-    """True when the user asks only for validate_config / dry_run."""
-    text = _s(user_request).lower()
-    if not text:
-        return False
-    patterns = (
-        r"\bonly\s+validate_config\s+and\s+dry_run\b",
-        r"\bonly\s+validate(?:_config)?\s+and\s+dry[_\s-]?run\b",
-        r"\bvalidate_config\s+and\s+dry_run\s+only\b",
-        r"\bonly\s+(?:do\s+)?validate(?:_config)?\s+and\s+(?:a\s+)?dry[_\s-]?run\b",
-        r"\bvalidate(?:_config)?\s+and\s+(?:run\s+a\s+)?dry[_\s-]?run\b.*\b(?:skip|do\s+not|don'?t|without)\b",
-    )
-    return any(re.search(p, text) for p in patterns)
-
-
-def apply_explicit_step_constraints(plan: dict, user_request: str = "") -> dict:
-    """Honor exclusive validate/dry-run requests and negative step constraints."""
-    if not isinstance(plan, dict):
-        return plan
-    out = dict(plan)
-    text = _s(user_request)
-    if request_requests_validation_dry_run_only(text):
-        out["steps"] = ["validate_config", "dry_run"]
-        _append_plan_note(out, "Restricted steps to validate_config and dry_run per user request.")
-        return out
-
-    steps = list(out.get("steps") or [])
-    if not steps:
-        return out
-
-    remove: set[str] = set()
-    if request_forbids_run_model(text):
-        remove.update({"run_model", "calibrate_model"})
-    if request_forbids_calibrate(text) or not re.search(r"\bcalibrat", text.lower()):
-        remove.add("calibrate_model")
-    if request_forbids_postprocess(text):
-        remove.add("postprocess_results")
-
-    if remove:
-        out["steps"] = [step for step in steps if step not in remove]
-    return out
-
-
 def infer_goal_steps_from_request(user_request: str) -> list[str]:
     """Infer high-level workflow goals from natural-language hydrology prompts."""
     text = _s(user_request).lower()
     if not text:
         return []
-
-    if request_requests_validation_dry_run_only(user_request):
-        return ["validate_config", "dry_run"]
-
-    forbids_model = request_forbids_run_model(user_request)
-    forbids_calibrate = request_forbids_calibrate(user_request)
-    forbids_postprocess = request_forbids_postprocess(user_request)
 
     goals: list[str] = []
 
@@ -2151,39 +2403,14 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if re.search(r"\bprocess_observed\b", text) or re.search(r"\bobserved\s+streamflow\b", text):
         add("process_observed_data")
 
-    if not forbids_model and (
+    if (
         re.search(r"\bfrom\s+scratch\b", text)
         or re.search(r"\brun\s+(?:the\s+)?model\b", text)
-        or re.search(r"\bmodel\s+run\b", text)
-        or re.search(r"\b(?:and|then)\s+(?:the\s+)?model\b", text)
         or re.search(r"\brun\s+summa\b", text)
         or re.search(r"\bsumma\s+workflow\b", text)
-        or (
-            re.search(r"\bworkflow\b", text)
-            and re.search(r"\b(?:fuse|summa|hbv|gr|mesh|hype|ngen|topmodel)\b", text)
-        )
+        or (re.search(r"\bworkflow\b", text) and re.search(r"\bsumma\b", text))
     ):
         add("run_model")
-
-    if not forbids_calibrate and re.search(r"\bcalibrat(?:e|ion)\s+(?:the\s+)?model\b", text):
-        add("calibrate_model")
-
-    # Require an affirmative postprocess mention, not "skip postprocessing".
-    if not forbids_postprocess and re.search(
-        r"\b(?:include\s+)?postprocess(?:ing|_results)?\b", text
-    ) and not re.search(
-        r"\b(?:do\s+not|don'?t|without|skip|omit|exclude|no)\b.{0,20}\bpostprocess",
-        text,
-    ):
-        add("postprocess_results")
-
-    if re.search(r"\bpreprocess", text):
-        add("model_agnostic_preprocessing")
-        add("model_specific_preprocessing")
-        add("discretize_domain")
-
-    if re.search(r"\bsetup\b", text):
-        add("setup_project")
 
     if re.search(r"\bsemi[- ]?distributed\b", text):
         add("define_domain")
@@ -2192,14 +2419,10 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     if re.search(r"\bprepare\s+.*\binput\b", text) or re.search(r"\bsumma\s+input\b", text):
         add("model_specific_preprocessing")
 
-    if re.search(r"\bforcings?\b", text) or re.search(r"\bdownload\b.*\bforcings?\b", text):
+    if re.search(r"\bforcing\b", text):
         add("acquire_forcings")
 
-    if (
-        re.search(r"\bacquire\s+attribute", text)
-        or re.search(r"\bdownload\s+attribute", text)
-        or re.search(r"\battributes\s+and\b", text)
-    ):
+    if re.search(r"\bacquire\s+attribute", text) or re.search(r"\battributes\s+and\b", text):
         add("acquire_attributes")
 
     if (
@@ -2209,33 +2432,7 @@ def infer_goal_steps_from_request(user_request: str) -> list[str]:
     ):
         add("define_domain")
 
-    if "define_domain" in goals and not _user_forbids_step_inference(
-        user_request, "create_pour_point"
-    ):
-        add("create_pour_point")
-
-    if "define_domain" in goals and (
-        "model_agnostic_preprocessing" in goals or "run_model" in goals
-    ):
-        add("discretize_domain")
-
     for step in extract_steps_from_request(user_request, WORKFLOW_STEP_NAMES):
-        if step == "run_model" and forbids_model:
-            continue
-        if step == "calibrate_model" and forbids_calibrate:
-            continue
-        if step == "postprocess_results" and forbids_postprocess:
-            continue
-        if step == "dry_run":
-            add(step)
-            continue
         add(step)
-
-    if forbids_model:
-        goals = [g for g in goals if g not in ("run_model", "calibrate_model")]
-    if forbids_calibrate:
-        goals = [g for g in goals if g != "calibrate_model"]
-    if forbids_postprocess:
-        goals = [g for g in goals if g != "postprocess_results"]
 
     return goals

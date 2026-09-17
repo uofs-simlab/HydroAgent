@@ -5,10 +5,10 @@ import pandas as pd
 
 def summarize(csv_path: Path) -> dict:
     df = pd.read_csv(csv_path, parse_dates=["time"])
-    if "IRFroutedRunoff" not in df.columns:
-        raise ValueError(f"Expected column IRFroutedRunoff in {csv_path.name}, got {list(df.columns)}")
-
-    q = df["IRFroutedRunoff"].astype(float)
+    qcol = next((c for c in df.columns if c.lower() != "time"), None)
+    if qcol is None:
+        raise ValueError(f"No discharge column in {csv_path.name}, got {list(df.columns)}")
+    q = df[qcol].astype(float)
 
     out = {
         "csv": str(csv_path),

@@ -1,0 +1,326 @@
+from unittest.mock import patch
+
+from server.core.plan_rules import (
+    WORKFLOW_PLAN_MODE_CALIBRATION,
+    WORKFLOW_PLAN_MODE_SIMULATION,
+    ensure_calibration_workflow_steps,
+    extract_ordered_steps_from_request,
+    is_calibration_workflow_plan,
+    is_simulation_workflow_plan,
+    normalize_local_workflow_plan,
+    strip_calibration_from_plan,
+)
+
+
+def test_legacy_prompt_matching_keeps_permissive_step_extraction():
+    prompt = (
+        "First run setup_project for the domain.\n"
+        "Then acquire_attributes for delineation.\n"
+        "Finally define_domain before continuing."
+    )
+
+    assert extract_ordered_steps_from_request(prompt) == [
+        "setup_project",
+        "acquire_attributes",
+        "define_domain",
+    ]
+
+
+def test_strip_calibration_from_simulation_plan():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": ["validate_config", "run_model", "calibrate_model", "process_observed_data"],
+        "config": {
+            "domain_name": "Experiment04",
+            "station_id": "05BB001",
+            "streamflow_data_provider": "WSC",
+            "calibration_period": "2022-04-01, 2022-05-01",
+            "evaluation_period": "2022-05-02, 2022-06-01",
+            "optimization_metric": "KGE",
+        },
+    }
+    out = strip_calibration_from_plan(plan, "")
+    assert "calibrate_model" not in out["steps"]
+    assert "process_observed_data" in out["steps"]
+    assert "run_model" in out["steps"]
+    assert out["config"]["station_id"] == "05BB001"
+    assert out["config"]["streamflow_data_provider"] == "WSC"
+    assert "calibration_period" not in out["config"]
+    assert out["config"]["evaluation_period"] == "2022-05-02, 2022-06-01"
+
+
+def test_calibration_plan_adds_steps_and_keeps_station():
+    from unittest.mock import patch
+
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_CALIBRATION,
+        "steps": ["validate_config", "run_model"],
+        "config": {
+            "domain_name": "Experiment04",
+            "pour_point_coords": "51.178/-115.579",
+            "experiment_time_start": "2022-04-01 01:00",
+            "experiment_time_end": "2022-05-26 01:00",
+        },
+    }
+
+    def fake_resolve(provider, pour, **kwargs):
+        return ("05BB001", "note")
+
+    with patch(
+        "server.core.station_resolver.resolve_station_near_pour_point",
+        side_effect=fake_resolve,
+    ):
+        out = normalize_local_workflow_plan(
+            plan,
+            "",
+            workflow_plan_mode=WORKFLOW_PLAN_MODE_CALIBRATION,
+            skip_workflow_step_restore=True,
+        )
+
+    assert is_calibration_workflow_plan(out)
+    assert "process_observed_data" in out["steps"]
+    assert "calibrate_model" in out["steps"]
+    assert out["config"].get("station_id") == "05BB001"
+
+
+def test_simulation_normalize_strips_calibration_fields():
+    plan = {
+        "steps": ["validate_config", "run_model", "calibrate_model"],
+        "config": {
+            "domain_name": "Experiment04",
+            "station_id": "05BA006",
+            "streamflow_data_provider": "WSC",
+            "iterations": 50,
+        },
+    }
+    out = normalize_local_workflow_plan(
+        plan,
+        "",
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        skip_workflow_step_restore=True,
+    )
+    assert is_simulation_workflow_plan(out)
+    assert "calibrate_model" not in out["steps"]
+    assert "station_id" not in out["config"]
+    assert "streamflow_data_provider" not in out["config"]
+    assert "iterations" not in out["config"]
+
+
+def test_ensure_calibration_workflow_steps_inserts_missing():
+    plan = {"steps": ["validate_config", "run_model"], "config": {}}
+    out = ensure_calibration_workflow_steps(plan, "")
+    assert out["steps"].index("process_observed_data") < out["steps"].index("calibrate_model")
+
+
+def test_simulation_keeps_domain_steps_when_local_artifacts_exist():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": [
+            "validate_config",
+            "define_domain",
+            "discretize_domain",
+            "acquire_forcings",
+            "run_model",
+        ],
+        "config": {
+            "domain_name": "Experiment06",
+            "experiment_id": "exp_001",
+            "domain_def": "delineate",
+            "hydrological_model": "SUMMA",
+            "routing_model": "mizuRoute",
+        },
+    }
+    with patch("server.core.plan_rules.domain_has_complete_local_workflow", return_value=True), patch(
+        "server.core.plan_rules.domain_has_local_summa_forcing", return_value=True
+    ), patch("server.core.plan_rules.domain_name_needs_user_input", return_value=False), patch(
+        "server.core.plan_rules.is_weak_domain_name", return_value=False
+    ):
+        out = normalize_local_workflow_plan(
+            plan,
+            "",
+            data_dir="/tmp",
+            workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+            skip_workflow_step_restore=True,
+        )
+    assert "define_domain" in out["steps"]
+    assert "discretize_domain" in out["steps"]
+    assert "acquire_forcings" in out["steps"]
+    assert "run_model" in out["steps"]
+
+
+def test_simulation_preserves_planner_scope_when_prompt_matching_disabled():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": ["validate_config", "run_model"],
+        "config": {
+            "domain_name": "Experiment06",
+            "domain_def": "delineate",
+            "hydrological_model": "SUMMA",
+            "routing_model": "mizuRoute",
+        },
+    }
+    out = normalize_local_workflow_plan(
+        plan,
+        "Use Experiment06 as the domain name.",
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        skip_workflow_step_restore=True,
+        enable_prompt_matching=False,
+    )
+    assert out["steps"] == ["validate_config", "run_model"]
+
+
+def test_simulation_restores_legacy_full_pipeline_when_prompt_matching_enabled():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": ["validate_config", "run_model"],
+        "config": {
+            "domain_name": "Experiment06",
+            "domain_def": "delineate",
+            "hydrological_model": "SUMMA",
+            "routing_model": "mizuRoute",
+        },
+    }
+    out = normalize_local_workflow_plan(
+        plan,
+        "Use Experiment06 as the domain name.",
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        skip_workflow_step_restore=True,
+        enable_prompt_matching=True,
+    )
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+        "discretize_domain",
+        "acquire_forcings",
+        "model_agnostic_preprocessing",
+        "build_model_ready_store",
+        "model_specific_preprocessing",
+        "run_model",
+    ]
+
+
+def test_simulation_preserves_structured_basin_scope_when_prompt_matching_disabled():
+    prompt = """Include only these workflow steps:
+
+validate_config
+setup_project
+create_pour_point
+acquire_attributes
+define_domain
+
+Do not include acquire_forcings.
+Do not include model_agnostic_preprocessing.
+Do not include build_model_ready_store.
+Do not include model_specific_preprocessing.
+Do not include run_model.
+"""
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": [
+            "validate_config",
+            "setup_project",
+            "create_pour_point",
+            "acquire_attributes",
+            "define_domain",
+        ],
+        "config": {
+            "domain_name": "Bow_at_Banff_CIROH_lumped",
+            "domain_def": "lumped",
+            "data_access": "cloud",
+        },
+    }
+
+    out = normalize_local_workflow_plan(
+        plan,
+        prompt,
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        enable_prompt_matching=False,
+    )
+
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+    ]
+
+
+def test_cloud_structured_plan_keeps_scope_when_prompt_matching_disabled(tmp_path):
+    prompt = """Prepare a fresh, basin-definition-only cloud workflow.
+
+data_access: cloud
+domain_name: Bow_at_Banff_CIROH_lumped
+
+Include only these workflow steps, in this order:
+
+validate_config
+setup_project
+create_pour_point
+acquire_attributes
+define_domain
+"""
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "config": {
+            "domain_name": "Bow_at_Banff_CIROH_lumped",
+            "data_access": "cloud",
+        },
+        "steps": [
+            "validate_config",
+            "setup_project",
+            "create_pour_point",
+            "acquire_attributes",
+            "define_domain",
+        ],
+    }
+
+    out = normalize_local_workflow_plan(
+        plan,
+        prompt,
+        data_dir=tmp_path,
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        enable_prompt_matching=False,
+    )
+
+    assert out["config"]["data_access"] == "cloud"
+    assert out["config"]["extra_config"]["DATA_ACCESS"] == "cloud"
+    assert out["steps"] == [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+    ]
+
+
+def test_simulation_preserves_experiment06_short_plan_when_prompt_matching_disabled():
+    plan = {
+        "workflow_plan_mode": WORKFLOW_PLAN_MODE_SIMULATION,
+        "steps": [
+            "define_domain",
+            "discretize_domain",
+            "acquire_forcings",
+            "model_agnostic_preprocessing",
+            "run_model",
+            "postprocess_results",
+        ],
+        "config": {
+            "domain_name": "Experiment06",
+            "domain_def": "delineate",
+            "hydrological_model": "SUMMA",
+            "routing_model": "mizuRoute",
+        },
+        "notes": "Skipped define_domain/discretize_domain; reusing existing local catchment.",
+    }
+    out = normalize_local_workflow_plan(
+        plan,
+        "Use Experiment06 as the domain name and run SUMMA from 2023/04/02 to 2023/05/15.",
+        workflow_plan_mode=WORKFLOW_PLAN_MODE_SIMULATION,
+        skip_workflow_step_restore=True,
+        enable_prompt_matching=False,
+    )
+    assert out["steps"] == ["acquire_attributes", *plan["steps"]]
