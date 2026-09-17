@@ -1,8 +1,9 @@
 # SYMFLUENCE cleanup status
 
-The backend changes have been reduced to two fixes. No Git commands were run.
+The backend changes have been reduced to two fixes, committed as `1b79a581`
+with message `fix python package compatibility and paradise SNOTEL metadata`.
 
-| Remaining file change under `symfluence/` | Reason to keep it |
+| Retained file change under `symfluence/` | Reason to keep it |
 | --- | --- |
 | `pixi.toml` and `pixi.lock` | Use the conda-forge CPU PyTorch build with the NumPy 2 stack. Keep the manifest and matching lock together. |
 | `examples/01_point_vertical_flux_estimation/01a_point_scale_snotel.ipynb` | Correct Paradise's station ID from `602` to `679` in the config and introduction, and correct the stated elevation to approximately 1,570 m. |
@@ -39,27 +40,16 @@ packages. Use a compatible Pixi version and have CI test those platforms. A loca
 macOS smoke test does not validate the Linux or Windows packages. Do not hand-edit
 the lock or publish it separately from the manifest.
 
-## Publish the backend before updating HydroAgent's pointer
+## Published backend
 
-These commands are instructions for you; none were executed here. From the
-HydroAgent root:
+The fixes are published on
+[`tristanmontoya/SYMFLUENCE`, branch `ciroh-asm-2026`](https://github.com/tristanmontoya/SYMFLUENCE/tree/ciroh-asm-2026).
+HydroAgent's `.gitmodules` points to that fork and branch, and the submodule
+remains pinned to commit `1b79a581`. This lets fresh clones fetch the retained
+fixes without requiring write access to the upstream repository.
 
-```sh
-git -C symfluence switch -c cleanup/backend-fixes
-git -C symfluence add pixi.toml pixi.lock
-git -C symfluence commit -m "Use conda-forge CPU PyTorch with NumPy 2"
-git -C symfluence add examples/01_point_vertical_flux_estimation/01a_point_scale_snotel.ipynb
-git -C symfluence commit -m "Correct Paradise SNOTEL station metadata"
-git -C symfluence push -u origin cleanup/backend-fixes
-```
-
-Open a backend PR targeting `hydroagent-v2` in
-`uofs-simlab/SYMFLUENCE-HydroAgent`. After it is merged, check out the published
-merge commit inside `symfluence/`, then stage `symfluence` in the parent
-HydroAgent repository alongside the HydroAgent changes. Commit and push the
-parent afterward. The parent stores a backend commit ID; it does not include
-uncommitted files inside the submodule.
-
-If you publish only HydroAgent now, leave its submodule pointer at the
-already-published backend commit. Fresh clones will not receive the local
-PyTorch fix until a published backend commit containing it is referenced.
+HydroAgent is published on
+[`tristanmontoya/HydroAgent`, branch `main`](https://github.com/tristanmontoya/HydroAgent/tree/main).
+To contribute the backend fixes upstream, open a separate PR targeting
+`hydroagent-v2` in `uofs-simlab/SYMFLUENCE-HydroAgent`. If that PR is merged,
+HydroAgent can switch back to the upstream URL and pin the published merge commit.
