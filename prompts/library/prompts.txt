@@ -376,3 +376,6 @@ Create a SUMMA workflow for domain BowRiver3 with experiment exp001. Use pour po
 
 24:
 Run SUMMA for the Bow River basin from 2025 to 2026. Use semi-distributed delineation with GRUs and ERA5 forcing. Experiment id exp001.
+
+25:
+Run a SUMMA simulation.

@@ -25,6 +25,35 @@ from server.llm.plan_shared import (
 from server.llm.stage_capture import record_parsed_plan, record_raw
 
 
+def _generation_config(
+    *,
+    model: str,
+    system_instruction: str,
+    max_output_tokens: int,
+    response_json_schema: Dict[str, Any] | None = None,
+) -> types.GenerateContentConfig:
+    """Build a Gemini request config for the model generation.
+
+    Gemini 3 models, including gemini-3.8-flash, reject temperature, top_p,
+    top_k, and candidate_count. Reasoning is set with thinking_level. Medium
+    is that model's default. Older Gemini models keep temperature 0.2.
+    """
+    kwargs: Dict[str, Any] = {
+        "max_output_tokens": max_output_tokens,
+        "system_instruction": system_instruction,
+        "response_mime_type": "application/json",
+    }
+    if response_json_schema is not None:
+        kwargs["response_json_schema"] = response_json_schema
+    if model.startswith("gemini-3"):
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=types.ThinkingLevel.MEDIUM
+        )
+    else:
+        kwargs["temperature"] = 0.2
+    return types.GenerateContentConfig(**kwargs)
+
+
 def _sanitize_schema_for_gemini(node: Any) -> Any:
     """Adapt JSON Schema for Gemini structured output (union types → anyOf)."""
     if isinstance(node, list):
@@ -153,11 +182,10 @@ class GeminiProvider:
 
         last_failure = "unknown error"
         for attempt_idx, token_budget in enumerate(token_budgets):
-            config = types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=token_budget,
+            config = _generation_config(
+                model=model,
                 system_instruction=system_prompt,
-                response_mime_type="application/json",
+                max_output_tokens=token_budget,
                 response_json_schema=gemini_schema,
             )
             resp = self.client.models.generate_content(
@@ -171,15 +199,14 @@ class GeminiProvider:
                 return parsed
             last_failure = self._describe_response_failure(resp)
 
-            fallback_config = types.GenerateContentConfig(
-                temperature=0.2,
+            fallback_config = _generation_config(
+                model=model,
                 max_output_tokens=token_budget,
                 system_instruction=(
                     system_prompt
                     + "\n\nIMPORTANT: Return ONLY a single valid JSON object. "
                     "No numbering, no comments, no markdown, no trailing commas."
                 ),
-                response_mime_type="application/json",
             )
             resp2 = self.client.models.generate_content(
                 model=model,
@@ -308,7 +335,7 @@ class GeminiProvider:
         *,
         audio_bytes: bytes,
         filename: str = "recording.webm",
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.8-flash",
     ) -> str:
         """Speech-to-text via Gemini multimodal audio understanding."""
         suffix = Path(filename).suffix or ".webm"

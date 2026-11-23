@@ -72,6 +72,8 @@
         "experiment_time_end": "2004-01-19 23:00"
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
         "run_model"
       ],
       "prohibited_steps": [],
@@ -93,6 +95,7 @@
       },
       "required_steps": [
         "acquire_attributes",
+        "define_domain",
         "acquire_forcings",
         "model_agnostic_preprocessing",
         "model_specific_preprocessing",
@@ -136,6 +139,9 @@
         "iterations": 50
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
+        "run_model",
         "calibrate_model"
       ],
       "prohibited_steps": [],
@@ -155,6 +161,8 @@
         "experiment_time_end": "2010-12-31 23:00"
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
         "run_model"
       ],
       "prohibited_steps": [],
@@ -200,8 +208,8 @@
       },
       "required_steps": [
         "setup_project",
-        "discretize_domain",
-        "run_model"
+        "define_domain",
+        "discretize_domain"
       ],
       "prohibited_steps": [],
       "needs_user_input": [
@@ -241,6 +249,7 @@
         "experiment_time_end": "2022-05-31 23:00"
       },
       "required_steps": [
+        "setup_project",
         "define_domain",
         "discretize_domain",
         "acquire_forcings",
@@ -263,8 +272,8 @@
         "routing_model": "mizuRoute"
       },
       "required_steps": [
-        "define_domain",
-        "run_model"
+        "setup_project",
+        "define_domain"
       ],
       "prohibited_steps": [],
       "needs_user_input": [
@@ -300,6 +309,8 @@
         "experiment_time_end": "2008-03-15 23:00"
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
         "run_model"
       ],
       "prohibited_steps": [],
@@ -363,6 +374,9 @@
         "iterations": 25
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
+        "run_model",
         "calibrate_model"
       ],
       "prohibited_steps": [],
@@ -383,6 +397,8 @@
         "experiment_time_end": "2011-12-31 23:00"
       },
       "required_steps": [
+        "setup_project",
+        "define_domain",
         "run_model"
       ],
       "prohibited_steps": [],
@@ -456,6 +472,7 @@
       },
       "required_steps": [
         "setup_project",
+        "define_domain",
         "run_model",
         "postprocess_results"
       ],
@@ -492,6 +509,7 @@
         "experiment_time_end": "2004-01-19 23:00"
       },
       "required_steps": [
+        "define_domain",
         "run_model",
         "postprocess_results"
       ],

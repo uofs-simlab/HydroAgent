@@ -1526,7 +1526,8 @@ GPT_MODELS = {
 ALL_GPT_MODELS = [m for group in GPT_MODELS.values() for m in group]
 
 GEMINI_MODELS = {
-    "Gemini 2.5 (Recommended)": ["gemini-2.5-flash", "gemini-2.5-pro"],
+    "Gemini 3.8 (Recommended)": ["gemini-3.8-flash"],
+    "Gemini 2.5": ["gemini-2.5-flash", "gemini-2.5-pro"],
     "Gemini 2.0": ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
     "Gemini 1.5 (Legacy)": ["gemini-1.5-pro", "gemini-1.5-flash"],
 }
@@ -1587,7 +1588,7 @@ LLM_PROVIDER_PACKAGES = {
 }
 DEFAULT_LLM_MODEL = {
     "openai": "gpt-5-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
     "claude": "claude-sonnet-5",
 }
 

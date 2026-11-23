@@ -283,7 +283,7 @@ Available models by provider:
 | Provider | Models |
 |----------|--------|
 | OpenAI (GPT) | GPT-4o, GPT-4o-mini, GPT-5, and others |
-| Google (Gemini) | Gemini 2.5 Flash / Pro (recommended), Gemini 2.0 Flash, Gemini 1.5 (legacy) |
+| Google (Gemini) | Gemini 3.8 Flash (recommended), Gemini 2.5 Flash / Pro, Gemini 2.0 Flash, Gemini 1.5 (legacy) |
 | Anthropic (Claude) | Sonnet 4, Opus 4 (recommended), Sonnet 3.7, Sonnet 3.5, Haiku 3.5 (legacy) |
 
 > **Note:** The `anthropic` and `google-genai` SDK packages must be installed (included in `requirements.txt`). If a provider's SDK is not importable, the UI shows an install hint.
