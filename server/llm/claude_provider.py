@@ -20,6 +20,7 @@ from server.llm.plan_shared import (
     _extract_bounding_box,
     _extract_hydrological_model,
 )
+from server.llm.stage_capture import record_parsed_plan, record_raw
 
 
 def _model_supports_temperature(model: str) -> bool:
@@ -205,6 +206,7 @@ class ClaudeProvider:
                         }
                     },
                 )
+                record_raw("SCHEMA_CALL", response)
                 parsed = self._extract_json_from_response(response)
                 if parsed is not None:
                     return parsed
@@ -222,6 +224,7 @@ class ClaudeProvider:
                     user_prompt=user_prompt,
                 ),
             )
+            record_raw("FALLBACK_CALL", response2)
             parsed2 = self._extract_json_from_response(response2)
             if parsed2 is not None:
                 return parsed2
@@ -246,6 +249,7 @@ class ClaudeProvider:
             user_prompt=user_request,
             max_output_tokens=8192,
         )
+        record_parsed_plan(plan)
         return finalize_run_plan(plan, user_request)
 
     def refine_run_plan(

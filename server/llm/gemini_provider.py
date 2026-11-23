@@ -22,6 +22,7 @@ from server.llm.plan_shared import (
     _extract_bounding_box,
     _extract_hydrological_model,
 )
+from server.llm.stage_capture import record_parsed_plan, record_raw
 
 
 def _sanitize_schema_for_gemini(node: Any) -> Any:
@@ -164,6 +165,7 @@ class GeminiProvider:
                 contents=user_prompt,
                 config=config,
             )
+            record_raw("SCHEMA_CALL", resp)
             parsed = self._extract_json_from_response(resp)
             if parsed is not None:
                 return parsed
@@ -184,6 +186,7 @@ class GeminiProvider:
                 contents=user_prompt,
                 config=fallback_config,
             )
+            record_raw("FALLBACK_CALL", resp2)
             parsed2 = self._extract_json_from_response(resp2)
             if parsed2 is not None:
                 return parsed2
@@ -208,6 +211,7 @@ class GeminiProvider:
             user_prompt=user_request,
             max_output_tokens=8192,
         )
+        record_parsed_plan(plan)
         return finalize_run_plan(plan, user_request)
 
     def refine_run_plan(

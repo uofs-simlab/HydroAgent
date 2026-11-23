@@ -617,11 +617,11 @@ def ensure_domain_name_user_input(
     if "domain_name" not in needs:
         needs.append("domain_name")
     out["needs_user_input"] = needs
-    out["steps"] = ["validate_config", "dry_run"]
     _append_plan_note(
         out,
         "Domain name is required. Set domain_name in the prompt, pick an existing "
-        "SYMFLUENCE_data/domain_<name>/ folder, or confirm it in the Input tab.",
+        "SYMFLUENCE_data/domain_<name>/ folder, or confirm it in the Input tab. "
+        "The requested workflow steps are kept.",
     )
     existing = list_existing_domain_names(data_dir)
     if existing:

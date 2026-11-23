@@ -20,6 +20,7 @@ from server.llm.plan_shared import (
     finalize_plan_refinement,
     finalize_run_plan,
 )
+from server.llm.stage_capture import record_parsed_plan, record_raw
 
 
 class OpenAIProvider:
@@ -104,6 +105,7 @@ class OpenAIProvider:
             payload["temperature"] = 0.2
 
         resp = self.client.responses.create(**payload)
+        record_raw("SCHEMA_CALL", resp)
         parsed = _extract_json(resp)
         if parsed is not None:
             return parsed
@@ -128,6 +130,7 @@ class OpenAIProvider:
             payload2["temperature"] = 0.2
 
         resp2 = self.client.responses.create(**payload2)
+        record_raw("FALLBACK_CALL", resp2)
         parsed2 = _extract_json(resp2)
         if parsed2 is not None:
             return parsed2
@@ -215,6 +218,7 @@ class OpenAIProvider:
             user_prompt=user_request,
             max_output_tokens=2500,
         )
+        record_parsed_plan(plan)
         return finalize_run_plan(plan, user_request)
 
     def refine_run_plan(

@@ -1,0 +1,131 @@
+{
+  "evaluation_name": "stage_snapshot",
+  "note": "New 25-prompt evaluation. These are the user requests only. References are in references.json and were written from the prompt text, not from a provider plan.",
+  "prompts": [
+    {
+      "id": "001",
+      "category": "complete_workflow",
+      "text": "Create a SUMMA workflow for domain BowRiver3 with experiment exp001. Use pour point 51.3500000/-116.0200000, delineate the domain, and run from 2020-01-01 to 2020-12-31. Include setup, preprocessing, model run, and postprocessing."
+    },
+    {
+      "id": "002",
+      "category": "missing_information",
+      "text": "Run SUMMA for the Bow River basin from 2025 to 2026. Use semi-distributed delineation with GRUs and ERA5 forcing. Experiment id exp001."
+    },
+    {
+      "id": "003",
+      "category": "missing_information",
+      "text": "Run a SUMMA simulation."
+    },
+    {
+      "id": "004",
+      "category": "complete_workflow",
+      "text": "Set up a hydrology workflow. Use BOWRiver3 as domain name, experiment semi_distributed_run_1, pour point 51.35/-116.02, and run the model from 2004-01-05 to 2004-01-19."
+    },
+    {
+      "id": "005",
+      "category": "complete_workflow",
+      "text": "Build a SUMMA domain called ParadiseValley for experiment pv_001. Bounding box 51.76/-116.55/50.95/-115.50. Download attributes and ERA5 forcings from the cloud, then run preprocessing and the model for 2018-06-01 to 2019-05-31."
+    },
+    {
+      "id": "006",
+      "category": "local_reuse",
+      "text": "Use existing local SYMFLUENCE data for domain Bow_at_Banff_semi_distributed with experiment semi_distributed_run_1. Do not download attributes or forcings. Run model-specific preprocessing, run the model, and postprocess results for 2004-01-05 to 2004-01-19."
+    },
+    {
+      "id": "007",
+      "category": "calibration",
+      "text": "Calibrate SUMMA for domain BowRiver_cal with experiment cal_001. Pour point 51.35/-116.02. Calibration period 2004-01-05 to 2004-01-19, evaluation period 2004-01-20 to 2004-01-31. Use DE algorithm, KGE metric, 50 iterations, and include calibrate_model in the workflow."
+    },
+    {
+      "id": "008",
+      "category": "specialized",
+      "text": "Create a lumped SUMMA setup for domain Bow_lumped with experiment lumped_001 at pour point 51.35/-116.02. Do not use mizuRoute. Run from 2010-01-01 to 2010-12-31 with lumped routing and parameter regionalization."
+    },
+    {
+      "id": "009",
+      "category": "dry_run",
+      "text": "Validate the configuration and run a dry run setup for domain TestBasin, experiment dry_001, pour point 50.50/-114.50, experiment window 2001-01-01 to 2001-01-10. Do not run the model."
+    },
+    {
+      "id": "010",
+      "category": "specialized",
+      "text": "Set up an elevation-distributed SUMMA workflow for domain Bow_elevation with experiment elev_001. Pour point 51.35/-116.02, discretization elevation, elevation band size 400 m, dates 2004-01-05 to 2004-01-19. Reuse existing semi-distributed catchment shapefiles where possible."
+    },
+    {
+      "id": "011",
+      "category": "complete_workflow",
+      "text": "Create a SUMMA plan with domain_name=ElbowRiver_v2, experiment_id=exp_elbow_01, pour point 50.95/-114.55, and experiment window 2015-01-01 to 2015-12-31. Include setup_project, acquire_attributes, define_domain, and run_model."
+    },
+    {
+      "id": "012",
+      "category": "complete_workflow",
+      "text": "Run a semi-distributed SUMMA workflow named CascadeCreek for experiment cc_2021. Pour point 51.10/-115.20. Use ERA5, GRUs, and run from 2021-06-01 to 2022-05-31. Include preprocessing and postprocessing."
+    },
+    {
+      "id": "013",
+      "category": "complete_workflow",
+      "text": "Set up SUMMA for domain RedDeer_Basin with experiment rd_001 from 2019 to 2020. Use delineate and mizuRoute."
+    },
+    {
+      "id": "014",
+      "category": "missing_information",
+      "text": "I need a SUMMA run for domain QuickTest and experiment qt_001."
+    },
+    {
+      "id": "015",
+      "category": "complete_workflow",
+      "text": "Plan a hydrology workflow. Set the domain name to SprayLakes and experiment to spray_run_3. Pour point 51.05/-115.40. Run the model from 2008-03-01 to 2008-03-15 only."
+    },
+    {
+      "id": "016",
+      "category": "negative_constraint",
+      "text": "For domain CloudOnly_Basin experiment co_001, bounding box 52.10/-116.20/51.40/-115.10, download attributes and forcings from the cloud for 2017-01-01 to 2017-06-30. Do not run the model and do not calibrate."
+    },
+    {
+      "id": "017",
+      "category": "local_reuse",
+      "text": "Reuse existing local SYMFLUENCE data for domain Bow_at_Banff_lumped with experiment lumped_local_1. Do not include acquire_attributes or acquire_forcings. Run model-specific preprocessing and postprocess_results for 2004-01-05 to 2004-01-19. Do not run the model."
+    },
+    {
+      "id": "018",
+      "category": "calibration",
+      "text": "For domain Kananaskis_cal experiment kan_cal_02, pour point 51.00/-115.10, calibrate the model using calibrate_model. Calibration period 2012-01-01 to 2012-12-31, evaluation period 2013-01-01 to 2013-06-30. Use KGE, DE, 25 iterations."
+    },
+    {
+      "id": "019",
+      "category": "specialized",
+      "text": "Build a lumped basin SUMMA workflow for domain Ghost_lumped, experiment ghost_l_01, pour point 51.20/-114.90. Without mizuRoute. Dates 2011-01-01 to 2011-12-31. Use lumped routing delineation and lumped parameter regionalization."
+    },
+    {
+      "id": "020",
+      "category": "specialized",
+      "text": "Create an elevation-distributed SUMMA plan for domain Highwood_elev experiment hw_elev_1. Pour point 50.55/-114.40, discretization elevation, elevation band size 200 m, from 2005-05-01 to 2005-05-31. Setup and discretize_domain only; do not run the model."
+    },
+    {
+      "id": "021",
+      "category": "complete_workflow",
+      "text": "Domain: MoraineLake, experiment: ml_full_01, pour point 51.33/-116.18. Run workflow steps in order: validate_config, setup_project, create_pour_point, acquire_attributes, define_domain, acquire_forcings, model_agnostic_preprocessing, model_specific_preprocessing, run_model, postprocess_results. Time window 2016-01-01 to 2016-01-31."
+    },
+    {
+      "id": "022",
+      "category": "complete_workflow",
+      "text": "SUMMA workflow for domain US_TestBasin experiment us_001 at pour point 40.01/-105.27. Streamflow data provider USGS. Run from 2014-10-01 to 2015-09-30. Include setup, model run, and postprocessing."
+    },
+    {
+      "id": "023",
+      "category": "missing_information",
+      "text": "Run SUMMA for Banff from 2010 to 2011 with ERA5 forcing and experiment banff_try_1."
+    },
+    {
+      "id": "024",
+      "category": "negative_constraint",
+      "text": "Domain BowRiver_nodl experiment nodl_001, pour point 51.35/-116.02, dates 2004-01-05 to 2004-01-19. Do not download attributes or forcings. Run the model and postprocess results."
+    },
+    {
+      "id": "025",
+      "category": "dry_run",
+      "text": "Only validate_config and dry_run for domain SmokeTest experiment smoke_01 with pour point 49.00/-114.00 and window 2001-01-01 to 2001-01-03. Skip model run, calibration, and postprocessing."
+    }
+  ]
+}

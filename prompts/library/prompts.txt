@@ -370,3 +370,9 @@ Run SUMMA for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
 22:
 Run Fuse for Bow River at 51.35/-116.02 from 2004-01-01 01:00 to
 2004-01-10 23:00
+
+23:
+Create a SUMMA workflow for domain BowRiver3 with experiment exp001. Use pour point 51.3500000/-116.0200000, delineate the domain, and run from 2020-01-01 to 2020-12-31. Include setup, preprocessing, model run, and postprocessing.
+
+24:
+Run SUMMA for the Bow River basin from 2025 to 2026. Use semi-distributed delineation with GRUs and ERA5 forcing. Experiment id exp001.

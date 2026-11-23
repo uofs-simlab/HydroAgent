@@ -1,0 +1,528 @@
+{
+  "note": "Expert reference for the 25 prompts. Values stated in the prompt are requested_config. A full date is stored as 01:00 to 23:00. A year range is an incomplete window, so the start and end remain in needs_user_input. A new domain that will be delineated, discretized, calibrated, or run needs bounding_box_coords when the prompt does not give a box and does not forbid downloads. Local reuse that forbids attribute or forcing downloads does not require a bounding box. A model, domain name, pour point, or time window that the prompt does not supply stays in needs_user_input.",
+  "references": {
+    "001": {
+      "requested_config": {
+        "domain_name": "BowRiver3",
+        "experiment_id": "exp001",
+        "pour_point_coords": "51.3500000/-116.0200000",
+        "hydrological_model": "SUMMA",
+        "domain_def": "delineate",
+        "experiment_time_start": "2020-01-01 01:00",
+        "experiment_time_end": "2020-12-31 23:00"
+      },
+      "required_steps": [
+        "setup_project",
+        "define_domain",
+        "model_agnostic_preprocessing",
+        "model_specific_preprocessing",
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "002": {
+      "requested_config": {
+        "experiment_id": "exp001",
+        "hydrological_model": "SUMMA",
+        "domain_def": "delineate",
+        "discretization": "GRUs",
+        "forcing_dataset": "ERA5"
+      },
+      "required_steps": [
+        "define_domain",
+        "discretize_domain",
+        "acquire_forcings",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "domain_name",
+        "pour_point_coords",
+        "bounding_box_coords",
+        "experiment_time_start",
+        "experiment_time_end"
+      ]
+    },
+    "003": {
+      "requested_config": {
+        "hydrological_model": "SUMMA"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "domain_name",
+        "pour_point_coords",
+        "experiment_time_start",
+        "experiment_time_end",
+        "bounding_box_coords"
+      ]
+    },
+    "004": {
+      "requested_config": {
+        "domain_name": "BOWRiver3",
+        "experiment_id": "semi_distributed_run_1",
+        "pour_point_coords": "51.35/-116.02",
+        "experiment_time_start": "2004-01-05 01:00",
+        "experiment_time_end": "2004-01-19 23:00"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "hydrological_model",
+        "bounding_box_coords"
+      ]
+    },
+    "005": {
+      "requested_config": {
+        "domain_name": "ParadiseValley",
+        "experiment_id": "pv_001",
+        "bounding_box_coords": "51.76/-116.55/50.95/-115.50",
+        "hydrological_model": "SUMMA",
+        "forcing_dataset": "ERA5",
+        "data_access": "cloud",
+        "experiment_time_start": "2018-06-01 01:00",
+        "experiment_time_end": "2019-05-31 23:00"
+      },
+      "required_steps": [
+        "acquire_attributes",
+        "acquire_forcings",
+        "model_agnostic_preprocessing",
+        "model_specific_preprocessing",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "pour_point_coords"
+      ]
+    },
+    "006": {
+      "requested_config": {
+        "domain_name": "Bow_at_Banff_semi_distributed",
+        "experiment_id": "semi_distributed_run_1",
+        "hydrological_model": "SUMMA",
+        "data_access": "local",
+        "experiment_time_start": "2004-01-05 01:00",
+        "experiment_time_end": "2004-01-19 23:00"
+      },
+      "required_steps": [
+        "model_specific_preprocessing",
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [
+        "acquire_attributes",
+        "acquire_forcings"
+      ],
+      "needs_user_input": []
+    },
+    "007": {
+      "requested_config": {
+        "domain_name": "BowRiver_cal",
+        "experiment_id": "cal_001",
+        "pour_point_coords": "51.35/-116.02",
+        "hydrological_model": "SUMMA",
+        "calibration_period": "2004-01-05 to 2004-01-19",
+        "evaluation_period": "2004-01-20 to 2004-01-31",
+        "optimization_metric": "KGE",
+        "iterative_optimization_algorithm": "DE",
+        "iterations": 50
+      },
+      "required_steps": [
+        "calibrate_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "008": {
+      "requested_config": {
+        "domain_name": "Bow_lumped",
+        "experiment_id": "lumped_001",
+        "pour_point_coords": "51.35/-116.02",
+        "hydrological_model": "SUMMA",
+        "domain_def": "lumped",
+        "discretization": "lumped",
+        "experiment_time_start": "2010-01-01 01:00",
+        "experiment_time_end": "2010-12-31 23:00"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "prohibited_config": {
+        "routing_model": [
+          "mizuRoute",
+          "mizuroute"
+        ]
+      },
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "009": {
+      "requested_config": {
+        "domain_name": "TestBasin",
+        "experiment_id": "dry_001",
+        "pour_point_coords": "50.50/-114.50",
+        "experiment_time_start": "2001-01-01 01:00",
+        "experiment_time_end": "2001-01-10 23:00"
+      },
+      "required_steps": [
+        "validate_config",
+        "dry_run"
+      ],
+      "prohibited_steps": [
+        "run_model"
+      ],
+      "needs_user_input": [
+        "hydrological_model"
+      ]
+    },
+    "010": {
+      "requested_config": {
+        "domain_name": "Bow_elevation",
+        "experiment_id": "elev_001",
+        "pour_point_coords": "51.35/-116.02",
+        "hydrological_model": "SUMMA",
+        "discretization": "elevation",
+        "elevation_band_size": 400,
+        "experiment_time_start": "2004-01-05 01:00",
+        "experiment_time_end": "2004-01-19 23:00"
+      },
+      "required_steps": [
+        "setup_project",
+        "discretize_domain",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "011": {
+      "requested_config": {
+        "domain_name": "ElbowRiver_v2",
+        "experiment_id": "exp_elbow_01",
+        "pour_point_coords": "50.95/-114.55",
+        "hydrological_model": "SUMMA",
+        "experiment_time_start": "2015-01-01 01:00",
+        "experiment_time_end": "2015-12-31 23:00"
+      },
+      "required_steps": [
+        "setup_project",
+        "acquire_attributes",
+        "define_domain",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "012": {
+      "requested_config": {
+        "domain_name": "CascadeCreek",
+        "experiment_id": "cc_2021",
+        "pour_point_coords": "51.10/-115.20",
+        "hydrological_model": "SUMMA",
+        "domain_def": "delineate",
+        "discretization": "GRUs",
+        "forcing_dataset": "ERA5",
+        "experiment_time_start": "2021-06-01 01:00",
+        "experiment_time_end": "2022-05-31 23:00"
+      },
+      "required_steps": [
+        "define_domain",
+        "discretize_domain",
+        "acquire_forcings",
+        "model_agnostic_preprocessing",
+        "model_specific_preprocessing",
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "013": {
+      "requested_config": {
+        "domain_name": "RedDeer_Basin",
+        "experiment_id": "rd_001",
+        "hydrological_model": "SUMMA",
+        "domain_def": "delineate",
+        "routing_model": "mizuRoute"
+      },
+      "required_steps": [
+        "define_domain",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "pour_point_coords",
+        "experiment_time_start",
+        "experiment_time_end",
+        "bounding_box_coords"
+      ]
+    },
+    "014": {
+      "requested_config": {
+        "domain_name": "QuickTest",
+        "experiment_id": "qt_001",
+        "hydrological_model": "SUMMA"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "pour_point_coords",
+        "experiment_time_start",
+        "experiment_time_end",
+        "bounding_box_coords"
+      ]
+    },
+    "015": {
+      "requested_config": {
+        "domain_name": "SprayLakes",
+        "experiment_id": "spray_run_3",
+        "pour_point_coords": "51.05/-115.40",
+        "experiment_time_start": "2008-03-01 01:00",
+        "experiment_time_end": "2008-03-15 23:00"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "hydrological_model",
+        "bounding_box_coords"
+      ]
+    },
+    "016": {
+      "requested_config": {
+        "domain_name": "CloudOnly_Basin",
+        "experiment_id": "co_001",
+        "bounding_box_coords": "52.10/-116.20/51.40/-115.10",
+        "data_access": "cloud",
+        "experiment_time_start": "2017-01-01 01:00",
+        "experiment_time_end": "2017-06-30 23:00"
+      },
+      "required_steps": [
+        "acquire_attributes",
+        "acquire_forcings"
+      ],
+      "prohibited_steps": [
+        "run_model",
+        "calibrate_model"
+      ],
+      "needs_user_input": [
+        "hydrological_model",
+        "pour_point_coords"
+      ]
+    },
+    "017": {
+      "requested_config": {
+        "domain_name": "Bow_at_Banff_lumped",
+        "experiment_id": "lumped_local_1",
+        "data_access": "local",
+        "experiment_time_start": "2004-01-05 01:00",
+        "experiment_time_end": "2004-01-19 23:00"
+      },
+      "required_steps": [
+        "model_specific_preprocessing",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [
+        "acquire_attributes",
+        "acquire_forcings",
+        "run_model"
+      ],
+      "needs_user_input": [
+        "hydrological_model"
+      ]
+    },
+    "018": {
+      "requested_config": {
+        "domain_name": "Kananaskis_cal",
+        "experiment_id": "kan_cal_02",
+        "pour_point_coords": "51.00/-115.10",
+        "calibration_period": "2012-01-01 to 2012-12-31",
+        "evaluation_period": "2013-01-01 to 2013-06-30",
+        "optimization_metric": "KGE",
+        "iterative_optimization_algorithm": "DE",
+        "iterations": 25
+      },
+      "required_steps": [
+        "calibrate_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "hydrological_model",
+        "bounding_box_coords"
+      ]
+    },
+    "019": {
+      "requested_config": {
+        "domain_name": "Ghost_lumped",
+        "experiment_id": "ghost_l_01",
+        "pour_point_coords": "51.20/-114.90",
+        "hydrological_model": "SUMMA",
+        "domain_def": "lumped",
+        "discretization": "lumped",
+        "experiment_time_start": "2011-01-01 01:00",
+        "experiment_time_end": "2011-12-31 23:00"
+      },
+      "required_steps": [
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "prohibited_config": {
+        "routing_model": [
+          "mizuRoute",
+          "mizuroute"
+        ]
+      },
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "020": {
+      "requested_config": {
+        "domain_name": "Highwood_elev",
+        "experiment_id": "hw_elev_1",
+        "pour_point_coords": "50.55/-114.40",
+        "hydrological_model": "SUMMA",
+        "discretization": "elevation",
+        "elevation_band_size": 200,
+        "experiment_time_start": "2005-05-01 01:00",
+        "experiment_time_end": "2005-05-31 23:00"
+      },
+      "required_steps": [
+        "setup_project",
+        "discretize_domain"
+      ],
+      "prohibited_steps": [
+        "run_model"
+      ],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "021": {
+      "requested_config": {
+        "domain_name": "MoraineLake",
+        "experiment_id": "ml_full_01",
+        "pour_point_coords": "51.33/-116.18",
+        "experiment_time_start": "2016-01-01 01:00",
+        "experiment_time_end": "2016-01-31 23:00"
+      },
+      "required_steps": [
+        "validate_config",
+        "setup_project",
+        "create_pour_point",
+        "acquire_attributes",
+        "define_domain",
+        "acquire_forcings",
+        "model_agnostic_preprocessing",
+        "model_specific_preprocessing",
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "hydrological_model",
+        "bounding_box_coords"
+      ]
+    },
+    "022": {
+      "requested_config": {
+        "domain_name": "US_TestBasin",
+        "experiment_id": "us_001",
+        "pour_point_coords": "40.01/-105.27",
+        "hydrological_model": "SUMMA",
+        "streamflow_data_provider": "USGS",
+        "experiment_time_start": "2014-10-01 01:00",
+        "experiment_time_end": "2015-09-30 23:00"
+      },
+      "required_steps": [
+        "setup_project",
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "bounding_box_coords"
+      ]
+    },
+    "023": {
+      "requested_config": {
+        "experiment_id": "banff_try_1",
+        "hydrological_model": "SUMMA",
+        "forcing_dataset": "ERA5"
+      },
+      "required_steps": [
+        "acquire_forcings",
+        "run_model"
+      ],
+      "prohibited_steps": [],
+      "needs_user_input": [
+        "domain_name",
+        "pour_point_coords",
+        "bounding_box_coords",
+        "experiment_time_start",
+        "experiment_time_end"
+      ]
+    },
+    "024": {
+      "requested_config": {
+        "domain_name": "BowRiver_nodl",
+        "experiment_id": "nodl_001",
+        "pour_point_coords": "51.35/-116.02",
+        "experiment_time_start": "2004-01-05 01:00",
+        "experiment_time_end": "2004-01-19 23:00"
+      },
+      "required_steps": [
+        "run_model",
+        "postprocess_results"
+      ],
+      "prohibited_steps": [
+        "acquire_attributes",
+        "acquire_forcings"
+      ],
+      "needs_user_input": [
+        "hydrological_model"
+      ]
+    },
+    "025": {
+      "requested_config": {
+        "domain_name": "SmokeTest",
+        "experiment_id": "smoke_01",
+        "pour_point_coords": "49.00/-114.00",
+        "experiment_time_start": "2001-01-01 01:00",
+        "experiment_time_end": "2001-01-03 23:00"
+      },
+      "required_steps": [
+        "validate_config",
+        "dry_run"
+      ],
+      "prohibited_steps": [
+        "run_model",
+        "calibrate_model",
+        "postprocess_results"
+      ],
+      "needs_user_input": [
+        "hydrological_model"
+      ]
+    }
+  }
+}

@@ -150,9 +150,10 @@ Rules:
 
 34c. If domain attributes/DEM are not already on disk, set data_access / DATA_ACCESS to "cloud" (online MAF/gistool fetch). When acquire_attributes or acquire_forcings is included, bounding_box_coords is required unless the user explicitly states data is already present locally.
 
-35. If needs_user_input is not empty, steps must be exactly:
-    - validate_config
-    - dry_run
+35. If needs_user_input is not empty, keep the workflow steps described by the request.
+    Do not replace those steps with validate_config and dry_run.
+    List every missing field in needs_user_input.
+    Use only validate_config and dry_run when the user explicitly asks for a validation or dry run.
 
 36. If the user mentions a SYMFLUENCE hydrological model (e.g. SUMMA, FUSE, GR, NGEN, MESH, HYPE), put the registry name in config.hydrological_model.
 

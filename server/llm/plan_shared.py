@@ -367,10 +367,9 @@ def finalize_run_plan(
             )
         else:
             plan["needs_user_input"] = missing
-            plan["steps"] = ["validate_config", "dry_run"]
             plan["notes"] = (
                 f"Missing required inputs: {', '.join(missing)}. "
-                "Returning a safe validation/dry-run plan until those values are provided."
+                "The requested workflow steps are kept until those values are provided."
             )
     elif bbox_missing:
         plan["needs_user_input"] = ["bounding_box_coords"]

@@ -7,6 +7,10 @@ __pycache__/
 .pytest_cache/
 runs/*
 !runs/.gitkeep
+benchmarking/results/*
+!benchmarking/results/.gitkeep
+repbenchmarking/results/*
+!repbenchmarking/results/.gitkeep
 .streamlit/secrets.toml
 figures/
 prompts/library/.cache/

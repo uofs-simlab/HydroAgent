@@ -46,7 +46,9 @@ def test_finalize_run_plan_rejects_inferred_bow():
         "run summa for Bow river from 2025/01/10 to 2025/02/15",
     )
     assert "domain_name" in (plan.get("needs_user_input") or [])
-    assert plan.get("steps") == ["validate_config", "dry_run"]
+    assert "setup_project" in (plan.get("steps") or [])
+    assert "run_model" in (plan.get("steps") or [])
+    assert plan.get("steps") != ["validate_config", "dry_run"]
     assert not (plan.get("config") or {}).get("domain_name")
 
 
