@@ -19,7 +19,7 @@ PLANNER_PROMPT_PATH = HYDROAGENT_ROOT / "prompts" / "planner_prompt.txt"
 PAPER_MODELS = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-3.8-flash",
-    "claude": "claude-sonnet-4-20250514",
+    "claude": "claude-sonnet-5",
 }
 
 # Settings copied from server/llm/*_provider.py generate_run_plan().
@@ -48,9 +48,10 @@ CALL_SETTINGS = {
         },
     },
     "claude": {
-        "requested_model": "claude-sonnet-4-20250514",
-        "temperature": 0.2,
-        "sampling": {},
+        "requested_model": "claude-sonnet-5",
+        "temperature": None,
+        "temperature_note": "Temperature is omitted. Claude Sonnet 5 rejects non-default temperature, top_p, and top_k.",
+        "sampling": {"thinking": "disabled"},
         "max_output_tokens": 8192,
         "structured_output": {
             "first_attempt": "output_config.format json_schema",
