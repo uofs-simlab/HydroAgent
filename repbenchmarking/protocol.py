@@ -18,7 +18,7 @@ PLANNER_PROMPT_PATH = HYDROAGENT_ROOT / "prompts" / "planner_prompt.txt"
 
 PAPER_MODELS = {
     "openai": "gpt-5-mini",
-    "gemini": "gemini-3.8-flash",
+    "gemini": "gemini-3.6-flash",
     "claude": "claude-sonnet-5",
 }
 
@@ -37,9 +37,9 @@ CALL_SETTINGS = {
         },
     },
     "gemini": {
-        "requested_model": "gemini-3.8-flash",
+        "requested_model": "gemini-3.6-flash",
         "temperature": None,
-        "temperature_note": "Temperature, top_p, top_k, and candidate_count are omitted. Gemini 3.8 Flash rejects those sampling parameters.",
+        "temperature_note": "Temperature, top_p, top_k, and candidate_count are omitted. Gemini 3.6 Flash rejects those sampling parameters.",
         "sampling": {"thinking_level": "medium"},
         "max_output_tokens": 8192,
         "structured_output": {

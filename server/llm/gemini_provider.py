@@ -34,7 +34,7 @@ def _generation_config(
 ) -> types.GenerateContentConfig:
     """Build a Gemini request config for the model generation.
 
-    Gemini 3 models, including gemini-3.8-flash, reject temperature, top_p,
+    Gemini 3 models, including gemini-3.6-flash, reject temperature, top_p,
     top_k, and candidate_count. Reasoning is set with thinking_level. Medium
     is that model's default. Older Gemini models keep temperature 0.2.
     """
@@ -335,7 +335,7 @@ class GeminiProvider:
         *,
         audio_bytes: bytes,
         filename: str = "recording.webm",
-        model: str = "gemini-3.8-flash",
+        model: str = "gemini-3.6-flash",
     ) -> str:
         """Speech-to-text via Gemini multimodal audio understanding."""
         suffix = Path(filename).suffix or ".webm"

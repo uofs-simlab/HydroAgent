@@ -10,7 +10,7 @@ from typing import Any
 REQUIRED_PLAN_KEYS = ("config", "steps", "needs_user_input", "notes")
 PAPER_MODELS = {
     "openai": "gpt-5-mini",
-    "gemini": "gemini-3.8-flash",
+    "gemini": "gemini-3.6-flash",
     "claude": "claude-sonnet-5",
 }
 IDENTIFICATION = (
